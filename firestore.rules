@@ -1,0 +1,211 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function requester() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function isApproved() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        requester().data.approvalStatus == 'APPROVED';
+    }
+
+    function isAdminRole() {
+      return isApproved() && requester().data.role in ['SUPERUSER', 'PROJECT_ADMIN'];
+    }
+
+    function isSuperUser() {
+      return isApproved() && requester().data.role == 'SUPERUSER';
+    }
+
+    match /users/{uid} {
+      allow read: if (isSignedIn() && request.auth.uid == uid) || isAdminRole() ||
+        // Permite a cualquier usuario autenticado leer placeholders (el filtro mergedToUid se hace en cliente).
+        // Necesario para que un usuario recién registrado encuentre su placeholder por email.
+        (isSignedIn() && resource.data.isPlaceholder == true);
+      allow create: if (isSignedIn() && request.auth.uid == uid) || isAdminRole();
+      allow update: if (
+        isSignedIn() &&
+        request.auth.uid == uid &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.approvalStatus == resource.data.approvalStatus
+      ) || isAdminRole() || (
+        // Cualquier usuario autenticado puede marcar como fusionado un placeholder cuyo email coincida con el suyo.
+        // (No requiere estar APPROVED — el placeholder PENDING también se puede reclamar al primer login.)
+        isSignedIn() &&
+        resource.data.isPlaceholder == true &&
+        resource.data.mergedToUid == null &&
+        request.resource.data.mergedToUid == request.auth.uid &&
+        request.resource.data.approvalStatus == resource.data.approvalStatus &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.email == resource.data.email
+      );
+      allow delete: if isAdminRole() && resource.data.isPlaceholder == true;
+    }
+
+    match /projects/{projectId} {
+      allow read: if isApproved();
+      allow create, update: if isSuperUser();
+      allow delete: if false;
+    }
+
+    match /project_configs/{projectId} {
+      allow read: if isApproved();
+      allow create, update: if isAdminRole();
+      allow delete: if false;
+    }
+
+    match /project_areas/{areaId} {
+      allow read: if isApproved();
+      allow create, update, delete: if isAdminRole();
+    }
+
+    match /project_roles/{roleId} {
+      allow read: if isApproved();
+      allow create, update, delete: if isAdminRole();
+    }
+
+    match /project_templates/{templateId} {
+      allow read: if isApproved();
+      allow create, update: if isAdminRole();
+      allow delete: if isSuperUser();
+    }
+
+    match /time_entries/{entryId} {
+      allow read: if isApproved();
+
+      allow create: if (isApproved() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.calculationSource == 'client' &&
+        request.resource.data.calculationVersion == 'v1-client' &&
+        request.resource.data.lockedByAdmin == false) ||
+        (isAdminRole() &&
+        request.resource.data.calculationSource == 'client' &&
+        request.resource.data.calculationVersion == 'v1-client');
+
+      allow update: if isAdminRole() || (
+        isApproved() &&
+        resource.data.userId == request.auth.uid &&
+        resource.data.lockedByAdmin == false &&
+        request.resource.data.calculationSource == resource.data.calculationSource &&
+        request.resource.data.calculationVersion == resource.data.calculationVersion
+      ) || (
+        // Migración de placeholder: reasignar entradas al UID real del usuario
+        isApproved() &&
+        resource.data.lockedByAdmin == false &&
+        request.resource.data.userId == request.auth.uid &&
+        get(/databases/$(database)/documents/users/$(resource.data.userId)).data.isPlaceholder == true
+      );
+
+      allow delete: if isSuperUser() || isAdminRole() || (
+        isApproved() &&
+        resource.data.userId == request.auth.uid &&
+        resource.data.lockedByAdmin == false
+      );
+    }
+
+    match /settlements/{settlementId} {
+      allow read: if isApproved();
+      allow create: if isAdminRole();
+      allow update, delete: if isSuperUser();
+    }
+
+    match /imported_members/{email} {
+      // Cualquier usuario autenticado puede leer (necesario para la auto-aprobación al login)
+      allow read: if isSignedIn();
+      // Solo admins pueden crear o borrar
+      allow create, delete: if isAdminRole();
+      // Admins O el propio usuario reclamando su registro (solo puede marcar claimed=true con su uid)
+      allow update: if isAdminRole() || (
+        isSignedIn() &&
+        request.resource.data.claimed == true &&
+        request.resource.data.claimedByUid == request.auth.uid &&
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.displayName == resource.data.displayName &&
+        request.resource.data.importedAt == resource.data.importedAt
+      );
+    }
+
+    // ─── Chat / Soporte ────────────────────────────────────────────────────
+    match /chat_threads/{threadId} {
+      // Helper: ¿el usuario actual puede ver el hilo?
+      function canView() {
+        return isApproved() && (
+          isSuperUser() ||
+          // PROJECT_ADMIN del proyecto
+          (requester().data.role == 'PROJECT_ADMIN' &&
+            requester().data.projectId == resource.data.projectId) ||
+          // MEMBER: depende del scope
+          (requester().data.projectId == resource.data.projectId && (
+            resource.data.scope == 'PUBLIC' ||
+            (resource.data.scope == 'AREA' &&
+              requester().data.areaId == resource.data.areaId) ||
+            (resource.data.scope == 'PRIVATE' &&
+              resource.data.createdBy == request.auth.uid)
+          ))
+        );
+      }
+
+      allow read: if canView();
+
+      // Crear hilo: usuario aprobado, proyecto coincide, campos válidos
+      allow create: if isApproved() &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.projectId == requester().data.projectId &&
+        request.resource.data.scope in ['PRIVATE', 'AREA', 'PUBLIC'] &&
+        request.resource.data.title is string &&
+        (request.resource.data.scope != 'AREA' ||
+          (request.resource.data.areaId is string &&
+            request.resource.data.areaId == requester().data.areaId));
+
+      // Update: solo para refrescar resumen del último mensaje (cualquier participante con acceso)
+      allow update: if canView() &&
+        request.resource.data.projectId == resource.data.projectId &&
+        request.resource.data.scope == resource.data.scope &&
+        request.resource.data.createdBy == resource.data.createdBy;
+
+      // Borrar: admin del proyecto, superuser, o el creador
+      allow delete: if isSuperUser() ||
+        (requester().data.role == 'PROJECT_ADMIN' &&
+          requester().data.projectId == resource.data.projectId) ||
+        (isApproved() && resource.data.createdBy == request.auth.uid);
+
+      match /messages/{messageId} {
+        function parentThread() {
+          return get(/databases/$(database)/documents/chat_threads/$(threadId)).data;
+        }
+        function canViewParent() {
+          return isApproved() && (
+            isSuperUser() ||
+            (requester().data.role == 'PROJECT_ADMIN' &&
+              requester().data.projectId == parentThread().projectId) ||
+            (requester().data.projectId == parentThread().projectId && (
+              parentThread().scope == 'PUBLIC' ||
+              (parentThread().scope == 'AREA' &&
+                requester().data.areaId == parentThread().areaId) ||
+              (parentThread().scope == 'PRIVATE' &&
+                parentThread().createdBy == request.auth.uid)
+            ))
+          );
+        }
+
+        allow read: if canViewParent();
+        allow create: if canViewParent() &&
+          request.resource.data.senderUid == request.auth.uid &&
+          request.resource.data.text is string &&
+          request.resource.data.text.size() > 0 &&
+          request.resource.data.text.size() <= 4000;
+        allow update: if false;
+        allow delete: if isSuperUser() ||
+          (requester().data.role == 'PROJECT_ADMIN' &&
+            requester().data.projectId == parentThread().projectId) ||
+          (isApproved() && resource.data.senderUid == request.auth.uid);
+      }
+    }
+  }
+}
