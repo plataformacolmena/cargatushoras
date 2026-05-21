@@ -4,6 +4,7 @@ import {
   deleteDoc,
   deleteField,
   doc,
+  getCountFromServer,
   getDoc,
   getDocs,
   onSnapshot,
@@ -432,11 +433,12 @@ export async function setUserRole(userId: string, role: AppRole): Promise<void> 
 /**
  * Devuelve cuántas jornadas (time_entries) tiene un usuario en total.
  * Usado para decidir si un usuario aprobado puede ser eliminado o solo inhabilitado.
+ * Usa getCountFromServer para evitar leer todos los documentos (1 lectura facturada).
  */
 export async function countUserTimeEntries(userId: string): Promise<number> {
   const q = query(collection(db, 'time_entries'), where('userId', '==', userId))
-  const snap = await getDocs(q)
-  return snap.size
+  const snap = await getCountFromServer(q)
+  return snap.data().count
 }
 
 /**
@@ -875,13 +877,16 @@ export function subscribeToMyEntries(
   userId: string,
   projectId: string,
   callback: (entries: TimeEntry[]) => void,
+  opts?: { since?: string },
 ): () => void {
-  const q = query(
-    collection(db, 'time_entries'),
+  const conditions = [
     where('userId', '==', userId),
     where('projectId', '==', projectId),
-    orderBy('workDate', 'desc'),
-  )
+  ]
+  if (opts?.since) {
+    conditions.push(where('workDate', '>=', opts.since))
+  }
+  const q = query(collection(db, 'time_entries'), ...conditions, orderBy('workDate', 'desc'))
   return onSnapshot(q, (snap) => {
     callback(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<TimeEntry, 'id'>) })))
   })
@@ -890,12 +895,13 @@ export function subscribeToMyEntries(
 export function subscribeToProjectEntries(
   projectId: string,
   callback: (entries: TimeEntry[]) => void,
+  opts?: { since?: string },
 ): () => void {
-  const q = query(
-    collection(db, 'time_entries'),
-    where('projectId', '==', projectId),
-    orderBy('workDate', 'desc'),
-  )
+  const conditions = [where('projectId', '==', projectId)]
+  if (opts?.since) {
+    conditions.push(where('workDate', '>=', opts.since))
+  }
+  const q = query(collection(db, 'time_entries'), ...conditions, orderBy('workDate', 'desc'))
   return onSnapshot(q, (snap) => {
     callback(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<TimeEntry, 'id'>) })))
   })

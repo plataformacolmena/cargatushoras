@@ -10,6 +10,14 @@
       ]
     },
     {
+      "collectionGroup": "time_entries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "projectId", "order": "ASCENDING" },
+        { "fieldPath": "workDate", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "project_areas",
       "queryScope": "COLLECTION",
       "fields": [

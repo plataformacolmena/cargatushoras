@@ -352,14 +352,22 @@ export function DashboardPage() {
   useEffect(() => {
     const currentProfile = profile
     if (!currentProfile || !activeProjectId) return
+    // Ventana de jornadas en tiempo real: \u00faltimos ~180 d\u00edas para limitar
+    // lecturas de Firestore. Reportes y liquidaciones (que requieran fechas
+    // m\u00e1s antiguas) usan listAllTimeEntries con rango espec\u00edfico.
+    const since = (() => {
+      const d = new Date()
+      d.setDate(d.getDate() - 180)
+      return d.toISOString().slice(0, 10)
+    })()
     if (canAudit(currentProfile.role)) {
-      return subscribeToProjectEntries(activeProjectId, setEntries)
+      return subscribeToProjectEntries(activeProjectId, setEntries, { since })
     } else if (currentProfile.areaId) {
       return subscribeToProjectEntries(activeProjectId, (all) => {
         setEntries(all.filter((e) => e.areaId === currentProfile.areaId))
-      })
+      }, { since })
     } else {
-      return subscribeToMyEntries(currentProfile.uid, activeProjectId, setEntries)
+      return subscribeToMyEntries(currentProfile.uid, activeProjectId, setEntries, { since })
     }
   }, [activeProjectId, profile])
 
