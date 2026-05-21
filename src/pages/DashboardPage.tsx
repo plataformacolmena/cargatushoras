@@ -2,6 +2,9 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import * as XLSX from 'xlsx'
 import { useAuth } from '../auth/useAuth'
 import { SupportChatPanel } from '../components/SupportChatPanel'
+import { Pagination, usePagedItems } from '../components/Pagination'
+import { LoadingOverlay, Spinner } from '../components/Spinner'
+import { OnlineStatusIndicator } from '../components/OnlineStatusIndicator'
 import {
   applyProjectTemplate,
   approveUser,
@@ -33,22 +36,31 @@ import {
   saveTimeEntry,
   saveTimeEntryForUser,
   setEntryReviewColor,
+  setUserAuditReviewColor,
+  setAuditLockEnabled,
   setUserRole,
   subscribeToApprovedUsers,
+  subscribeToAuditLock,
   subscribeToMyEntries,
   subscribeToImportedPlaceholders,
   subscribeToPendingUsers,
   subscribeToProjectEntries,
   subscribeToProjectUsers,
   subscribeToProjects,
+  listUsersWithoutEntries,
+  type NoReportUserRow,
   updateProject,
   updateProjectArea,
+  countUserTimeEntries,
+  deleteUserProfile,
+  setUserDisabled,
   updateProjectRole,
   updateTimeEntry,
   updateUserProfileAdmin,
 } from '../services/firestore'
 import type {
   AppRole,
+  AuditLock,
   Project,
   ProjectArea,
   ProjectConfig,
@@ -62,7 +74,7 @@ import type {
   UserProfile,
 } from '../types/domain'
 
-type MainTab = 'PROJECTS' | 'PROJECT_MANAGEMENT' | 'USERS' | 'SUPPORT' | 'HELP'
+type MainTab = 'PROJECTS' | 'PROJECT_MANAGEMENT' | 'USERS' | 'HELP'
 type ProjectTab =
   | 'PROJECT_CONFIG'
   | 'TIME_ENTRY_FORM'
@@ -89,6 +101,18 @@ function canAudit(role: UserProfile['role']): boolean {
   return role === 'SUPERUSER' || role === 'PROJECT_ADMIN'
 }
 
+/** Devuelve YYYY-MM-DD máximo permitido según la política, o null si no hay restricción. */
+function getMaxWorkDate(policy: 'ALLOW' | 'TODAY' | 'TODAY_PLUS_ONE' | undefined): string | null {
+  if (!policy || policy === 'ALLOW') return null
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  if (policy === 'TODAY_PLUS_ONE') today.setDate(today.getDate() + 1)
+  const y = today.getFullYear()
+  const m = String(today.getMonth() + 1).padStart(2, '0')
+  const d = String(today.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
 /** Formatea YYYY-MM-DD → DD-MM-AA para mostrar en pantalla. */
 function formatDate(dateStr: string): string {
   if (!dateStr || dateStr.length < 10) return dateStr
@@ -102,7 +126,7 @@ function downloadEntriesCSV(entries: TimeEntry[], downloader: UserProfile, areas
   const userName = downloader.displayName ?? downloader.email ?? downloader.uid
 
   const header = [
-    `# CargarTusHoras — Descarga de horarios`,
+    `# CargaTusHoras — Descarga de horarios`,
     `# Fecha de descarga: ${downloadedAt}`,
     `# Área: ${areaName}`,
     `# Descargado por: ${userName}`,
@@ -143,13 +167,37 @@ const REVIEW_COLORS = [
   { value: 'blue',   defaultLabel: 'Consulta',      bg: '#3b82f6', tint: 'rgba(59,130,246,0.13)' },
 ] as const
 
+// ─── Persistencia de navegación ───────────────────────────────────────────
+const LS_PREFIX = 'cargatushoras:nav:'
+function readLS<T extends string>(key: string, fallback: T, allowed?: readonly T[]): T {
+  try {
+    const v = localStorage.getItem(LS_PREFIX + key)
+    if (!v) return fallback
+    if (allowed && !allowed.includes(v as T)) return fallback
+    return v as T
+  } catch {
+    return fallback
+  }
+}
+function writeLS(key: string, value: string) {
+  try { localStorage.setItem(LS_PREFIX + key, value) } catch { /* noop */ }
+}
+const MAIN_TABS = ['PROJECTS', 'PROJECT_MANAGEMENT', 'USERS', 'HELP'] as const
+const PROJECT_TABS = ['PROJECT_CONFIG', 'TIME_ENTRY_FORM', 'TIME_ENTRY_TABLE', 'TIME_ENTRY_AUDIT', 'SETTLEMENTS'] as const
+const USER_TABS = ['PENDING', 'APPROVED'] as const
+
 export function DashboardPage() {
   const { profile, signOutUser, user } = useAuth()
   const toastIdRef = useRef(0)
   const [toasts, setToasts] = useState<Toast[]>([])
-  const [mainTab, setMainTab] = useState<MainTab>('PROJECTS')
-  const [projectTab, setProjectTab] = useState<ProjectTab>('TIME_ENTRY_FORM')
-  const [userTab, setUserTab] = useState<UserTab>('PENDING')
+  const [mainTab, setMainTab] = useState<MainTab>(() => readLS<MainTab>('mainTab', 'PROJECTS', MAIN_TABS))
+  const [projectTab, setProjectTab] = useState<ProjectTab>(() => readLS<ProjectTab>('projectTab', 'TIME_ENTRY_FORM', PROJECT_TABS))
+  const [userTab, setUserTab] = useState<UserTab>(() => readLS<UserTab>('userTab', 'PENDING', USER_TABS))
+
+  // Persistir tabs
+  useEffect(() => { writeLS('mainTab', mainTab) }, [mainTab])
+  useEffect(() => { writeLS('projectTab', projectTab) }, [projectTab])
+  useEffect(() => { writeLS('userTab', userTab) }, [userTab])
 
   const [projects, setProjects] = useState<Project[]>([])
   const [activeProjectId, setActiveProjectId] = useState('')
@@ -238,9 +286,13 @@ export function DashboardPage() {
 
   // Edición de usuarios aprobados
   const [editingUser, setEditingUser] = useState<UserProfile | null>(null)
-  const [editUserForm, setEditUserForm] = useState({ displayName: '', areaId: '', roleId: '', projectId: '' })
+  const [editUserForm, setEditUserForm] = useState({ displayName: '', areaId: '', roleId: '', projectId: '', cycleMode: 'CYCLE' as 'CYCLE' | 'REINFORCEMENT' })
   const [editUserAreas, setEditUserAreas] = useState<ProjectArea[]>([])
   const [editUserRoles, setEditUserRoles] = useState<ProjectRole[]>([])
+  // Estados de guardado/edición/eliminación de jornadas (para spinners en UI)
+  const [savingEntry, setSavingEntry] = useState(false)
+  const [savingEditEntry, setSavingEditEntry] = useState(false)
+  const [deletingEntryId, setDeletingEntryId] = useState<string | null>(null)
 
   // Templates de proyecto
   const [templates, setTemplates] = useState<ProjectTemplate[]>([])
@@ -249,6 +301,16 @@ export function DashboardPage() {
 
   // Rangos bloqueados por liquidaciones
   const [lockedRanges, setLockedRanges] = useState<Array<{ dateFrom: string; dateTo: string }>>([])
+
+  // Auditoría: bloqueo de ediciones (por proyecto)
+  const [auditLock, setAuditLock] = useState<AuditLock | null>(null)
+  const [auditLockForm, setAuditLockForm] = useState<{ dateFrom: string; dateTo: string }>({ dateFrom: '', dateTo: '' })
+  const [auditLockBusy, setAuditLockBusy] = useState(false)
+
+  // Auditoría: usuarios sin informar
+  const [noReportFilters, setNoReportFilters] = useState<{ dateFrom: string; dateTo: string; areaId: string }>({ dateFrom: '', dateTo: '', areaId: '' })
+  const [noReportRows, setNoReportRows] = useState<NoReportUserRow[]>([])
+  const [noReportLoading, setNoReportLoading] = useState(false)
 
   const [form, setForm] = useState<TimeEntryInput>({
     projectId: '',
@@ -272,10 +334,20 @@ export function DashboardPage() {
       setProjects(loadedProjects)
       setActiveProjectId((prev) => {
         if (prev) return prev
+        // Restaurar último proyecto activo si existe y sigue disponible
+        const remembered = (() => {
+          try { return localStorage.getItem(LS_PREFIX + 'activeProjectId') ?? '' } catch { return '' }
+        })()
+        if (remembered && loadedProjects.some((p) => p.id === remembered)) return remembered
         return loadedProjects[0]?.id ?? ''
       })
     })
   }, [])
+
+  // Persistir proyecto activo
+  useEffect(() => {
+    if (activeProjectId) writeLS('activeProjectId', activeProjectId)
+  }, [activeProjectId])
 
   useEffect(() => {
     const currentProfile = profile
@@ -297,6 +369,19 @@ export function DashboardPage() {
     if (!currentProfile || !canAudit(currentProfile.role) || !activeProjectId) return
     return subscribeToProjectUsers(activeProjectId, setProjectUsers)
   }, [activeProjectId, profile])
+
+  // Suscripción al bloqueo de ediciones del proyecto activo
+  useEffect(() => {
+    if (!activeProjectId) {
+      setAuditLock(null)
+      return
+    }
+    return subscribeToAuditLock(activeProjectId, (lock) => {
+      setAuditLock(lock)
+      // Prellenar el form con los últimos valores almacenados
+      if (lock) setAuditLockForm({ dateFrom: lock.dateFrom, dateTo: lock.dateTo })
+    })
+  }, [activeProjectId])
 
   useEffect(() => {
     if (!activeProjectId) return
@@ -400,6 +485,11 @@ export function DashboardPage() {
     return projects.find((p) => p.id === activeProjectId)?.name || 'Sin proyecto'
   }, [activeProjectId, projects])
 
+  const activeAreaName = useMemo(() => {
+    if (!profile?.areaId) return ''
+    return areas.find((a) => a.id === profile.areaId)?.name ?? ''
+  }, [profile?.areaId, areas])
+
   const filteredApprovedUsers = useMemo(() => {
     if (!userSearch.trim()) return approvedUsers
     const s = userSearch.toLowerCase()
@@ -409,6 +499,14 @@ export function DashboardPage() {
         (u.email ?? '').toLowerCase().includes(s),
     )
   }, [approvedUsers, userSearch])
+
+  // ─── Paginación ─────────────────────────────────────────────────────────
+  const entriesPagination = usePagedItems(entries, 25)
+  const auditPagination = usePagedItems(auditEntries, 50)
+  const settlementsPagination = usePagedItems(pastSettlements, 10)
+
+  // Loading global (cualquier proceso en curso) → overlay con spinner
+  const anyLoading = auditLoading || settlementLoading || importLoading
 
   if (!profile) return null
 
@@ -509,7 +607,26 @@ export function DashboardPage() {
       setLockedRanges(loaded.map((s) => ({ dateFrom: s.dateFrom, dateTo: s.dateTo })))
       showToast('Liquidaci\u00f3n guardada. Fechas bloqueadas.')
     } catch (err) {
-      showToast('Error al guardar la liquidaci\u00f3n.', 'error')
+      const e = err as { code?: string; message?: string }
+      const msg = String(e?.message ?? '').toLowerCase()
+      const code = String(e?.code ?? '').toLowerCase()
+      const isBlocked =
+        code === 'unavailable' ||
+        msg.includes('blocked_by_client') ||
+        msg.includes('err_blocked') ||
+        msg.includes('network error') ||
+        msg.includes('webchannel') ||
+        msg.includes('failed to fetch')
+      if (isBlocked) {
+        showToast(
+          'No se pudo guardar la liquidación. Es posible que una extensión del navegador (bloqueador de anuncios o privacidad) esté bloqueando Firestore. Probá desactivarla para este sitio o usar una ventana de incógnito.',
+          'error',
+        )
+      } else if (e?.message) {
+        showToast(`Error al guardar la liquidación: ${e.message}`, 'error')
+      } else {
+        showToast('Error al guardar la liquidación.', 'error')
+      }
       console.error(err)
     } finally {
       setSettlementLoading(false)
@@ -579,6 +696,7 @@ export function DashboardPage() {
         reengancheHours: projectConfig.reengancheHours,
         penaltyHours: projectConfig.penaltyHours,
         jornadaAdicionalMultiplier: projectConfig.jornadaAdicionalMultiplier,
+        futureDatePolicy: projectConfig.futureDatePolicy ?? 'ALLOW',
       })
       setConfigStatus('')
       showToast('Configuración guardada correctamente.')
@@ -647,12 +765,103 @@ export function DashboardPage() {
       showToast(`La fecha ${form.workDate} pertenece a un período liquidado y no se puede modificar.`, 'error')
       return
     }
+    // Bloqueo por política de fechas futuras (admins exentos).
+    if (!canAudit(currentProfile.role) && projectConfig) {
+      const maxDate = getMaxWorkDate(projectConfig.futureDatePolicy)
+      if (maxDate && form.workDate > maxDate) {
+        const msg = projectConfig.futureDatePolicy === 'TODAY'
+          ? 'No se permiten fechas posteriores a hoy.'
+          : 'No se permiten fechas posteriores a mañana.'
+        showToast(msg, 'error')
+        return
+      }
+    }
+    // Bloqueo de auditoría: si el miembro ya informó fechas en el rango, no puede agregar más.
+    // (Los admins quedan exentos de esta validación.)
+    if (
+      !canAudit(currentProfile.role) &&
+      isDateAuditLocked(form.workDate) &&
+      memberHasEntriesInAuditLockRange()
+    ) {
+      showToast(
+        `El rango ${auditLock?.dateFrom} → ${auditLock?.dateTo} está bloqueado por auditoría y ya informá jornadas en él.`,
+        'error',
+      )
+      return
+    }
     const fechaDuplicada = entries.some((e) => e.workDate === form.workDate && e.userId === currentProfile.uid)
     if (fechaDuplicada) {
       showToast(`Ya existe un registro para el ${form.workDate} en este proyecto.`, 'error')
       return
     }
+
+    // ── Validaciones de 6to día (no aplican a usuarios marcados como Refuerzo) ──
+    const myEntriesForUser = entries.filter((e) => e.userId === currentProfile.uid)
+    const refDate = new Date(form.workDate + 'T00:00:00')
+    const isReinforcement = currentProfile.cycleMode === 'REINFORCEMENT'
+
+    // 1) BLOQUEO: no permitir un 3er 6to día dentro de los últimos 7 días.
+    if (!isReinforcement && form.isJornadaAdicional) {
+      const windowStart = new Date(refDate)
+      windowStart.setDate(refDate.getDate() - 6)
+      const windowStartStr = windowStart.toISOString().slice(0, 10)
+      const flagsInWindow = myEntriesForUser.filter(
+        (e) =>
+          (e as TimeEntry & { isJornadaAdicional?: boolean }).isJornadaAdicional === true &&
+          e.workDate >= windowStartStr &&
+          e.workDate < form.workDate,
+      ).length
+      if (flagsInWindow >= 2) {
+        showToast('No podés marcar un 3er 6to día en menos de 7 días.', 'error')
+        return
+      }
+    }
+
+    // 2) AVISO: si hay 5+ jornadas consecutivas previas sin 6to día, ofrecer marcarlo.
+    if (!isReinforcement && !form.isJornadaAdicional) {
+      const sorted = myEntriesForUser
+        .slice()
+        .sort((a, b) => b.workDate.localeCompare(a.workDate))
+      let consecutive = 0
+      const cursor = new Date(refDate)
+      for (const e of sorted) {
+        if (e.workDate >= form.workDate) continue
+        cursor.setDate(cursor.getDate() - 1)
+        const expectedStr = cursor.toISOString().slice(0, 10)
+        if (e.workDate !== expectedStr) break
+        if ((e as TimeEntry & { isJornadaAdicional?: boolean }).isJornadaAdicional === true) break
+        consecutive++
+        if (consecutive >= 5) break
+      }
+      if (consecutive >= 5) {
+        const wantsMark = window.confirm(
+          'Atención: hoy sería tu 6to día laboral consecutivo.\n\n' +
+            'Aceptar: marcar esta jornada como 6to día y guardar.\n' +
+            'Cancelar: guardar como jornada normal.',
+        )
+        if (wantsMark) {
+          // Re-verifico el bloqueo de 3er 6to día también en este caso.
+          const windowStart = new Date(refDate)
+          windowStart.setDate(refDate.getDate() - 6)
+          const windowStartStr = windowStart.toISOString().slice(0, 10)
+          const flagsInWindow = myEntriesForUser.filter(
+            (e) =>
+              (e as TimeEntry & { isJornadaAdicional?: boolean }).isJornadaAdicional === true &&
+              e.workDate >= windowStartStr &&
+              e.workDate < form.workDate,
+          ).length
+          if (flagsInWindow >= 2) {
+            showToast('No podés marcar un 3er 6to día en menos de 7 días.', 'error')
+            return
+          }
+          form.isJornadaAdicional = true
+          setForm((prev) => ({ ...prev, isJornadaAdicional: true }))
+        }
+      }
+    }
+
     try {
+      setSavingEntry(true)
       await saveTimeEntry(
         { ...form, projectId: activeProjectId },
         { uid: currentProfile.uid, displayName: currentProfile.displayName, areaId: currentProfile.areaId },
@@ -662,6 +871,8 @@ export function DashboardPage() {
     } catch (err) {
       showToast('Error al guardar el horario.', 'error')
       console.error(err)
+    } finally {
+      setSavingEntry(false)
     }
   }
 
@@ -681,24 +892,50 @@ export function DashboardPage() {
   async function submitEditEntry(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!editingEntry) return
+    if (!canAudit(currentProfile.role) && (editingEntry.lockedByAudit === true || isDateAuditLocked(editEntryForm.workDate))) {
+      showToast('Esta jornada está bloqueada por auditoría y no se puede editar.', 'error')
+      return
+    }
+    // Bloqueo por política de fechas futuras (admins exentos).
+    if (!canAudit(currentProfile.role) && projectConfig) {
+      const maxDate = getMaxWorkDate(projectConfig.futureDatePolicy)
+      if (maxDate && editEntryForm.workDate > maxDate) {
+        const msg = projectConfig.futureDatePolicy === 'TODAY'
+          ? 'No se permiten fechas posteriores a hoy.'
+          : 'No se permiten fechas posteriores a mañana.'
+        showToast(msg, 'error')
+        return
+      }
+    }
     try {
+      setSavingEditEntry(true)
       await updateTimeEntry(editingEntry.id, editEntryForm, activeProjectId, editingEntry.userId)
       setEditingEntry(null)
       showToast('Jornada actualizada.')
     } catch (err) {
       showToast('Error al actualizar.', 'error')
       console.error(err)
+    } finally {
+      setSavingEditEntry(false)
     }
   }
 
   async function handleDeleteEntry(entryId: string, userId: string) {
+    const target = entries.find((e) => e.id === entryId)
+    if (!canAudit(currentProfile.role) && target?.lockedByAudit === true) {
+      showToast('Esta jornada está bloqueada por auditoría y no se puede eliminar.', 'error')
+      return
+    }
     if (!window.confirm('¿Eliminar esta jornada?')) return
     try {
+      setDeletingEntryId(entryId)
       await deleteTimeEntry(entryId, activeProjectId, userId)
       showToast('Jornada eliminada.')
     } catch (err) {
       showToast('Error al eliminar.', 'error')
       console.error(err)
+    } finally {
+      setDeletingEntryId(null)
     }
   }
 
@@ -1022,6 +1259,7 @@ export function DashboardPage() {
       areaId: u.areaId ?? '',
       roleId: u.roleId ?? '',
       projectId: u.projectId ?? '',
+      cycleMode: u.cycleMode ?? 'CYCLE',
     })
   }
 
@@ -1034,6 +1272,7 @@ export function DashboardPage() {
         areaId: editUserForm.areaId || undefined,
         roleId: editUserForm.roleId || undefined,
         projectId: editUserForm.projectId || undefined,
+        cycleMode: editUserForm.cycleMode,
       })
       showToast('Usuario actualizado.')
       setEditingUser(null)
@@ -1043,8 +1282,142 @@ export function DashboardPage() {
     }
   }
 
+  async function handleDeleteApprovedUser(u: UserProfile) {
+    if (u.uid === profile?.uid) {
+      showToast('No podés eliminar tu propia cuenta.', 'error')
+      return
+    }
+    if (u.role === 'SUPERUSER') {
+      showToast('No se puede eliminar un Superusuario desde la aplicación.', 'error')
+      return
+    }
+    try {
+      const count = await countUserTimeEntries(u.uid)
+      if (count > 0) {
+        const offerDisable = window.confirm(
+          `No se puede eliminar a ${u.displayName ?? u.email}: tiene ${count} jornada(s) cargada(s).\n\n¿Querés inhabilitarlo en su lugar? El usuario no podrá acceder hasta ser rehabilitado.`,
+        )
+        if (offerDisable) {
+          await setUserDisabled(u.uid, true)
+          showToast('Usuario inhabilitado.')
+        }
+        return
+      }
+      const confirmDelete = window.confirm(
+        `¿Eliminar permanentemente a ${u.displayName ?? u.email}?\n\nEsta acción no se puede deshacer.`,
+      )
+      if (!confirmDelete) return
+      await deleteUserProfile(u.uid)
+      showToast('Usuario eliminado.')
+    } catch (err) {
+      console.error(err)
+      showToast('Error al eliminar el usuario.', 'error')
+    }
+  }
+
+  async function handleToggleUserDisabled(u: UserProfile) {
+    if (u.uid === profile?.uid) {
+      showToast('No podés inhabilitar tu propia cuenta.', 'error')
+      return
+    }
+    const next = !u.disabled
+    const verb = next ? 'inhabilitar' : 'rehabilitar'
+    if (!window.confirm(`¿Seguro que querés ${verb} a ${u.displayName ?? u.email}?`)) return
+    try {
+      await setUserDisabled(u.uid, next)
+      showToast(next ? 'Usuario inhabilitado.' : 'Usuario rehabilitado.')
+    } catch (err) {
+      console.error(err)
+      showToast(`Error al ${verb} el usuario.`, 'error')
+    }
+  }
+
   function isDateLocked(workDate: string): boolean {
     return lockedRanges.some((r) => workDate >= r.dateFrom && workDate <= r.dateTo)
+  }
+
+  /** True si la fecha cae dentro del rango del bloqueo de auditoría activo. */
+  function isDateAuditLocked(workDate: string): boolean {
+    if (!auditLock || !auditLock.enabled) return false
+    return workDate >= auditLock.dateFrom && workDate <= auditLock.dateTo
+  }
+
+  /** True si el usuario actual ya tiene al menos una entrada propia dentro del rango del bloqueo de auditoría. */
+  function memberHasEntriesInAuditLockRange(): boolean {
+    if (!auditLock || !auditLock.enabled) return false
+    return entries.some(
+      (e) =>
+        e.userId === currentProfile.uid &&
+        e.workDate >= auditLock.dateFrom &&
+        e.workDate <= auditLock.dateTo,
+    )
+  }
+
+  async function loadNoReportUsers() {
+    if (!activeProjectId) return
+    if (!noReportFilters.dateFrom || !noReportFilters.dateTo) {
+      showToast('Indicá rango de fechas para el reporte.', 'error')
+      return
+    }
+    setNoReportLoading(true)
+    try {
+      const rows = await listUsersWithoutEntries(
+        activeProjectId,
+        noReportFilters.dateFrom,
+        noReportFilters.dateTo,
+        noReportFilters.areaId || undefined,
+      )
+      setNoReportRows(rows)
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Error al consultar.', 'error')
+      console.error(err)
+    } finally {
+      setNoReportLoading(false)
+    }
+  }
+
+  async function handleSetUserAuditColor(uid: string, color: string) {
+    setNoReportRows((prev) =>
+      prev.map((r) => (r.user.uid === uid ? { ...r, user: { ...r.user, auditReviewColor: color } } : r)),
+    )
+    try {
+      await setUserAuditReviewColor(uid, color)
+    } catch (err) {
+      showToast('Error al guardar el color.', 'error')
+      console.error(err)
+      void loadNoReportUsers()
+    }
+  }
+
+  async function handleToggleAuditLock(targetEnabled: boolean) {
+    if (!activeProjectId) return
+    if (!auditLockForm.dateFrom || !auditLockForm.dateTo) {
+      showToast('Indicá el rango de fechas a bloquear.', 'error')
+      return
+    }
+    if (auditLockForm.dateFrom > auditLockForm.dateTo) {
+      showToast('La fecha desde no puede ser mayor que la fecha hasta.', 'error')
+      return
+    }
+    const action = targetEnabled ? 'activar' : 'desactivar'
+    if (!window.confirm(`¿Seguro que querés ${action} el bloqueo de ediciones para ${auditLockForm.dateFrom} → ${auditLockForm.dateTo}?`)) {
+      return
+    }
+    setAuditLockBusy(true)
+    try {
+      const count = await setAuditLockEnabled(activeProjectId, {
+        enabled: targetEnabled,
+        dateFrom: auditLockForm.dateFrom,
+        dateTo: auditLockForm.dateTo,
+        updatedBy: currentProfile.uid,
+      })
+      showToast(targetEnabled ? `Bloqueo activado (${count} jornadas marcadas).` : `Bloqueo desactivado (${count} jornadas liberadas).`)
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Error al cambiar el bloqueo.', 'error')
+      console.error(err)
+    } finally {
+      setAuditLockBusy(false)
+    }
   }
 
   const projectTabs: Array<{ key: ProjectTab; label: string; visible: boolean }> = [
@@ -1061,7 +1434,11 @@ export function DashboardPage() {
         <div>
           <p className="chip">{currentProfile.role}</p>
           <h1>Gestor de jornadas</h1>
-          <p className="muted">Proyecto activo: {activeProjectName}</p>
+          <p className="muted">
+            Proyecto activo: {activeProjectName}
+            {activeAreaName && <span className="topbar-area-chip">Área: {activeAreaName}</span>}
+            <OnlineStatusIndicator />
+          </p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
           {user?.photoURL && (
@@ -1125,12 +1502,6 @@ export function DashboardPage() {
             Usuarios{pendingUsers.length > 0 ? ` (${pendingUsers.length})` : ''}
           </button>
         )}
-        <button
-          className={`tab ${mainTab === 'SUPPORT' ? 'active' : ''}`}
-          onClick={() => setMainTab('SUPPORT')}
-        >
-          Soporte
-        </button>
         <button
           className={`tab ${mainTab === 'HELP' ? 'active' : ''}`}
           onClick={() => setMainTab('HELP')}
@@ -1248,98 +1619,6 @@ export function DashboardPage() {
 
           <hr />
 
-          <h3>Áreas del proyecto activo</h3>
-          <p className="muted" style={{ marginTop: 0, fontSize: '0.85rem' }}>Área <strong>TODAS</strong>: los administradores y superusuarios ven todos los registros sin importar el área asignada.</p>
-          <form onSubmit={(e) => { void addArea(e) }} className="row">
-            <input
-              type="text"
-              placeholder="Nueva área"
-              value={newAreaName}
-              onChange={(event) => setNewAreaName(event.target.value)}
-            />
-            <button className="btn" type="submit">Agregar</button>
-          </form>
-          <div className="stack" style={{ marginTop: '0.5rem' }}>
-            {areas.map((area) => (
-              <div className="row" key={area.id} style={{ alignItems: 'center' }}>
-                {editingAreaId === area.id ? (
-                  <>
-                    <input
-                      type="text"
-                      value={editAreaName}
-                      onChange={(e) => setEditAreaName(e.target.value)}
-                      style={{ flex: 1 }}
-                      autoFocus
-                    />
-                    <button className="btn-sm" onClick={() => { void handleSaveAreaRename(area.id) }}>Guardar</button>
-                    <button className="btn-sm btn-outline" onClick={() => setEditingAreaId(null)}>Cancelar</button>
-                  </>
-                ) : (
-                  <>
-                    <span style={{ flex: 1 }}>{area.name}</span>
-                    <button className="btn-sm btn-outline" onClick={() => { setEditingAreaId(area.id); setEditAreaName(area.name) }}>Renombrar</button>
-                    <button className="btn-sm danger" onClick={() => { void removeArea(area.id) }}>Eliminar</button>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
-
-          <hr />
-
-          <h3>Roles del proyecto activo</h3>
-          <p className="muted" style={{ marginTop: 0, fontSize: '0.85rem' }}>Define los roles con sus tarifas (diaria, semanal, mensual) para usar en liquidaciones.</p>
-          <details style={{ marginBottom: '1rem' }}>
-            <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none' }}>+ Agregar rol</summary>
-            <form className="stack" style={{ marginTop: '0.75rem' }} onSubmit={(e) => { void handleAddRole(e) }}>
-              <label>Nombre del rol
-                <input type="text" value={newRoleForm.name} onChange={(e) => setNewRoleForm((f) => ({ ...f, name: e.target.value }))} required placeholder="Ej: Oficial, Ayudante..." />
-              </label>
-              <div className="time-grid">
-                <label>Tarifa diaria ($)<input type="number" min={0} step={0.01} value={newRoleForm.dailyRate || ''} onChange={(e) => setNewRoleForm((f) => ({ ...f, dailyRate: parseFloat(e.target.value) || 0 }))} /></label>
-                <label>Tarifa semanal ($)<input type="number" min={0} step={0.01} value={newRoleForm.weeklyRate || ''} onChange={(e) => setNewRoleForm((f) => ({ ...f, weeklyRate: parseFloat(e.target.value) || 0 }))} /></label>
-              </div>
-              <label>Tarifa mensual ($)<input type="number" min={0} step={0.01} value={newRoleForm.monthlyRate || ''} onChange={(e) => setNewRoleForm((f) => ({ ...f, monthlyRate: parseFloat(e.target.value) || 0 }))} /></label>
-              <button className="btn" type="submit">Crear rol</button>
-            </form>
-          </details>
-          <div className="stack">
-            {projectRoles.length === 0 && <p className="muted">No hay roles definidos para este proyecto.</p>}
-            {projectRoles.map((r) => (
-              <div key={r.id} className="entry-item">
-                {editingRole?.id === r.id ? (
-                  <form className="stack" onSubmit={(e) => { void handleSaveRoleEdit(e) }}>
-                    <label>Nombre<input type="text" value={editRoleForm.name} onChange={(e) => setEditRoleForm((f) => ({ ...f, name: e.target.value }))} required /></label>
-                    <div className="time-grid">
-                      <label>Diaria ($)<input type="number" min={0} step={0.01} value={editRoleForm.dailyRate || ''} onChange={(e) => setEditRoleForm((f) => ({ ...f, dailyRate: parseFloat(e.target.value) || 0 }))} /></label>
-                      <label>Semanal ($)<input type="number" min={0} step={0.01} value={editRoleForm.weeklyRate || ''} onChange={(e) => setEditRoleForm((f) => ({ ...f, weeklyRate: parseFloat(e.target.value) || 0 }))} /></label>
-                    </div>
-                    <label>Mensual ($)<input type="number" min={0} step={0.01} value={editRoleForm.monthlyRate || ''} onChange={(e) => setEditRoleForm((f) => ({ ...f, monthlyRate: parseFloat(e.target.value) || 0 }))} /></label>
-                    <div className="row">
-                      <button className="btn" type="submit">Guardar</button>
-                      <button className="btn btn-outline" type="button" onClick={() => setEditingRole(null)}>Cancelar</button>
-                    </div>
-                  </form>
-                ) : (
-                  <div className="row" style={{ alignItems: 'flex-start' }}>
-                    <div style={{ flex: 1 }}>
-                      <strong>{r.name}</strong>
-                      <p className="muted" style={{ margin: '2px 0', fontSize: '0.82rem' }}>
-                        Diario: ${r.dailyRate.toFixed(2)} | Semanal: ${r.weeklyRate.toFixed(2)} | Mensual: ${r.monthlyRate.toFixed(2)}
-                      </p>
-                    </div>
-                    <div className="row" style={{ gap: '6px' }}>
-                      <button className="btn-sm btn-outline" onClick={() => { setEditingRole(r); setEditRoleForm({ name: r.name, dailyRate: r.dailyRate, weeklyRate: r.weeklyRate, monthlyRate: r.monthlyRate }) }}>Editar</button>
-                      <button className="btn-sm danger" onClick={() => { void handleDeleteRole(r.id) }}>Eliminar</button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-
-          <hr />
-
           <h3>Templates de configuración</h3>
           <p className="muted" style={{ marginTop: 0, fontSize: '0.85rem' }}>Guarda la configuración actual (áreas, roles y parámetros de cálculo) como template reutilizable.</p>
           <div className="row" style={{ marginBottom: '0.75rem' }}>
@@ -1386,6 +1665,7 @@ export function DashboardPage() {
           </nav>
 
           {projectTab === 'PROJECT_CONFIG' && canSeeConfig(currentProfile.role) && (
+            <>
             <section className="card">
               <h2>Configuración del proyecto</h2>
               {!projectConfig ? (
@@ -1509,34 +1789,6 @@ export function DashboardPage() {
                     </select>
                   </label>
 
-                  <div>
-                    <p style={{ margin: '0 0 6px', fontSize: '0.88rem', color: 'var(--text-muted)' }}>Días laborales de la semana</p>
-                    <div className="row" style={{ flexWrap: 'wrap', gap: '6px' }}>
-                      {([['MON','LUN'],['TUE','MAR'],['WED','MIÉ'],['THU','JUE'],['FRI','VIE'],['SAT','SÁB'],['SUN','DOM']] as [string, string][]).map(([v, label]) => {
-                        const isSelected = projectConfig.workWeekPattern.includes(v)
-                        return (
-                          <button
-                            key={v}
-                            type="button"
-                            className={isSelected ? 'btn' : 'btn btn-outline'}
-                            style={{ minWidth: '44px', padding: '4px 8px', fontSize: '0.8rem' }}
-                            onClick={() =>
-                              setProjectConfig((prev) => {
-                                if (!prev) return prev
-                                const next = isSelected
-                                  ? prev.workWeekPattern.filter((d) => d !== v)
-                                  : [...prev.workWeekPattern, v]
-                                return { ...prev, workWeekPattern: next }
-                              })
-                            }
-                          >
-                            {label}
-                          </button>
-                        )
-                      })}
-                    </div>
-                  </div>
-
                   <div className="time-grid">
                     <label>
                       Inicio del rodaje
@@ -1608,7 +1860,7 @@ export function DashboardPage() {
                       />
                     </label>
                     <label>
-                      Jornada adicional (multiplicador)
+                      6to día (multiplicador)
                       <input
                         type="number" min={1} max={10} step={0.5}
                         value={projectConfig.jornadaAdicionalMultiplier}
@@ -1621,6 +1873,24 @@ export function DashboardPage() {
                     </label>
                   </div>
 
+                  <div className="time-grid">
+                    <label>
+                      Fechas futuras
+                      <select
+                        value={projectConfig.futureDatePolicy ?? 'ALLOW'}
+                        onChange={(e) =>
+                          setProjectConfig((prev) =>
+                            prev ? { ...prev, futureDatePolicy: e.target.value as 'ALLOW' | 'TODAY' | 'TODAY_PLUS_ONE' } : prev,
+                          )
+                        }
+                      >
+                        <option value="ALLOW">Permitir cualquier fecha</option>
+                        <option value="TODAY">Impedir posteriores a hoy</option>
+                        <option value="TODAY_PLUS_ONE">Impedir posteriores a hoy + 1</option>
+                      </select>
+                    </label>
+                  </div>
+
                   <button className="btn" type="submit">
                     Guardar configuración
                   </button>
@@ -1628,17 +1898,114 @@ export function DashboardPage() {
                 </form>
               )}
             </section>
+
+            <section className="card">
+              <h3 style={{ marginTop: 0 }}>Áreas del proyecto activo</h3>
+              <p className="muted" style={{ marginTop: 0, fontSize: '0.85rem' }}>Área <strong>TODAS</strong>: los administradores y superusuarios ven todos los registros sin importar el área asignada.</p>
+              <form onSubmit={(e) => { void addArea(e) }} className="row">
+                <input
+                  type="text"
+                  placeholder="Nueva área"
+                  value={newAreaName}
+                  onChange={(event) => setNewAreaName(event.target.value)}
+                />
+                <button className="btn" type="submit">Agregar</button>
+              </form>
+              <div className="stack" style={{ marginTop: '0.5rem' }}>
+                {areas.map((area) => (
+                  <div className="row" key={area.id} style={{ alignItems: 'center' }}>
+                    {editingAreaId === area.id ? (
+                      <>
+                        <input
+                          type="text"
+                          value={editAreaName}
+                          onChange={(e) => setEditAreaName(e.target.value)}
+                          style={{ flex: 1 }}
+                          autoFocus
+                        />
+                        <button className="btn-sm" onClick={() => { void handleSaveAreaRename(area.id) }}>Guardar</button>
+                        <button className="btn-sm btn-outline" onClick={() => setEditingAreaId(null)}>Cancelar</button>
+                      </>
+                    ) : (
+                      <>
+                        <span style={{ flex: 1 }}>{area.name}</span>
+                        <button className="btn-sm btn-outline" onClick={() => { setEditingAreaId(area.id); setEditAreaName(area.name) }}>Renombrar</button>
+                        <button className="btn-sm danger" onClick={() => { void removeArea(area.id) }}>Eliminar</button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <section className="card">
+              <h3 style={{ marginTop: 0 }}>Roles del proyecto activo</h3>
+              <p className="muted" style={{ marginTop: 0, fontSize: '0.85rem' }}>Define los roles con sus tarifas (diaria, semanal, mensual) para usar en liquidaciones.</p>
+              <details style={{ marginBottom: '1rem' }}>
+                <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none' }}>+ Agregar rol</summary>
+                <form className="stack" style={{ marginTop: '0.75rem' }} onSubmit={(e) => { void handleAddRole(e) }}>
+                  <label>Nombre del rol
+                    <input type="text" value={newRoleForm.name} onChange={(e) => setNewRoleForm((f) => ({ ...f, name: e.target.value }))} required placeholder="Ej: Oficial, Ayudante..." />
+                  </label>
+                  <div className="time-grid">
+                    <label>Tarifa diaria ($)<input type="number" min={0} step={0.01} value={newRoleForm.dailyRate || ''} onChange={(e) => setNewRoleForm((f) => ({ ...f, dailyRate: parseFloat(e.target.value) || 0 }))} /></label>
+                    <label>Tarifa semanal ($)<input type="number" min={0} step={0.01} value={newRoleForm.weeklyRate || ''} onChange={(e) => setNewRoleForm((f) => ({ ...f, weeklyRate: parseFloat(e.target.value) || 0 }))} /></label>
+                  </div>
+                  <label>Tarifa mensual ($)<input type="number" min={0} step={0.01} value={newRoleForm.monthlyRate || ''} onChange={(e) => setNewRoleForm((f) => ({ ...f, monthlyRate: parseFloat(e.target.value) || 0 }))} /></label>
+                  <button className="btn" type="submit">Crear rol</button>
+                </form>
+              </details>
+              <div className="stack">
+                {projectRoles.length === 0 && <p className="muted">No hay roles definidos para este proyecto.</p>}
+                {projectRoles.map((r) => (
+                  <div key={r.id} className="entry-item">
+                    {editingRole?.id === r.id ? (
+                      <form className="stack" onSubmit={(e) => { void handleSaveRoleEdit(e) }}>
+                        <label>Nombre<input type="text" value={editRoleForm.name} onChange={(e) => setEditRoleForm((f) => ({ ...f, name: e.target.value }))} required /></label>
+                        <div className="time-grid">
+                          <label>Diaria ($)<input type="number" min={0} step={0.01} value={editRoleForm.dailyRate || ''} onChange={(e) => setEditRoleForm((f) => ({ ...f, dailyRate: parseFloat(e.target.value) || 0 }))} /></label>
+                          <label>Semanal ($)<input type="number" min={0} step={0.01} value={editRoleForm.weeklyRate || ''} onChange={(e) => setEditRoleForm((f) => ({ ...f, weeklyRate: parseFloat(e.target.value) || 0 }))} /></label>
+                        </div>
+                        <label>Mensual ($)<input type="number" min={0} step={0.01} value={editRoleForm.monthlyRate || ''} onChange={(e) => setEditRoleForm((f) => ({ ...f, monthlyRate: parseFloat(e.target.value) || 0 }))} /></label>
+                        <div className="row">
+                          <button className="btn" type="submit">Guardar</button>
+                          <button className="btn btn-outline" type="button" onClick={() => setEditingRole(null)}>Cancelar</button>
+                        </div>
+                      </form>
+                    ) : (
+                      <div className="row" style={{ alignItems: 'flex-start' }}>
+                        <div style={{ flex: 1 }}>
+                          <strong>{r.name}</strong>
+                          <p className="muted" style={{ margin: '2px 0', fontSize: '0.82rem' }}>
+                            Diario: ${r.dailyRate.toFixed(2)} | Semanal: ${r.weeklyRate.toFixed(2)} | Mensual: ${r.monthlyRate.toFixed(2)}
+                          </p>
+                        </div>
+                        <div className="row" style={{ gap: '6px' }}>
+                          <button className="btn-sm btn-outline" onClick={() => { setEditingRole(r); setEditRoleForm({ name: r.name, dailyRate: r.dailyRate, weeklyRate: r.weeklyRate, monthlyRate: r.monthlyRate }) }}>Editar</button>
+                          <button className="btn-sm danger" onClick={() => { void handleDeleteRole(r.id) }}>Eliminar</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+            </>
           )}
 
           {projectTab === 'TIME_ENTRY_FORM' && (
             <section className="card">
               <h2>Cargar horario</h2>
+
+              {/* Cards de ciclo laboral / modo refuerzo eliminadas: el 6to día es manual y el reenganche se decide por ese flag. */}
+
               <form className="stack" onSubmit={submitEntry}>
                 <label>
                   Fecha / jornada
                   <input
                     type="date"
                     value={form.workDate}
+                    max={!canAudit(currentProfile.role) ? (getMaxWorkDate(projectConfig?.futureDatePolicy) ?? undefined) : undefined}
                     onChange={(event) => setForm((prev) => ({ ...prev, workDate: event.target.value }))}
                     required
                   />
@@ -1690,24 +2057,24 @@ export function DashboardPage() {
                     >
                       <option value={0}>0 — Sin penalty</option>
                       <option value={1}>1 penalty</option>
-                      <option value={2}>2 penalties</option>
                     </select>
                   </label>
+                  {/* 6to día: lo marca manualmente el usuario al cargar la jornada. */}
                   <label style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
-                    <span style={{ marginBottom: '4px' }}>Jornada adicional</span>
+                    <span style={{ marginBottom: '4px' }}>6to día</span>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontWeight: 'normal' }}>
                       <input
                         type="checkbox"
                         checked={form.isJornadaAdicional}
                         onChange={(e) => setForm((prev) => ({ ...prev, isJornadaAdicional: e.target.checked }))}
                       />
-                      {form.isJornadaAdicional ? 'Sí — jornada adicional' : 'No'}
+                      {form.isJornadaAdicional ? 'Sí — 6to día' : 'No'}
                     </label>
                   </label>
                 </div>
 
-                <button className="btn" type="submit">
-                  Guardar horario
+                <button className="btn" type="submit" disabled={savingEntry}>
+                  {savingEntry ? <><Spinner size={14} inline /> Guardando…</> : 'Guardar horario'}
                 </button>
               </form>
             </section>
@@ -1736,8 +2103,9 @@ export function DashboardPage() {
               {entries.length === 0 ? (
                 <p className="muted">No hay registros para este proyecto.</p>
               ) : (
+                <>
                 <div className="mobile-table">
-                  {entries.map((entry) => (
+                  {entriesPagination.paged.map((entry) => (
                     <article className="entry-item" key={entry.id}>
                       <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}>
                         <div>
@@ -1745,6 +2113,7 @@ export function DashboardPage() {
                           {entry.userId !== currentProfile.uid && (
                             <span className="chip" style={{ marginLeft: '6px', fontSize: '0.75rem' }}>{entry.userName}</span>
                           )}
+                          {/* Chips de ciclo (IN_CYCLE / OUT_OF_CYCLE / REINFORCEMENT) eliminados: el 6to día es manual y se muestra más abajo como info. */}
                           <p style={{ margin: '2px 0' }}>{entry.timeIn} → {entry.timeOut}</p>
                           <p style={{ margin: '2px 0' }}>
                             Hs: <strong>{entry.calculation.workedHours}</strong>
@@ -1762,19 +2131,36 @@ export function DashboardPage() {
                             {entry.calculation.reengancheExtraHours > 0 && (
                               <> {' | '}Reenganche: {entry.calculation.reengancheExtraHours}</>
                             )}
+                            {' | '}6to día: <strong>{entry.isJornadaAdicional ? 'Sí' : 'No'}</strong>
                           </p>
                           {entry.notes && <p className="muted" style={{ margin: '2px 0' }}>{entry.notes}</p>}
                         </div>
                         {(canAudit(currentProfile.role) || entry.userId === currentProfile.uid) && (
                           <div className="row" style={{ gap: '6px' }}>
-                            <button className="btn-sm" onClick={() => startEditEntry(entry)}>Editar</button>
-                            <button className="btn-sm danger" onClick={() => { void handleDeleteEntry(entry.id, entry.userId) }}>Eliminar</button>
+                            {entry.lockedByAudit && !canAudit(currentProfile.role) ? (
+                              <span className="chip" title="Esta jornada está bloqueada por auditoría" style={{ fontSize: '0.75rem' }}>
+                                🔒 Bloqueada
+                              </span>
+                            ) : (
+                              <>
+                                <button className="btn-sm" onClick={() => startEditEntry(entry)}>Editar</button>
+                                <button className="btn-sm danger" disabled={deletingEntryId === entry.id} onClick={() => { void handleDeleteEntry(entry.id, entry.userId) }}>{deletingEntryId === entry.id ? <><Spinner size={12} inline /> Eliminando…</> : 'Eliminar'}</button>
+                              </>
+                            )}
                           </div>
                         )}
                       </div>
                     </article>
                   ))}
                 </div>
+                <Pagination
+                  totalItems={entriesPagination.totalItems}
+                  pageSize={entriesPagination.pageSize}
+                  page={entriesPagination.page}
+                  onPageChange={entriesPagination.setPage}
+                  onPageSizeChange={entriesPagination.setPageSize}
+                />
+                </>
               )}
             </section>
           )}
@@ -1782,6 +2168,170 @@ export function DashboardPage() {
           {projectTab === 'TIME_ENTRY_AUDIT' && canAudit(currentProfile.role) && (
             <section className="card">
               <h2>Auditoría de horarios</h2>
+
+              {/* ── Bloqueo de ediciones ───────────────────────────────────── */}
+              <details
+                style={{
+                  marginBottom: '1rem',
+                  borderBottom: '1px solid var(--line)',
+                  paddingBottom: '1rem',
+                  background: auditLock?.enabled ? 'rgba(239,68,68,0.06)' : 'transparent',
+                  padding: '0.75rem',
+                  borderRadius: 'var(--radius)',
+                }}
+                open={auditLock?.enabled}
+              >
+                <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none' }}>
+                  🔒 Bloqueo de ediciones
+                  {auditLock?.enabled ? (
+                    <span className="chip" style={{ marginLeft: '8px', background: '#ef4444', color: 'white' }}>
+                      Activo: {formatDate(auditLock.dateFrom)} → {formatDate(auditLock.dateTo)}
+                    </span>
+                  ) : (
+                    <span className="chip" style={{ marginLeft: '8px' }}>Inactivo</span>
+                  )}
+                </summary>
+                <p className="muted" style={{ fontSize: '0.85rem', marginTop: '0.5rem' }}>
+                  Cuando está activo, los miembros no pueden editar ni eliminar jornadas dentro del rango,
+                  ni agregar nuevas jornadas en él si ya informaron días en ese período.
+                  Los administradores pueden seguir editando libremente.
+                </p>
+                <div className="time-grid" style={{ marginTop: '0.5rem' }}>
+                  <label>
+                    Desde
+                    <input
+                      type="date"
+                      value={auditLockForm.dateFrom}
+                      onChange={(e) => setAuditLockForm((p) => ({ ...p, dateFrom: e.target.value }))}
+                      disabled={auditLockBusy}
+                    />
+                  </label>
+                  <label>
+                    Hasta
+                    <input
+                      type="date"
+                      value={auditLockForm.dateTo}
+                      onChange={(e) => setAuditLockForm((p) => ({ ...p, dateTo: e.target.value }))}
+                      disabled={auditLockBusy}
+                    />
+                  </label>
+                </div>
+                <div className="row" style={{ flexWrap: 'wrap', gap: '8px', marginTop: '0.5rem' }}>
+                  {!auditLock?.enabled ? (
+                    <button
+                      className="btn"
+                      onClick={() => { void handleToggleAuditLock(true) }}
+                      disabled={auditLockBusy}
+                    >
+                      {auditLockBusy ? <><Spinner size={14} inline /> Bloqueando…</> : 'Activar bloqueo'}
+                    </button>
+                  ) : (
+                    <button
+                      className="btn btn-outline"
+                      onClick={() => { void handleToggleAuditLock(false) }}
+                      disabled={auditLockBusy}
+                    >
+                      {auditLockBusy ? <><Spinner size={14} inline /> Liberando…</> : 'Desactivar bloqueo'}
+                    </button>
+                  )}
+                </div>
+              </details>
+
+              {/* ── Usuarios sin informar ──────────────────────────────────── */}
+              <details style={{ marginBottom: '1rem', borderBottom: '1px solid var(--line)', paddingBottom: '1rem' }}>
+                <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none' }}>
+                  📋 Usuarios sin informar horarios
+                </summary>
+                <p className="muted" style={{ fontSize: '0.85rem', marginTop: '0.5rem' }}>
+                  Reporta los miembros aprobados del proyecto que no cargaron ninguna jornada en el rango indicado.
+                </p>
+                <div className="time-grid" style={{ marginTop: '0.5rem' }}>
+                  <label>
+                    Desde
+                    <input
+                      type="date"
+                      value={noReportFilters.dateFrom}
+                      onChange={(e) => setNoReportFilters((p) => ({ ...p, dateFrom: e.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Hasta
+                    <input
+                      type="date"
+                      value={noReportFilters.dateTo}
+                      onChange={(e) => setNoReportFilters((p) => ({ ...p, dateTo: e.target.value }))}
+                    />
+                  </label>
+                </div>
+                <div className="time-grid">
+                  <label>
+                    Área
+                    <select
+                      value={noReportFilters.areaId}
+                      onChange={(e) => setNoReportFilters((p) => ({ ...p, areaId: e.target.value }))}
+                    >
+                      <option value="">— Todas las áreas —</option>
+                      {areas.map((a) => (
+                        <option key={a.id} value={a.id}>{a.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <div className="row" style={{ flexWrap: 'wrap', gap: '8px', marginTop: '0.5rem' }}>
+                  <button
+                    className="btn"
+                    onClick={() => { void loadNoReportUsers() }}
+                    disabled={noReportLoading}
+                  >
+                    {noReportLoading ? <><Spinner size={14} inline /> Consultando…</> : 'Buscar'}
+                  </button>
+                </div>
+
+                {noReportRows.length > 0 && (
+                  <div style={{ overflowX: 'auto', marginTop: '0.75rem' }}>
+                    <table className="audit-table">
+                      <thead>
+                        <tr>
+                          <th title="Color de revisión"></th>
+                          <th>Usuario</th>
+                          <th>Email</th>
+                          <th>Área</th>
+                          <th>Días sin informar</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {noReportRows.map((row) => {
+                          const areaName = areas.find((a) => a.id === row.user.areaId)?.name ?? '—'
+                          const rowBg = REVIEW_COLORS.find((c) => c.value === row.user.auditReviewColor)?.tint
+                          return (
+                            <tr key={row.user.uid} style={{ backgroundColor: rowBg }}>
+                              <td style={{ padding: '4px 6px' }}>
+                                <div style={{ display: 'flex', gap: '3px', alignItems: 'center' }}>
+                                  {REVIEW_COLORS.map((rc) => (
+                                    <button
+                                      key={rc.value}
+                                      title={projectConfig?.reviewColorLabels?.[rc.value] ?? rc.defaultLabel}
+                                      onClick={() => { void handleSetUserAuditColor(row.user.uid, row.user.auditReviewColor === rc.value ? '' : rc.value) }}
+                                      style={{ width: 13, height: 13, borderRadius: '50%', background: rc.bg, border: `2px solid ${row.user.auditReviewColor === rc.value ? '#333' : 'transparent'}`, cursor: 'pointer', padding: 0, flexShrink: 0 }}
+                                    />
+                                  ))}
+                                </div>
+                              </td>
+                              <td>{row.user.displayName ?? '—'}</td>
+                              <td>{row.user.email ?? '—'}</td>
+                              <td>{areaName}</td>
+                              <td><strong>{row.totalDaysInRange}</strong></td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {!noReportLoading && noReportRows.length === 0 && noReportFilters.dateFrom && noReportFilters.dateTo && (
+                  <p className="muted" style={{ marginTop: '0.5rem' }}>Sin resultados (todos los miembros informaron al menos un día en el rango).</p>
+                )}
+              </details>
 
               {/* Form admin: cargar jornada para otro usuario */}
               <details style={{ marginBottom: '1rem', borderBottom: '1px solid var(--line)', paddingBottom: '1rem' }}>
@@ -1818,11 +2368,10 @@ export function DashboardPage() {
                       <select value={adminEntryForm.penalties} onChange={(e) => setAdminEntryForm((f) => ({ ...f, penalties: Number(e.target.value) }))}>
                         <option value={0}>0 — Sin penalty</option>
                         <option value={1}>1 penalty</option>
-                        <option value={2}>2 penalties</option>
                       </select>
                     </label>
                     <label style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
-                      <span style={{ marginBottom: '4px' }}>Jornada adicional</span>
+                      <span style={{ marginBottom: '4px' }}>6to día</span>
                       <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontWeight: 'normal' }}>
                         <input type="checkbox" checked={adminEntryForm.isJornadaAdicional} onChange={(e) => setAdminEntryForm((f) => ({ ...f, isJornadaAdicional: e.target.checked }))} />
                         {adminEntryForm.isJornadaAdicional ? 'Sí' : 'No'}
@@ -1874,7 +2423,7 @@ export function DashboardPage() {
                 </div>
                 <div className="row" style={{ flexWrap: 'wrap', gap: '8px' }}>
                   <button className="btn" onClick={() => { void loadAuditEntries() }} disabled={auditLoading}>
-                    {auditLoading ? 'Cargando...' : 'Buscar'}
+                    {auditLoading ? <><Spinner size={14} inline /> Cargando…</> : 'Buscar'}
                   </button>
                   {auditEntries.length > 0 && (
                     <button className="btn btn-outline" onClick={exportAuditExcel}>
@@ -1916,11 +2465,10 @@ export function DashboardPage() {
                         <select value={editAuditForm.penalties} onChange={(e) => setEditAuditForm((f) => ({ ...f, penalties: Number(e.target.value) }))}>
                           <option value={0}>0</option>
                           <option value={1}>1</option>
-                          <option value={2}>2</option>
                         </select>
                       </label>
                       <label style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
-                        <span style={{ marginBottom: '4px' }}>Jornada adicional</span>
+                        <span style={{ marginBottom: '4px' }}>6to día</span>
                         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontWeight: 'normal' }}>
                           <input type="checkbox" checked={editAuditForm.isJornadaAdicional} onChange={(e) => setEditAuditForm((f) => ({ ...f, isJornadaAdicional: e.target.checked }))} />
                           {editAuditForm.isJornadaAdicional ? 'Sí' : 'No'}
@@ -1976,13 +2524,13 @@ export function DashboardPage() {
                         <th>Reenganche</th>
                         <th>Pen.</th>
                         <th title="Extras + Enganche + Reenganche + Penalties">Tot. Ext.</th>
-                        <th>J. Adic.</th>
+                        <th>6to día</th>
                         <th>Obs.</th>
                         <th>Acciones</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {auditEntries.map((entry) => {
+                      {auditPagination.paged.map((entry) => {
                         const totalExtras = (entry.calculation.overtimeHours ?? 0)
                           + (entry.calculation.engancheExtraHours ?? 0)
                           + (entry.calculation.reengancheExtraHours ?? 0)
@@ -2028,6 +2576,14 @@ export function DashboardPage() {
                       })}
                     </tbody>
                   </table>
+                  <Pagination
+                    totalItems={auditPagination.totalItems}
+                    pageSize={auditPagination.pageSize}
+                    page={auditPagination.page}
+                    onPageChange={auditPagination.setPage}
+                    onPageSizeChange={auditPagination.setPageSize}
+                    pageSizeOptions={[25, 50, 100, 200]}
+                  />
                 </div>
               ) : (
                 !auditLoading && <p className="muted">Aplicá filtros y presioná Buscar para ver registros.</p>
@@ -2055,7 +2611,7 @@ export function DashboardPage() {
                   </div>
                 </div>
                 <button type="submit" className="btn" disabled={settlementLoading}>
-                  {settlementLoading ? 'Calculando...' : 'Calcular'}
+                  {settlementLoading ? <><Spinner size={14} inline /> Calculando…</> : 'Calcular'}
                 </button>
               </form>
 
@@ -2074,7 +2630,7 @@ export function DashboardPage() {
                           onClick={() => { void handleSaveSettlement() }}
                           disabled={settlementLoading || editableLines.length === 0}
                         >
-                          {settlementLoading ? 'Guardando...' : 'Guardar Liquidación'}
+                          {settlementLoading ? <><Spinner size={14} inline /> Guardando…</> : 'Guardar Liquidación'}
                         </button>
                       )}
                       <button className="btn btn-outline" onClick={() => exportSettlementExcel({ ...currentSettlement, lines: editableLines })}>
@@ -2120,7 +2676,7 @@ export function DashboardPage() {
                             <th>Hs. Norm.</th><th>Hs. Ext.</th><th>Hs. Noct.</th>
                             <th title="Horas extra que caen en ventana nocturna">Noct. Ext.</th>
                             <th>Enganches</th><th>Reenganches</th>
-                            <th title="Cantidad de jornadas adicionales">J. Adic.</th>
+                            <th title="Cantidad de 6tos días">6to día</th>
                             <th>Pen.</th>
                             <th title="Extras + Enganche + Reenganche + Penalties">Tot. Ext.</th>
                             <th>Total Hs.</th><th>Total $</th>
@@ -2225,7 +2781,7 @@ export function DashboardPage() {
                   <hr />
                   <h3>Historial de Liquidaciones</h3>
                   <div className="stack">
-                    {pastSettlements.map((s) => (
+                    {settlementsPagination.paged.map((s) => (
                       <div key={s.id} className="entry-item" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <div>
                           <strong>{formatDate(s.dateFrom)} → {formatDate(s.dateTo)}</strong>
@@ -2247,6 +2803,14 @@ export function DashboardPage() {
                       </div>
                     ))}
                   </div>
+                  <Pagination
+                    totalItems={settlementsPagination.totalItems}
+                    pageSize={settlementsPagination.pageSize}
+                    page={settlementsPagination.page}
+                    onPageChange={settlementsPagination.setPage}
+                    onPageSizeChange={settlementsPagination.setPageSize}
+                    pageSizeOptions={[5, 10, 25, 50]}
+                  />
                 </>
               )}
             </section>
@@ -2412,6 +2976,12 @@ export function DashboardPage() {
                           {u.isPlaceholder && (
                             <span className="chip" style={{ background: '#f97316', color: '#fff', fontSize: '0.72rem' }}>Sin primer acceso</span>
                           )}
+                          {u.disabled && (
+                            <span className="chip" style={{ background: '#ef4444', color: '#fff', fontSize: '0.72rem' }}>Inhabilitado</span>
+                          )}
+                          {u.cycleMode === 'REINFORCEMENT' && (
+                            <span className="chip" style={{ background: '#8b5cf6', color: '#fff', fontSize: '0.72rem' }}>Refuerzo</span>
+                          )}
                           <span className="chip">{u.role}</span>
                           {u.projectId && (
                             <span className="chip">
@@ -2430,7 +3000,31 @@ export function DashboardPage() {
                           )}
                         </div>
                       </div>
-                      <button className="btn-sm btn-outline" onClick={() => openEditUser(u)}>Editar</button>
+                      <div className="row" style={{ gap: '6px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                        <button className="btn-sm btn-outline" onClick={() => openEditUser(u)}>Editar</button>
+                        <button
+                          className="btn-sm btn-outline"
+                          onClick={() => handleToggleUserDisabled(u)}
+                          disabled={u.uid === profile?.uid}
+                          title={u.uid === profile?.uid ? 'No podés inhabilitar tu propia cuenta' : ''}
+                        >
+                          {u.disabled ? 'Rehabilitar' : 'Inhabilitar'}
+                        </button>
+                        <button
+                          className="btn-sm danger"
+                          onClick={() => handleDeleteApprovedUser(u)}
+                          disabled={u.uid === profile?.uid || u.role === 'SUPERUSER'}
+                          title={
+                            u.uid === profile?.uid
+                              ? 'No podés eliminar tu propia cuenta'
+                              : u.role === 'SUPERUSER'
+                              ? 'No se puede eliminar un Superusuario'
+                              : ''
+                          }
+                        >
+                          Eliminar
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -2440,25 +3034,24 @@ export function DashboardPage() {
         </>
       )}
 
-      {/* === SOPORTE / CHAT === */}
-      {mainTab === 'SUPPORT' && (
-        activeProjectId ? (
-          <SupportChatPanel
-            viewer={currentProfile}
-            projectId={activeProjectId}
-            projectName={activeProjectName}
-            areas={areas}
-            showToast={showToast}
-          />
-        ) : (
-          <section className="card">
-            <p className="muted">Seleccioná un proyecto para usar el chat de soporte.</p>
-          </section>
-        )
-      )}
-
-      {/* === AYUDA === */}
+      {/* === AYUDA (incluye Soporte) === */}
       {mainTab === 'HELP' && (
+        <>
+          <section className="card">
+            <h2>Soporte</h2>
+            {activeProjectId ? (
+              <SupportChatPanel
+                viewer={currentProfile}
+                projectId={activeProjectId}
+                projectName={activeProjectName}
+                areas={areas}
+                showToast={showToast}
+              />
+            ) : (
+              <p className="muted">Seleccioná un proyecto para usar el chat de soporte.</p>
+            )}
+          </section>
+
         <section className="card">
           <h2>Ayuda y guía de uso</h2>
 
@@ -2500,7 +3093,7 @@ export function DashboardPage() {
           <h3>Carga de jornadas (solapa Horarios)</h3>
           <ul style={{ paddingLeft: '1.25rem', lineHeight: '1.8' }}>
             <li>Seleccioná el proyecto activo en el menú superior.</li>
-            <li><strong>Cargar horario:</strong> fecha, etiqueta de turno, hora de entrada, hora de salida, notas, penalties y "jornada adicional" si aplica.</li>
+            <li><strong>Cargar horario:</strong> fecha, etiqueta de turno, hora de entrada, hora de salida, notas, penalties y "6to día" si aplica.</li>
             <li><strong>Mis horarios / Horarios del área / Horarios del proyecto</strong> (según rol): listado para revisar, editar o eliminar registros que no estén bloqueados.</li>
             <li>Las horas extras, nocturnas y multiplicadores se calculan automáticamente según la <em>Configuración</em> del proyecto.</li>
           </ul>
@@ -2556,6 +3149,7 @@ export function DashboardPage() {
             <li><strong>Colores de revisión:</strong> personalizá las etiquetas de cada color de auditoría.</li>
           </ul>
         </section>
+        </>
       )}
 
       {/* === MODAL: Editar propia jornada === */}
@@ -2565,7 +3159,7 @@ export function DashboardPage() {
             <h3>Editar jornada</h3>
             <form className="stack" onSubmit={(e) => { void submitEditEntry(e) }}>
               <label>Fecha
-                <input type="date" value={editEntryForm.workDate} onChange={(e) => setEditEntryForm((f) => ({ ...f, workDate: e.target.value }))} required />
+                <input type="date" value={editEntryForm.workDate} max={!canAudit(currentProfile.role) ? (getMaxWorkDate(projectConfig?.futureDatePolicy) ?? undefined) : undefined} onChange={(e) => setEditEntryForm((f) => ({ ...f, workDate: e.target.value }))} required />
               </label>
               <label>Etiqueta
                 <input type="text" value={editEntryForm.shiftLabel} onChange={(e) => setEditEntryForm((f) => ({ ...f, shiftLabel: e.target.value }))} />
@@ -2582,11 +3176,10 @@ export function DashboardPage() {
                   <select value={editEntryForm.penalties} onChange={(e) => setEditEntryForm((f) => ({ ...f, penalties: Number(e.target.value) }))}>
                     <option value={0}>0 — Sin penalty</option>
                     <option value={1}>1 penalty</option>
-                    <option value={2}>2 penalties</option>
                   </select>
                 </label>
                 <label style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
-                  <span style={{ marginBottom: '4px' }}>Jornada adicional</span>
+                  <span style={{ marginBottom: '4px' }}>6to día</span>
                   <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontWeight: 'normal' }}>
                     <input type="checkbox" checked={editEntryForm.isJornadaAdicional} onChange={(e) => setEditEntryForm((f) => ({ ...f, isJornadaAdicional: e.target.checked }))} />
                     {editEntryForm.isJornadaAdicional ? 'Sí' : 'No'}
@@ -2594,8 +3187,10 @@ export function DashboardPage() {
                 </label>
               </div>
               <div className="row">
-                <button className="btn" type="submit">Guardar</button>
-                <button className="btn btn-outline" type="button" onClick={() => setEditingEntry(null)}>Cancelar</button>
+                <button className="btn" type="submit" disabled={savingEditEntry}>
+                  {savingEditEntry ? <><Spinner size={14} inline /> Guardando…</> : 'Guardar'}
+                </button>
+                <button className="btn btn-outline" type="button" disabled={savingEditEntry} onClick={() => setEditingEntry(null)}>Cancelar</button>
               </div>
             </form>
           </div>
@@ -2715,6 +3310,19 @@ export function DashboardPage() {
                   ))}
                 </select>
               </label>
+              <label>
+                Tipo de ciclo
+                <select
+                  value={editUserForm.cycleMode}
+                  onChange={(e) => setEditUserForm((f) => ({ ...f, cycleMode: e.target.value as 'CYCLE' | 'REINFORCEMENT' }))}
+                >
+                  <option value="CYCLE">Ciclo normal (con reenganche)</option>
+                  <option value="REINFORCEMENT">Refuerzo (sin reenganche)</option>
+                </select>
+                <span className="muted" style={{ fontSize: '0.78rem' }}>
+                  Refuerzo: el usuario no recibe avisos de 6to día ni se le calcula reenganche. El enganche se sigue calculando normalmente.
+                </span>
+              </label>
               <p className="muted" style={{ fontSize: '0.8rem', margin: '0' }}>
                 Nota: el nombre se actualiza en el sistema pero se sincronizará nuevamente desde Google en el próximo inicio de sesión.
               </p>
@@ -2733,6 +3341,17 @@ export function DashboardPage() {
           <div key={t.id} className={`toast toast-${t.type}`}>{t.message}</div>
         ))}
       </div>
+
+      {/* === LOADING OVERLAY === */}
+      <LoadingOverlay
+        show={anyLoading}
+        label={
+          auditLoading ? 'Buscando registros…'
+          : settlementLoading ? 'Procesando liquidación…'
+          : importLoading ? 'Importando miembros…'
+          : 'Procesando…'
+        }
+      />
     </div>
   )
 }

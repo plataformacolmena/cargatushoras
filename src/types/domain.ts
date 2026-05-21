@@ -1,6 +1,11 @@
 export type AppRole = 'SUPERUSER' | 'PROJECT_ADMIN' | 'MEMBER'
 export type ApprovalStatus = 'PENDING' | 'APPROVED'
 
+// Modo del usuario respecto al ciclo laboral.
+// CYCLE: trabaja por ciclos semanales declarados (con anchor + weeklyWorkDays).
+// REINFORCEMENT: refuerzo por jornada puntual; solo enganche, sin reenganche ni jornada adicional.
+export type CycleMode = 'CYCLE' | 'REINFORCEMENT'
+
 export interface UserProfile {
   uid: string
   email: string | null
@@ -10,11 +15,52 @@ export interface UserProfile {
   projectId?: string
   areaId?: string
   roleId?: string
+  cycleMode?: CycleMode      // default 'CYCLE'
   isPlaceholder?: boolean    // true = creado por admin, aún no ha iniciado sesión
   mergedToUid?: string       // UID real al que se migró este placeholder
   migratedFromUid?: string   // UID del placeholder del que proviene este perfil real
+  auditReviewColor?: string  // color de revisión asignado por admin en reporte "sin informar"
+  disabled?: boolean         // true = inhabilitado por admin; no puede iniciar sesión
   createdAt?: unknown
   updatedAt?: unknown
+}
+
+// Ciclo laboral declarado por un usuario en un proyecto.
+// - anchorDate: primer día laboral del ciclo (YYYY-MM-DD).
+// - El ciclo dura desde anchorDate (incl.) hasta closedFromDate (excl.) si está cerrado;
+//   si no, está abierto (sin límite superior).
+// - Solo un ciclo abierto por (userId, projectId).
+export interface WorkCycle {
+  id: string
+  userId: string
+  projectId: string
+  anchorDate: string                 // YYYY-MM-DD
+  closedAt?: unknown
+  closedBy?: string
+  closedFromDate?: string            // YYYY-MM-DD; si presente, ciclo cerrado
+  createdBy: string
+  createdAt?: unknown
+  updatedBy?: string
+  updatedAt?: unknown
+}
+
+// Ámbito del cálculo de ciclo para una entry.
+// IN_CYCLE: la entry cae dentro de un ciclo activo del usuario.
+// OUT_OF_CYCLE: el usuario es CYCLE pero la entry está fuera de cualquier ciclo (sin ciclo declarado, anterior al anchor, o posterior a closedFromDate sin ciclo nuevo).
+// REINFORCEMENT: el usuario es refuerzo por jornada.
+export type CycleScope = 'IN_CYCLE' | 'OUT_OF_CYCLE' | 'REINFORCEMENT'
+
+// Bloqueo de ediciones a nivel de proyecto.
+// Cuando enabled=true, las entradas con workDate entre dateFrom y dateTo
+// quedan marcadas con lockedByAudit=true y los miembros no pueden
+// editarlas/eliminarlas ni crear nuevas en ese rango (los admins sí).
+export interface AuditLock {
+  projectId: string
+  enabled: boolean
+  dateFrom: string  // YYYY-MM-DD
+  dateTo: string    // YYYY-MM-DD
+  updatedAt?: unknown
+  updatedBy?: string
 }
 
 export interface Project {
@@ -59,6 +105,11 @@ export interface ProjectConfig {
   reengancheHours: number           // mín. horas entre última/primera jornada de semanas adyacentes (0=desactivado)
   penaltyHours: number              // horas que suma cada penalty marcado (0=desactivado)
   jornadaAdicionalMultiplier: number // multiplicador jornada adicional (default 1)
+  // Política de fechas futuras al cargar jornadas (admins quedan exentos).
+  //  - 'ALLOW': sin restricción (default por compatibilidad)
+  //  - 'TODAY': la fecha máxima permitida es hoy
+  //  - 'TODAY_PLUS_ONE': la fecha máxima permitida es hoy + 1 día
+  futureDatePolicy?: 'ALLOW' | 'TODAY' | 'TODAY_PLUS_ONE'
   reviewColorLabels?: Record<string, string> // leyenda de colores de revisión por proyecto
 }
 
@@ -94,7 +145,12 @@ export interface TimeEntry extends TimeEntryInput {
   calculationVersion: string
   calculationSource: 'client'
   lockedByAdmin: boolean
+  lockedByAudit?: boolean            // bloqueado por auditoría (impide edición a miembros)
   reviewColor?: string               // color de revisión asignado por admin
+  // Campos derivados del ciclo laboral del usuario (calculados al guardar/recalcular):
+  cycleScope?: CycleScope            // IN_CYCLE | OUT_OF_CYCLE | REINFORCEMENT
+  cycleDayInWeek?: number            // 0..6 (solo si IN_CYCLE)
+  cycleWeekIndex?: number            // semana cronológica relativa al anchor (solo si IN_CYCLE)
   createdAt?: unknown
   updatedAt?: unknown
 }
@@ -176,6 +232,7 @@ export interface Settlement {
 // ─── Chat / Soporte ──────────────────────────────────────────────────────────
 
 export type ChatScope = 'PRIVATE' | 'AREA' | 'PUBLIC'
+export type ChatThreadStatus = 'OPEN' | 'CLOSED'
 
 export interface ChatThread {
   id: string
@@ -183,6 +240,10 @@ export interface ChatThread {
   scope: ChatScope
   areaId?: string                // requerido si scope === 'AREA'
   title: string
+  status?: ChatThreadStatus      // 'OPEN' (default) | 'CLOSED' (respondida/cerrada)
+  closedAt?: unknown
+  closedBy?: string              // uid
+  closedByName?: string
   createdBy: string              // uid
   createdByName: string
   createdByRole: AppRole

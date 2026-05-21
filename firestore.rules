@@ -25,27 +25,45 @@ service cloud.firestore {
 
     match /users/{uid} {
       allow read: if (isSignedIn() && request.auth.uid == uid) || isAdminRole() ||
-        // Permite a cualquier usuario autenticado leer placeholders (el filtro mergedToUid se hace en cliente).
-        // Necesario para que un usuario recién registrado encuentre su placeholder por email.
-        (isSignedIn() && resource.data.isPlaceholder == true);
+        // Permite a un usuario autenticado leer sólo placeholders cuyo email
+        // coincida con el suyo. Necesario para que un usuario recién registrado
+        // encuentre y reclame su propio placeholder, sin permitir enumerar
+        // todos los placeholders del sistema.
+        (isSignedIn() &&
+          resource.data.isPlaceholder == true &&
+          request.auth.token.email != null &&
+          resource.data.email == request.auth.token.email.lower());
       allow create: if (isSignedIn() && request.auth.uid == uid) || isAdminRole();
       allow update: if (
         isSignedIn() &&
         request.auth.uid == uid &&
         request.resource.data.role == resource.data.role &&
-        request.resource.data.approvalStatus == resource.data.approvalStatus
-      ) || isAdminRole() || (
+        request.resource.data.approvalStatus == resource.data.approvalStatus &&
+        request.resource.data.get('cycleMode', 'CYCLE') == resource.data.get('cycleMode', 'CYCLE')
+      ) || (
+        isAdminRole() &&
+        // Defensa en profundidad: si se cambia el rol, debe ser un valor válido.
+        request.resource.data.role in ['SUPERUSER', 'PROJECT_ADMIN', 'MEMBER']
+      ) || (
         // Cualquier usuario autenticado puede marcar como fusionado un placeholder cuyo email coincida con el suyo.
         // (No requiere estar APPROVED — el placeholder PENDING también se puede reclamar al primer login.)
         isSignedIn() &&
         resource.data.isPlaceholder == true &&
         resource.data.mergedToUid == null &&
+        request.auth.token.email != null &&
+        resource.data.email == request.auth.token.email.lower() &&
         request.resource.data.mergedToUid == request.auth.uid &&
         request.resource.data.approvalStatus == resource.data.approvalStatus &&
         request.resource.data.role == resource.data.role &&
         request.resource.data.email == resource.data.email
       );
-      allow delete: if isAdminRole() && resource.data.isPlaceholder == true;
+      allow delete: if isAdminRole() && (
+        resource.data.isPlaceholder == true ||
+        (
+          resource.data.role != 'SUPERUSER' &&
+          request.auth.uid != uid
+        )
+      );
     }
 
     match /projects/{projectId} {
@@ -88,10 +106,15 @@ service cloud.firestore {
         request.resource.data.calculationSource == 'client' &&
         request.resource.data.calculationVersion == 'v1-client');
 
-      allow update: if isAdminRole() || (
+      allow update: if (isAdminRole() && (
+        // Defensa en profundidad: si se cambia el color de revisión, debe estar en el set permitido.
+        !('reviewColor' in request.resource.data) ||
+        request.resource.data.reviewColor in ['', 'green', 'yellow', 'red', 'orange', 'blue']
+      )) || (
         isApproved() &&
         resource.data.userId == request.auth.uid &&
         resource.data.lockedByAdmin == false &&
+        resource.data.get('lockedByAudit', false) == false &&
         request.resource.data.calculationSource == resource.data.calculationSource &&
         request.resource.data.calculationVersion == resource.data.calculationVersion
       ) || (
@@ -105,8 +128,49 @@ service cloud.firestore {
       allow delete: if isSuperUser() || isAdminRole() || (
         isApproved() &&
         resource.data.userId == request.auth.uid &&
-        resource.data.lockedByAdmin == false
+        resource.data.lockedByAdmin == false &&
+        resource.data.get('lockedByAudit', false) == false
       );
+    }
+
+    // ─── Bloqueo de ediciones por auditoría ───────────────────────────────
+    match /audit_locks/{projectId} {
+      allow read: if isApproved();
+      allow create, update: if isAdminRole();
+      allow delete: if isSuperUser();
+    }
+
+    // ─── Ciclos laborales por usuario ─────────────────────────────────────
+    // user_work_cycles/{cycleId}: { userId, projectId, anchorDate, closedFromDate?, closedAt?, closedBy?, createdBy, createdAt, updatedAt? }
+    match /user_work_cycles/{cycleId} {
+      // Read: el propio dueño del ciclo, o cualquier admin/super del sistema.
+      allow read: if isAdminRole() || (isApproved() && resource.data.userId == request.auth.uid);
+
+      // Create: el propio usuario (modo CYCLE, no REINFORCEMENT) o un admin.
+      //   - userId del nuevo ciclo debe coincidir con request.auth.uid (o ser admin).
+      //   - anchorDate es string YYYY-MM-DD básico.
+      //   - createdBy debe ser request.auth.uid.
+      //   - No puede estar pre-cerrado.
+      allow create: if (
+        isAdminRole() &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.anchorDate is string &&
+        !('closedFromDate' in request.resource.data)
+      ) || (
+        isApproved() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.anchorDate is string &&
+        !('closedFromDate' in request.resource.data) &&
+        // El usuario debe estar en modo CYCLE (default si no está seteado).
+        requester().data.get('cycleMode', 'CYCLE') == 'CYCLE'
+      );
+
+      // Update / close / reopen / edit anchor: solo admins.
+      allow update: if isAdminRole();
+
+      // Delete: solo SUPERUSER.
+      allow delete: if isSuperUser();
     }
 
     match /settlements/{settlementId} {
@@ -163,11 +227,19 @@ service cloud.firestore {
           (request.resource.data.areaId is string &&
             request.resource.data.areaId == requester().data.areaId));
 
-      // Update: solo para refrescar resumen del último mensaje (cualquier participante con acceso)
+      // Update: refrescar resumen del último mensaje (cualquier participante con acceso)
+      // o cambiar status (solo superuser / admin del proyecto)
       allow update: if canView() &&
         request.resource.data.projectId == resource.data.projectId &&
         request.resource.data.scope == resource.data.scope &&
-        request.resource.data.createdBy == resource.data.createdBy;
+        request.resource.data.createdBy == resource.data.createdBy && (
+          // Caso 1: status no cambia (refresco normal de lastMessage)
+          (request.resource.data.get('status', 'OPEN') == resource.data.get('status', 'OPEN')) ||
+          // Caso 2: cambia status → solo superuser o admin del proyecto
+          isSuperUser() ||
+          (requester().data.role == 'PROJECT_ADMIN' &&
+            requester().data.projectId == resource.data.projectId)
+        );
 
       // Borrar: admin del proyecto, superuser, o el creador
       allow delete: if isSuperUser() ||
@@ -196,10 +268,13 @@ service cloud.firestore {
 
         allow read: if canViewParent();
         allow create: if canViewParent() &&
+          parentThread().get('status', 'OPEN') == 'OPEN' &&
           request.resource.data.senderUid == request.auth.uid &&
           request.resource.data.text is string &&
           request.resource.data.text.size() > 0 &&
-          request.resource.data.text.size() <= 4000;
+          request.resource.data.text.size() <= 4000 &&
+          // No permitir mensajes que sean sólo espacios en blanco.
+          request.resource.data.text.matches('[\\s\\S]*\\S[\\s\\S]*');
         allow update: if false;
         allow delete: if isSuperUser() ||
           (requester().data.role == 'PROJECT_ADMIN' &&

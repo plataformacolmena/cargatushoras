@@ -2,9 +2,12 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import type { ChatMessage, ChatScope, ChatThread, ProjectArea, UserProfile } from '../types/domain'
 import {
   canDeleteThread,
+  canManageThreadStatus,
   canPostInThread,
+  closeChatThread,
   createChatThread,
   deleteChatThread,
+  reopenChatThread,
   scopeLabel,
   sendChatMessage,
   subscribeToChatThreads,
@@ -19,6 +22,25 @@ interface Props {
   showToast: (msg: string, type?: 'success' | 'error' | 'info') => void
 }
 
+const BLOCKED_HINT =
+  'No se pudieron cargar las conversaciones. Es posible que una extensión del navegador (bloqueador de anuncios o privacidad) esté bloqueando Firestore. Probá desactivarla para este sitio o usar una ventana de incógnito.'
+
+function isLikelyBlockedError(err: unknown): boolean {
+  if (!err) return false
+  const e = err as { code?: string; message?: string; name?: string }
+  const code = String(e.code ?? '').toLowerCase()
+  const msg = String(e.message ?? '').toLowerCase()
+  return (
+    code === 'unavailable' ||
+    code === 'failed-precondition' ||
+    msg.includes('blocked_by_client') ||
+    msg.includes('err_blocked') ||
+    msg.includes('network error') ||
+    msg.includes('webchannel') ||
+    msg.includes('failed to fetch')
+  )
+}
+
 export function SupportChatPanel({ viewer, projectId, projectName, areas, showToast }: Props) {
   const [threads, setThreads] = useState<ChatThread[]>([])
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null)
@@ -29,6 +51,9 @@ export function SupportChatPanel({ viewer, projectId, projectName, areas, showTo
   const [newScope, setNewScope] = useState<ChatScope>('PRIVATE')
   const [newAreaId, setNewAreaId] = useState<string>(viewer.areaId ?? '')
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null)
+  const threadsErrorShownRef = useRef(false)
+  const messagesErrorShownRef = useRef(false)
 
   // Suscripción a hilos del proyecto
   useEffect(() => {
@@ -36,13 +61,19 @@ export function SupportChatPanel({ viewer, projectId, projectName, areas, showTo
       setThreads([])
       return
     }
+    threadsErrorShownRef.current = false
     const unsub = subscribeToChatThreads(
       projectId,
       viewer,
       setThreads,
       (err) => {
         console.error('[chat] subscribeToChatThreads error:', err)
-        showToast('No se pudieron cargar las conversaciones.', 'error')
+        if (threadsErrorShownRef.current) return
+        threadsErrorShownRef.current = true
+        const msg = isLikelyBlockedError(err)
+          ? BLOCKED_HINT
+          : 'No se pudieron cargar las conversaciones.'
+        showToast(msg, 'error')
       },
     )
     return unsub
@@ -54,20 +85,30 @@ export function SupportChatPanel({ viewer, projectId, projectName, areas, showTo
       setMessages([])
       return
     }
+    messagesErrorShownRef.current = false
     const unsub = subscribeToThreadMessages(
       selectedThreadId,
       setMessages,
       (err) => {
         console.error('[chat] subscribeToThreadMessages error:', err)
-        showToast('No se pudieron cargar los mensajes.', 'error')
+        if (messagesErrorShownRef.current) return
+        messagesErrorShownRef.current = true
+        const msg = isLikelyBlockedError(err)
+          ? 'No se pudieron cargar los mensajes. Es posible que una extensión del navegador esté bloqueando Firestore. Probá desactivarla para este sitio.'
+          : 'No se pudieron cargar los mensajes.'
+        showToast(msg, 'error')
       },
     )
     return unsub
   }, [selectedThreadId, showToast])
 
-  // Auto scroll al final cuando llegan mensajes
+  // Auto scroll al final cuando llegan mensajes (solo dentro del contenedor,
+  // sin afectar el scroll de la página).
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const c = messagesContainerRef.current
+    if (c) {
+      c.scrollTop = c.scrollHeight
+    }
   }, [messages])
 
   const selectedThread = useMemo(
@@ -101,7 +142,10 @@ export function SupportChatPanel({ viewer, projectId, projectName, areas, showTo
       showToast('Conversación creada.')
     } catch (err) {
       console.error(err)
-      showToast('No se pudo crear la conversación.', 'error')
+      const msg = isLikelyBlockedError(err)
+        ? 'No se pudo crear la conversación. Es posible que una extensión del navegador esté bloqueando Firestore. Probá desactivarla para este sitio.'
+        : 'No se pudo crear la conversación.'
+      showToast(msg, 'error')
     }
   }
 
@@ -113,7 +157,10 @@ export function SupportChatPanel({ viewer, projectId, projectName, areas, showTo
       setDraft('')
     } catch (err) {
       console.error(err)
-      showToast('No se pudo enviar el mensaje.', 'error')
+      const msg = isLikelyBlockedError(err)
+        ? 'No se pudo enviar el mensaje. Es posible que una extensión del navegador esté bloqueando Firestore.'
+        : 'No se pudo enviar el mensaje.'
+      showToast(msg, 'error')
     }
   }
 
@@ -130,8 +177,27 @@ export function SupportChatPanel({ viewer, projectId, projectName, areas, showTo
     }
   }
 
-  const canPost = selectedThread ? canPostInThread(selectedThread, viewer) : false
+  async function handleToggleStatus() {
+    if (!selectedThread) return
+    const isClosed = selectedThread.status === 'CLOSED'
+    try {
+      if (isClosed) {
+        await reopenChatThread(selectedThread.id)
+        showToast('Conversación reabierta.')
+      } else {
+        await closeChatThread(selectedThread.id, viewer)
+        showToast('Conversación marcada como respondida.')
+      }
+    } catch (err) {
+      console.error(err)
+      showToast('No se pudo actualizar el estado.', 'error')
+    }
+  }
+
+  const isClosed = selectedThread?.status === 'CLOSED'
+  const canPost = selectedThread ? canPostInThread(selectedThread, viewer) && !isClosed : false
   const canDelete = selectedThread ? canDeleteThread(selectedThread, viewer) : false
+  const canManageStatus = selectedThread ? canManageThreadStatus(selectedThread, viewer) : false
 
   // MEMBER no puede iniciar AREA si no tiene area asignada
   const memberHasArea = !!viewer.areaId
@@ -202,10 +268,13 @@ export function SupportChatPanel({ viewer, projectId, projectName, areas, showTo
               threads.map((t) => (
                 <button
                   key={t.id}
-                  className={`chat-thread-item ${selectedThreadId === t.id ? 'active' : ''}`}
+                  className={`chat-thread-item ${selectedThreadId === t.id ? 'active' : ''} ${t.status === 'CLOSED' ? 'closed' : ''}`}
                   onClick={() => setSelectedThreadId(t.id)}
                 >
-                  <div className="chat-thread-title">{t.title}</div>
+                  <div className="chat-thread-title">
+                    {t.status === 'CLOSED' && <span className="chat-status-badge closed" title="Cerrada/Respondida">✓</span>}
+                    {t.title}
+                  </div>
                   <div className="chat-thread-meta">
                     <span className={`chat-scope-badge scope-${t.scope.toLowerCase()}`}>{scopeLabel(t.scope)}</span>
                     <span className="muted">{t.createdByName}</span>
@@ -231,22 +300,39 @@ export function SupportChatPanel({ viewer, projectId, projectName, areas, showTo
             <>
               <div className="chat-main-header">
                 <div>
-                  <h3 style={{ margin: 0 }}>{selectedThread.title}</h3>
+                  <h3 style={{ margin: 0 }}>
+                    {selectedThread.title}
+                    {isClosed && <span className="chat-status-badge closed" style={{ marginLeft: 8 }}>✓ Respondida</span>}
+                  </h3>
                   <p className="muted" style={{ margin: '0.25rem 0 0', fontSize: '0.85rem' }}>
                     <span className={`chat-scope-badge scope-${selectedThread.scope.toLowerCase()}`}>
                       {scopeLabel(selectedThread.scope)}
                     </span>
                     {' '}· Iniciada por {selectedThread.createdByName}
+                    {isClosed && selectedThread.closedByName && (
+                      <> · Cerrada por {selectedThread.closedByName}</>
+                    )}
                   </p>
                 </div>
-                {canDelete && (
-                  <button className="btn btn-outline btn-sm" onClick={handleDeleteThread}>
-                    Eliminar
-                  </button>
-                )}
+                <div className="row" style={{ gap: '6px' }}>
+                  {canManageStatus && (
+                    <button
+                      className={`btn btn-sm ${isClosed ? 'btn-outline' : 'btn-primary'}`}
+                      onClick={handleToggleStatus}
+                      title={isClosed ? 'Reabrir conversación' : 'Marcar como respondida/cerrada'}
+                    >
+                      {isClosed ? 'Reabrir' : 'Marcar respondida'}
+                    </button>
+                  )}
+                  {canDelete && (
+                    <button className="btn btn-outline btn-sm" onClick={handleDeleteThread}>
+                      Eliminar
+                    </button>
+                  )}
+                </div>
               </div>
 
-              <div className="chat-messages">
+              <div className="chat-messages" ref={messagesContainerRef}>
                 {messages.length === 0 ? (
                   <p className="muted" style={{ textAlign: 'center', padding: '2rem' }}>
                     Aún no hay mensajes. Escribí el primero.
@@ -273,6 +359,12 @@ export function SupportChatPanel({ viewer, projectId, projectName, areas, showTo
                 )}
                 <div ref={messagesEndRef} />
               </div>
+
+              {isClosed && (
+                <div className="chat-closed-banner">
+                  Esta conversación está cerrada. {canManageStatus ? 'Podés reabrirla con el botón superior.' : 'Solo un administrador puede reabrirla.'}
+                </div>
+              )}
 
               {canPost && (
                 <form className="chat-composer" onSubmit={handleSend}>

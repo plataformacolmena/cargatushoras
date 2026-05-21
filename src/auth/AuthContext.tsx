@@ -3,9 +3,12 @@
 import {
   GoogleAuthProvider,
   createUserWithEmailAndPassword,
+  getRedirectResult,
   onAuthStateChanged,
+  sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signInWithPopup,
+  signInWithRedirect,
   signOut,
   type User,
 } from 'firebase/auth'
@@ -21,6 +24,7 @@ interface AuthContextValue {
   signInWithGoogle: () => Promise<void>
   signInWithEmail: (email: string, password: string) => Promise<void>
   signUpWithEmail: (email: string, password: string) => Promise<void>
+  sendPasswordReset: (email: string) => Promise<void>
   signOutUser: () => Promise<void>
   reloadProfile: () => Promise<void>
 }
@@ -33,6 +37,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    // Si volvemos de un signInWithRedirect (fallback de Google), capturamos el resultado.
+    // Si no hubo redirect, getRedirectResult() devuelve null sin error.
+    getRedirectResult(auth).catch((err) => {
+      console.warn('[AuthContext] getRedirectResult error:', err)
+    })
+
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       setUser(firebaseUser)
 
@@ -68,12 +78,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       profile,
       loading,
       async signInWithGoogle() {
-        await signInWithPopup(auth, new GoogleAuthProvider())
+        const provider = new GoogleAuthProvider()
+        // Forzar selector de cuenta para evitar usar una cuenta previa
+        // que pudiera no estar autorizada.
+        provider.setCustomParameters({ prompt: 'select_account' })
+        try {
+          await signInWithPopup(auth, provider)
+        } catch (err) {
+          const code = (err as { code?: string })?.code
+          // Casos donde el popup no se puede abrir o el navegador no lo soporta:
+          // fallback a redirect (móviles/Safari/embebidos/COOP).
+          if (
+            code === 'auth/popup-blocked' ||
+            code === 'auth/operation-not-supported-in-this-environment' ||
+            code === 'auth/web-storage-unsupported'
+          ) {
+            await signInWithRedirect(auth, provider)
+            return
+          }
+          throw err
+        }
       },
       async signInWithEmail(email: string, password: string) {
         await signInWithEmailAndPassword(auth, email, password)
       },
       async signUpWithEmail(email: string, password: string) {
+        if (password.length < 8) {
+          throw new Error('La contraseña debe tener al menos 8 caracteres.')
+        }
         try {
           await createUserWithEmailAndPassword(auth, email, password)
         } catch (err) {
@@ -88,6 +120,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           }
           throw err
         }
+      },
+      async sendPasswordReset(email: string) {
+        await sendPasswordResetEmail(auth, email)
       },
       async signOutUser() {
         await signOut(auth)

@@ -9,6 +9,7 @@ import {
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
   updateDoc,
@@ -19,6 +20,8 @@ import { db } from '../firebase'
 import { calcEngancheExtras, calculateEntry, calculateSettlement, getDefaultProjectConfig } from '../lib/calc'
 import type {
   AppRole,
+  AuditLock,
+  CycleMode,
   Project,
   ProjectArea,
   ProjectConfig,
@@ -31,9 +34,54 @@ import type {
   TimeEntry,
   TimeEntryInput,
   UserProfile,
+  WorkCycle,
 } from '../types/domain'
 
 const CALCULATION_VERSION = 'v1-client'
+
+// ---------- Validadores defensivos (defensa en profundidad) ----------
+// Las reglas de Firestore son la fuente de verdad de seguridad, pero
+// validar también en cliente evita escrituras inválidas y reduce
+// errores ruidosos en la UI.
+
+const VALID_REVIEW_COLORS = new Set(['', 'green', 'yellow', 'red', 'orange', 'blue'])
+const VALID_APP_ROLES: ReadonlySet<AppRole> = new Set<AppRole>([
+  'SUPERUSER',
+  'PROJECT_ADMIN',
+  'MEMBER',
+])
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+const TIME_RE = /^\d{2}:\d{2}$/
+
+function assertReviewColor(color: string): void {
+  if (!VALID_REVIEW_COLORS.has(color)) {
+    throw new Error(`Color de revisión inválido: "${color}"`)
+  }
+}
+
+function assertAppRole(role: string): asserts role is AppRole {
+  if (!VALID_APP_ROLES.has(role as AppRole)) {
+    throw new Error(`Rol inválido: "${role}"`)
+  }
+}
+
+function assertTimeEntryInput(input: TimeEntryInput): void {
+  if (!DATE_RE.test(input.workDate)) {
+    throw new Error(`Fecha de jornada inválida: "${input.workDate}" (formato esperado YYYY-MM-DD)`)
+  }
+  if (!TIME_RE.test(input.timeIn) || !TIME_RE.test(input.timeOut)) {
+    throw new Error('Hora inválida (formato esperado HH:MM)')
+  }
+  const penalties = input.penalties
+  if (penalties != null) {
+    if (!Number.isInteger(penalties) || penalties < 0 || penalties > 10) {
+      throw new Error('Penalizaciones inválidas (entero entre 0 y 10)')
+    }
+  }
+  if (!input.projectId || typeof input.projectId !== 'string') {
+    throw new Error('Proyecto inválido')
+  }
+}
 
 export async function upsertUserProfile(payload: {
   uid: string
@@ -45,9 +93,8 @@ export async function upsertUserProfile(payload: {
   let snapshot: Awaited<ReturnType<typeof getDoc>>
   try {
     snapshot = await getDoc(userRef)
-    console.log('[upsert] A: getDoc(userRef) OK, exists=', snapshot.exists())
   } catch (e) {
-    console.error('[upsert] A: getDoc(userRef) FAILED:', e)
+    if (import.meta.env.DEV) console.error('[upsert] getDoc(userRef) failed:', e)
     throw e
   }
 
@@ -55,7 +102,6 @@ export async function upsertUserProfile(payload: {
     // Verificar si el email coincide con un placeholder importado en users
     if (payload.email) {
       const emailLower = payload.email.toLowerCase().trim()
-      console.log('[upsert] looking for placeholder with email=', emailLower)
       const placeholderQuery = query(
         collection(db, 'users'),
         where('email', '==', emailLower),
@@ -65,9 +111,8 @@ export async function upsertUserProfile(payload: {
       let placeholderSnap: Awaited<ReturnType<typeof getDocs>>
       try {
         placeholderSnap = await getDocs(placeholderQuery)
-        console.log('[upsert] B: getDocs(placeholder by email) OK, found=', placeholderSnap.size)
       } catch (e) {
-        console.error('[upsert] B: getDocs(placeholder by email) FAILED:', e)
+        if (import.meta.env.DEV) console.error('[upsert] placeholder query failed:', e)
         throw e
       }
 
@@ -76,7 +121,6 @@ export async function upsertUserProfile(payload: {
         const data = d.data() as UserProfile
         return !data.mergedToUid
       })
-      console.log('[upsert] placeholder selected?', !!placeholderDoc)
 
       if (placeholderDoc) {
         const placeholderData = placeholderDoc.data() as UserProfile
@@ -99,9 +143,8 @@ export async function upsertUserProfile(payload: {
         // 1. Crear perfil real
         try {
           await setDoc(userRef, newProfile)
-          console.log('[migration] step1 setDoc OK')
         } catch (e) {
-          console.error('[migration] step1 setDoc FAILED:', e)
+          if (import.meta.env.DEV) console.error('[migration] step1 setDoc failed:', e)
           throw e
         }
 
@@ -111,9 +154,8 @@ export async function upsertUserProfile(payload: {
           entriesSnap = await getDocs(
             query(collection(db, 'time_entries'), where('userId', '==', placeholderUid)),
           )
-          console.log('[migration] step2 getDocs OK, entries:', entriesSnap.docs.length)
         } catch (e) {
-          console.error('[migration] step2 getDocs FAILED:', e)
+          if (import.meta.env.DEV) console.error('[migration] step2 getDocs failed:', e)
           throw e
         }
         const CHUNK = 440
@@ -124,9 +166,8 @@ export async function upsertUserProfile(payload: {
           }
           try {
             await b.commit()
-            console.log('[migration] step2 batch commit OK (offset', i, ')')
           } catch (e) {
-            console.error('[migration] step2 batch commit FAILED (offset', i, '):', e)
+            if (import.meta.env.DEV) console.error('[migration] step2 batch failed:', e)
             throw e
           }
         }
@@ -138,9 +179,8 @@ export async function upsertUserProfile(payload: {
             mergedToUid: payload.uid,
             updatedAt: serverTimestamp(),
           })
-          console.log('[migration] step3 placeholder merge OK')
         } catch (e) {
-          console.warn('[migration] step3 placeholder merge SKIPPED (non-critical):', e)
+          if (import.meta.env.DEV) console.warn('[migration] step3 placeholder merge skipped:', e)
         }
 
         return newProfile
@@ -166,9 +206,8 @@ export async function upsertUserProfile(payload: {
   if (payload.displayName != null) updateData.displayName = payload.displayName
   try {
     await updateDoc(userRef, updateData)
-    console.log('[upsert] F: updateDoc(existing profile) OK')
   } catch (e) {
-    console.error('[upsert] F: updateDoc(existing profile) FAILED:', e)
+    if (import.meta.env.DEV) console.error('[upsert] updateDoc(existing) failed:', e)
     throw e
   }
   return { ...data, email: payload.email, displayName: payload.displayName ?? data.displayName }
@@ -259,6 +298,7 @@ export async function getProjectConfig(projectId: string): Promise<ProjectConfig
 }
 
 export async function setEntryReviewColor(entryId: string, color: string): Promise<void> {
+  assertReviewColor(color)
   await updateDoc(doc(db, 'time_entries', entryId), { reviewColor: color })
 }
 
@@ -282,6 +322,7 @@ export async function saveTimeEntry(
   input: TimeEntryInput,
   user: Pick<UserProfile, 'uid' | 'displayName' | 'areaId'>,
 ): Promise<void> {
+  assertTimeEntryInput(input)
   const config = await getProjectConfig(input.projectId)
   const calculation = calculateEntry(input.timeIn, input.timeOut, config, {
     penalties: input.penalties,
@@ -297,6 +338,7 @@ export async function saveTimeEntry(
     calculationSource: 'client',
     calculationVersion: CALCULATION_VERSION,
     lockedByAdmin: false,
+    lockedByAudit: false,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
@@ -308,6 +350,7 @@ export async function saveTimeEntryForUser(
   input: TimeEntryInput,
   targetUser: Pick<UserProfile, 'uid' | 'displayName' | 'areaId'>,
 ): Promise<void> {
+  assertTimeEntryInput(input)
   const config = await getProjectConfig(input.projectId)
   const calculation = calculateEntry(input.timeIn, input.timeOut, config, {
     penalties: input.penalties,
@@ -323,6 +366,7 @@ export async function saveTimeEntryForUser(
     calculationSource: 'client',
     calculationVersion: CALCULATION_VERSION,
     lockedByAdmin: false,
+    lockedByAudit: false,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
@@ -380,8 +424,37 @@ export async function approveUser(
 }
 
 export async function setUserRole(userId: string, role: AppRole): Promise<void> {
+  assertAppRole(role)
   const userRef = doc(db, 'users', userId)
   await updateDoc(userRef, { role, updatedAt: serverTimestamp() })
+}
+
+/**
+ * Devuelve cuántas jornadas (time_entries) tiene un usuario en total.
+ * Usado para decidir si un usuario aprobado puede ser eliminado o solo inhabilitado.
+ */
+export async function countUserTimeEntries(userId: string): Promise<number> {
+  const q = query(collection(db, 'time_entries'), where('userId', '==', userId))
+  const snap = await getDocs(q)
+  return snap.size
+}
+
+/**
+ * Elimina el documento /users/{uid} en Firestore. NO borra la cuenta de Firebase
+ * Auth (eso requiere Admin SDK). El usuario perderá acceso automáticamente porque
+ * en su próximo onAuthStateChanged el perfil no se encontrará.
+ * Esta función solo debe invocarse cuando el usuario NO tiene time_entries.
+ */
+export async function deleteUserProfile(userId: string): Promise<void> {
+  await deleteDoc(doc(db, 'users', userId))
+}
+
+/** Marca un usuario como inhabilitado / rehabilitado. */
+export async function setUserDisabled(userId: string, disabled: boolean): Promise<void> {
+  await updateDoc(doc(db, 'users', userId), {
+    disabled,
+    updatedAt: serverTimestamp(),
+  })
 }
 
 export async function listApprovedUsers(): Promise<UserProfile[]> {
@@ -395,29 +468,52 @@ export async function listApprovedUsers(): Promise<UserProfile[]> {
 
 /**
  * Recalcula enganche/reenganche de todas las entradas no bloqueadas del usuario.
- * Se llama automáticamente tras guardar, editar o eliminar una jornada.
+ * El reenganche se decide por el flag manual `isJornadaAdicional` de la jornada previa.
+ * Se llama automáticamente tras guardar, editar o eliminar.
  */
 export async function recalculateUserEntries(projectId: string, userId: string): Promise<void> {
-  const [entries, config] = await Promise.all([
+  const [entries, config, userSnap] = await Promise.all([
     listMyTimeEntries(userId, projectId),
     getProjectConfig(projectId),
+    getDoc(doc(db, 'users', userId)),
   ])
+  const userCycleMode = (userSnap.data() as UserProfile | undefined)?.cycleMode ?? 'CYCLE'
+  const userCycleModes = new Map<string, 'CYCLE' | 'REINFORCEMENT'>([[userId, userCycleMode]])
+
   const toUpdate = entries.filter((e) => !e.lockedByAdmin)
-  const engancheMap = calcEngancheExtras(toUpdate, config)
+
+  const entriesForExtras = toUpdate.map((e) => ({
+    id: e.id,
+    userId: e.userId,
+    workDate: e.workDate,
+    timeIn: e.timeIn,
+    timeOut: e.timeOut,
+    isJornadaAdicional: (e as TimeEntry & { isJornadaAdicional?: boolean }).isJornadaAdicional ?? false,
+  }))
+  const engancheMap = calcEngancheExtras(entriesForExtras, config, userCycleModes)
 
   for (let i = 0; i < toUpdate.length; i += 400) {
     const batch = writeBatch(db)
     for (const entry of toUpdate.slice(i, i + 400)) {
       const extras = engancheMap.get(entry.id)
+
+      // 6to día es MANUAL: respetar el valor guardado por el usuario.
+      const effectiveAdicional = (entry as TimeEntry & { isJornadaAdicional?: boolean }).isJornadaAdicional ?? false
+
       const calculation = calculateEntry(entry.timeIn, entry.timeOut, config, {
         penalties: (entry as TimeEntry & { penalties?: number }).penalties ?? 0,
-        isJornadaAdicional: (entry as TimeEntry & { isJornadaAdicional?: boolean }).isJornadaAdicional ?? false,
+        isJornadaAdicional: effectiveAdicional,
         engancheExtraHours: extras?.enganche ?? 0,
         reengancheExtraHours: extras?.reenganche ?? 0,
       })
+
+      // Borrar campos derivados del ciclo (legado): ya no se usan.
       batch.update(doc(db, 'time_entries', entry.id), {
         calculation,
         updatedAt: serverTimestamp(),
+        cycleScope: deleteField(),
+        cycleDayInWeek: deleteField(),
+        cycleWeekIndex: deleteField(),
       })
     }
     await batch.commit()
@@ -435,6 +531,7 @@ export async function updateTimeEntry(
   projectId: string,
   userId: string,
 ): Promise<void> {
+  assertTimeEntryInput({ ...input, projectId })
   const config = await getProjectConfig(projectId)
   const calculation = calculateEntry(input.timeIn, input.timeOut, config, {
     penalties: input.penalties,
@@ -518,7 +615,7 @@ export async function deleteProjectRole(roleId: string): Promise<void> {
 
 export async function updateUserProfileAdmin(
   userId: string,
-  updates: Partial<Pick<UserProfile, 'displayName' | 'areaId' | 'roleId' | 'projectId' | 'role'>>,
+  updates: Partial<Pick<UserProfile, 'displayName' | 'areaId' | 'roleId' | 'projectId' | 'role' | 'cycleMode'>>,
 ): Promise<void> {
   const userRef = doc(db, 'users', userId)
   // Convert undefined values to null for Firestore (to actually clear fields)
@@ -535,10 +632,17 @@ export async function recalculateProjectEntries(
   projectId: string,
   lockedRanges: Array<{ dateFrom: string; dateTo: string }>,
 ): Promise<number> {
-  const [entries, config] = await Promise.all([
+  const [entries, config, usersSnap] = await Promise.all([
     listAllTimeEntries(projectId, {}),
     getProjectConfig(projectId),
+    getDocs(query(collection(db, 'users'), where('projectId', '==', projectId))),
   ])
+
+  const userCycleModes = new Map<string, 'CYCLE' | 'REINFORCEMENT'>()
+  for (const d of usersSnap.docs) {
+    const u = d.data() as UserProfile
+    userCycleModes.set(u.uid, u.cycleMode ?? 'CYCLE')
+  }
 
   const toUpdate = entries.filter(
     (e) =>
@@ -546,22 +650,35 @@ export async function recalculateProjectEntries(
       !lockedRanges.some((r) => e.workDate >= r.dateFrom && e.workDate <= r.dateTo),
   )
 
-  // Calcular extras de enganche/reenganche para el lote completo
-  const engancheMap = calcEngancheExtras(toUpdate, config)
+  const entriesForExtras = toUpdate.map((e) => ({
+    id: e.id,
+    userId: e.userId,
+    workDate: e.workDate,
+    timeIn: e.timeIn,
+    timeOut: e.timeOut,
+    isJornadaAdicional: (e as TimeEntry & { isJornadaAdicional?: boolean }).isJornadaAdicional ?? false,
+  }))
+  const engancheMap = calcEngancheExtras(entriesForExtras, config, userCycleModes)
 
   for (let i = 0; i < toUpdate.length; i += 400) {
     const batch = writeBatch(db)
     for (const entry of toUpdate.slice(i, i + 400)) {
       const extras = engancheMap.get(entry.id)
+      // 6to día es MANUAL: respetar el valor guardado.
+      const effectiveAdicional = (entry as TimeEntry & { isJornadaAdicional?: boolean }).isJornadaAdicional ?? false
       const calculation = calculateEntry(entry.timeIn, entry.timeOut, config, {
         penalties: (entry as TimeEntry & { penalties?: number }).penalties ?? 0,
-        isJornadaAdicional: (entry as TimeEntry & { isJornadaAdicional?: boolean }).isJornadaAdicional ?? false,
+        isJornadaAdicional: effectiveAdicional,
         engancheExtraHours: extras?.enganche ?? 0,
         reengancheExtraHours: extras?.reenganche ?? 0,
       })
+      // Borrar campos derivados del ciclo (legado): ya no se usan.
       batch.update(doc(db, 'time_entries', entry.id), {
         calculation,
         updatedAt: serverTimestamp(),
+        cycleScope: deleteField(),
+        cycleDayInWeek: deleteField(),
+        cycleWeekIndex: deleteField(),
       })
     }
     await batch.commit()
@@ -671,11 +788,37 @@ export async function previewSettlement(
 
 export async function saveSettlement(settlement: Settlement): Promise<Settlement> {
   const { id: _id, ...data } = settlement
-  const docRef = await addDoc(collection(db, 'settlements'), {
-    ...data,
-    createdAt: serverTimestamp(),
+  if (!DATE_RE.test(settlement.dateFrom) || !DATE_RE.test(settlement.dateTo)) {
+    throw new Error('Fechas de liquidación inválidas (formato esperado YYYY-MM-DD).')
+  }
+  if (settlement.dateFrom > settlement.dateTo) {
+    throw new Error('La fecha desde no puede ser mayor que la fecha hasta.')
+  }
+
+  // Transacción: comprobamos que no exista otra liquidación para el mismo
+  // proyecto y rango exacto antes de crear, para evitar duplicados por
+  // doble click o envíos concurrentes.
+  const settlementsCol = collection(db, 'settlements')
+  const duplicateQuery = query(
+    settlementsCol,
+    where('projectId', '==', settlement.projectId),
+    where('dateFrom', '==', settlement.dateFrom),
+    where('dateTo', '==', settlement.dateTo),
+  )
+
+  const newRef = doc(settlementsCol)
+  await runTransaction(db, async (tx) => {
+    // getDocs no se puede usar dentro de la transacción; hacemos lectura previa.
+    const existing = await getDocs(duplicateQuery)
+    if (!existing.empty) {
+      throw new Error('Ya existe una liquidación para este proyecto y rango de fechas.')
+    }
+    tx.set(newRef, {
+      ...data,
+      createdAt: serverTimestamp(),
+    })
   })
-  return { ...settlement, id: docRef.id }
+  return { ...settlement, id: newRef.id }
 }
 
 export async function deleteSettlement(settlementId: string): Promise<void> {
@@ -951,4 +1094,330 @@ export async function migrateLegacyImportedMembers(): Promise<number> {
   }
   await batch.commit()
   return migrated
+}
+
+// ─── Auditoría: usuarios sin informar + color de revisión ──────────────────
+
+/** Asigna (o limpia con '') el color de revisión de un usuario en el reporte de "sin informar". */
+export async function setUserAuditReviewColor(uid: string, color: string): Promise<void> {
+  assertReviewColor(color)
+  await updateDoc(doc(db, 'users', uid), {
+    auditReviewColor: color,
+    updatedAt: serverTimestamp(),
+  })
+}
+
+export interface NoReportUserRow {
+  user: UserProfile
+  daysWithEntries: number
+  totalDaysInRange: number
+}
+
+/** Devuelve los usuarios aprobados del proyecto que NO informaron horarios en el rango.
+ *  Opcionalmente filtra por área.
+ */
+export async function listUsersWithoutEntries(
+  projectId: string,
+  dateFrom: string,
+  dateTo: string,
+  areaId?: string,
+): Promise<NoReportUserRow[]> {
+  if (!DATE_RE.test(dateFrom) || !DATE_RE.test(dateTo)) {
+    throw new Error('Fechas inválidas (formato esperado YYYY-MM-DD)')
+  }
+  if (dateFrom > dateTo) {
+    throw new Error('La fecha desde no puede ser mayor que la fecha hasta.')
+  }
+  const [users, entries] = await Promise.all([
+    listProjectUsers(projectId),
+    listAllTimeEntries(projectId, { dateFrom, dateTo, areaId: areaId || undefined }),
+  ])
+
+  // Contar días distintos con entries por usuario
+  const daysByUser = new Map<string, Set<string>>()
+  for (const e of entries) {
+    let set = daysByUser.get(e.userId)
+    if (!set) {
+      set = new Set<string>()
+      daysByUser.set(e.userId, set)
+    }
+    set.add(e.workDate)
+  }
+
+  // Cálculo de días en rango (inclusivo)
+  const start = new Date(dateFrom + 'T00:00:00')
+  const end = new Date(dateTo + 'T00:00:00')
+  const totalDaysInRange = Math.max(1, Math.round((end.getTime() - start.getTime()) / 86400000) + 1)
+
+  const filtered = areaId ? users.filter((u) => (u.areaId ?? '') === areaId) : users
+  return filtered
+    .map((u) => ({
+      user: u,
+      daysWithEntries: daysByUser.get(u.uid)?.size ?? 0,
+      totalDaysInRange,
+    }))
+    .filter((row) => row.daysWithEntries === 0)
+    .sort((a, b) => (a.user.displayName ?? '').localeCompare(b.user.displayName ?? ''))
+}
+
+// ─── Auditoría: bloqueo de ediciones (audit_locks/{projectId}) ─────────────
+
+export async function getAuditLock(projectId: string): Promise<AuditLock | null> {
+  const snap = await getDoc(doc(db, 'audit_locks', projectId))
+  if (!snap.exists()) return null
+  return { projectId, ...(snap.data() as Omit<AuditLock, 'projectId'>) }
+}
+
+export function subscribeToAuditLock(
+  projectId: string,
+  callback: (lock: AuditLock | null) => void,
+): () => void {
+  return onSnapshot(doc(db, 'audit_locks', projectId), (snap) => {
+    if (!snap.exists()) {
+      callback(null)
+    } else {
+      callback({ projectId, ...(snap.data() as Omit<AuditLock, 'projectId'>) })
+    }
+  })
+}
+
+/** Activa o desactiva el bloqueo de ediciones para el proyecto en un rango de fechas.
+ *  Cuando se activa: marca lockedByAudit=true en todas las entradas existentes del rango.
+ *  Cuando se desactiva: marca lockedByAudit=false en las entradas del rango previamente bloqueadas.
+ *  Devuelve la cantidad de entradas afectadas.
+ */
+export async function setAuditLockEnabled(
+  projectId: string,
+  opts: { enabled: boolean; dateFrom: string; dateTo: string; updatedBy: string },
+): Promise<number> {
+  const { enabled, dateFrom, dateTo, updatedBy } = opts
+  if (!DATE_RE.test(dateFrom) || !DATE_RE.test(dateTo)) {
+    throw new Error('Fechas inválidas (formato esperado YYYY-MM-DD)')
+  }
+  if (dateFrom > dateTo) {
+    throw new Error('La fecha desde no puede ser mayor que la fecha hasta.')
+  }
+
+  // 1) Persistir el documento del lock
+  await setDoc(
+    doc(db, 'audit_locks', projectId),
+    { projectId, enabled, dateFrom, dateTo, updatedBy, updatedAt: serverTimestamp() },
+    { merge: true },
+  )
+
+  // 2) Actualizar entradas en rango
+  const entries = await listAllTimeEntries(projectId, { dateFrom, dateTo })
+  const toUpdate = entries.filter((e) => (e.lockedByAudit ?? false) !== enabled)
+
+  for (let i = 0; i < toUpdate.length; i += 400) {
+    const batch = writeBatch(db)
+    for (const entry of toUpdate.slice(i, i + 400)) {
+      batch.update(doc(db, 'time_entries', entry.id), {
+        lockedByAudit: enabled,
+        updatedAt: serverTimestamp(),
+      })
+    }
+    await batch.commit()
+  }
+  return toUpdate.length
+}
+
+
+// ─── Ciclos laborales por usuario ──────────────────────────────────────────
+
+/** Lista todos los ciclos (abiertos y cerrados) del usuario en el proyecto. */
+export async function listUserWorkCycles(projectId: string, userId: string): Promise<WorkCycle[]> {
+  const q = query(
+    collection(db, 'user_work_cycles'),
+    where('projectId', '==', projectId),
+    where('userId', '==', userId),
+  )
+  const snap = await getDocs(q)
+  return snap.docs
+    .map((d) => ({ id: d.id, ...(d.data() as Omit<WorkCycle, 'id'>) }))
+    .sort((a, b) => a.anchorDate.localeCompare(b.anchorDate))
+}
+
+/** Devuelve el ciclo abierto del usuario (closedFromDate ausente) o null. */
+export async function getUserActiveWorkCycle(
+  projectId: string,
+  userId: string,
+): Promise<WorkCycle | null> {
+  const cycles = await listUserWorkCycles(projectId, userId)
+  for (const c of cycles) {
+    if (!c.closedFromDate) return c
+  }
+  return null
+}
+
+/** Suscripción en tiempo real a los ciclos del usuario en el proyecto. */
+export function subscribeToUserWorkCycles(
+  projectId: string,
+  userId: string,
+  callback: (cycles: WorkCycle[]) => void,
+  onError?: (err: unknown) => void,
+): () => void {
+  const q = query(
+    collection(db, 'user_work_cycles'),
+    where('projectId', '==', projectId),
+    where('userId', '==', userId),
+  )
+  return onSnapshot(
+    q,
+    (snap) => {
+      const cycles = snap.docs
+        .map((d) => ({ id: d.id, ...(d.data() as Omit<WorkCycle, 'id'>) }))
+        .sort((a, b) => a.anchorDate.localeCompare(b.anchorDate))
+      callback(cycles)
+    },
+    (err) => {
+      onError?.(err)
+    },
+  )
+}
+
+/** Lista los ciclos de todos los usuarios del proyecto (uso ADMIN). */
+export async function listProjectWorkCycles(projectId: string): Promise<WorkCycle[]> {
+  const q = query(collection(db, 'user_work_cycles'), where('projectId', '==', projectId))
+  const snap = await getDocs(q)
+  return snap.docs
+    .map((d) => ({ id: d.id, ...(d.data() as Omit<WorkCycle, 'id'>) }))
+    .sort((a, b) => a.userId.localeCompare(b.userId) || a.anchorDate.localeCompare(b.anchorDate))
+}
+
+/**
+ * Crea un nuevo ciclo laboral para el usuario.
+ * - Valida que no exista ya un ciclo abierto para el mismo (projectId, userId).
+ * - Valida cycleMode === 'CYCLE' del usuario.
+ * - Tras crear, dispara recalculateUserEntries para reprocesar entradas no liquidadas.
+ */
+export async function createUserWorkCycle(input: {
+  projectId: string
+  userId: string
+  anchorDate: string
+  createdBy: string
+}): Promise<string> {
+  if (!DATE_RE.test(input.anchorDate)) {
+    throw new Error('Fecha de anchor inválida (formato YYYY-MM-DD)')
+  }
+  const profileSnap = await getDoc(doc(db, 'users', input.userId))
+  if (!profileSnap.exists()) throw new Error('Usuario no encontrado')
+  const profile = profileSnap.data() as UserProfile
+  const mode: CycleMode = profile.cycleMode ?? 'CYCLE'
+  if (mode === 'REINFORCEMENT') {
+    throw new Error('El usuario está en modo refuerzo y no puede declarar ciclos.')
+  }
+  const existing = await getUserActiveWorkCycle(input.projectId, input.userId)
+  if (existing) {
+    throw new Error('El usuario ya tiene un ciclo laboral abierto.')
+  }
+
+  const ref = await addDoc(collection(db, 'user_work_cycles'), {
+    projectId: input.projectId,
+    userId: input.userId,
+    anchorDate: input.anchorDate,
+    createdBy: input.createdBy,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  })
+
+  // Recalcular para aplicar cycleScope/isJornadaAdicional a entradas existentes
+  await recalculateUserEntries(input.projectId, input.userId)
+  return ref.id
+}
+
+/**
+ * Cierra un ciclo abierto a partir de una fecha (closedFromDate, exclusivo).
+ * Tras cerrar, recalcula las entries del usuario.
+ */
+export async function closeUserWorkCycle(
+  cycleId: string,
+  closedFromDate: string,
+  closedBy: string,
+): Promise<void> {
+  if (!DATE_RE.test(closedFromDate)) {
+    throw new Error('Fecha de cierre inválida (formato YYYY-MM-DD)')
+  }
+  const ref = doc(db, 'user_work_cycles', cycleId)
+  const snap = await getDoc(ref)
+  if (!snap.exists()) throw new Error('Ciclo no encontrado')
+  const cycle = snap.data() as Omit<WorkCycle, 'id'>
+  if (cycle.closedFromDate) throw new Error('El ciclo ya está cerrado')
+  if (closedFromDate <= cycle.anchorDate) {
+    throw new Error('La fecha de cierre debe ser posterior al inicio del ciclo.')
+  }
+  await updateDoc(ref, {
+    closedFromDate,
+    closedAt: serverTimestamp(),
+    closedBy,
+    updatedAt: serverTimestamp(),
+    updatedBy: closedBy,
+  })
+  await recalculateUserEntries(cycle.projectId, cycle.userId)
+}
+
+/** Reabre un ciclo cerrado (solo ADMIN). */
+export async function reopenUserWorkCycle(cycleId: string, updatedBy: string): Promise<void> {
+  const ref = doc(db, 'user_work_cycles', cycleId)
+  const snap = await getDoc(ref)
+  if (!snap.exists()) throw new Error('Ciclo no encontrado')
+  const cycle = snap.data() as Omit<WorkCycle, 'id'>
+  if (!cycle.closedFromDate) throw new Error('El ciclo no está cerrado')
+  // Verificar que no haya otro ciclo abierto del mismo usuario
+  const existingOpen = await getUserActiveWorkCycle(cycle.projectId, cycle.userId)
+  if (existingOpen) {
+    throw new Error('Ya existe otro ciclo abierto para este usuario; cierralo antes de reabrir éste.')
+  }
+  await updateDoc(ref, {
+    closedFromDate: deleteField(),
+    closedAt: deleteField(),
+    closedBy: deleteField(),
+    updatedAt: serverTimestamp(),
+    updatedBy,
+  })
+  await recalculateUserEntries(cycle.projectId, cycle.userId)
+}
+
+/** Actualiza el anchorDate del ciclo (solo ADMIN). */
+export async function updateUserWorkCycleAnchor(
+  cycleId: string,
+  newAnchorDate: string,
+  updatedBy: string,
+): Promise<void> {
+  if (!DATE_RE.test(newAnchorDate)) {
+    throw new Error('Fecha de anchor inválida (formato YYYY-MM-DD)')
+  }
+  const ref = doc(db, 'user_work_cycles', cycleId)
+  const snap = await getDoc(ref)
+  if (!snap.exists()) throw new Error('Ciclo no encontrado')
+  const cycle = snap.data() as Omit<WorkCycle, 'id'>
+  if (cycle.closedFromDate && newAnchorDate >= cycle.closedFromDate) {
+    throw new Error('El nuevo anchor no puede ser posterior o igual a la fecha de cierre del ciclo.')
+  }
+  await updateDoc(ref, {
+    anchorDate: newAnchorDate,
+    updatedAt: serverTimestamp(),
+    updatedBy,
+  })
+  await recalculateUserEntries(cycle.projectId, cycle.userId)
+}
+
+/** Elimina un ciclo (solo SUPERUSER vía rules). */
+export async function deleteUserWorkCycle(cycleId: string): Promise<void> {
+  const ref = doc(db, 'user_work_cycles', cycleId)
+  const snap = await getDoc(ref)
+  if (!snap.exists()) return
+  const cycle = snap.data() as Omit<WorkCycle, 'id'>
+  await deleteDoc(ref)
+  await recalculateUserEntries(cycle.projectId, cycle.userId)
+}
+
+/** Cambia el modo de ciclo del usuario (CYCLE | REINFORCEMENT). */
+export async function setUserCycleMode(userId: string, mode: CycleMode): Promise<void> {
+  if (mode !== 'CYCLE' && mode !== 'REINFORCEMENT') {
+    throw new Error(`Modo de ciclo inválido: "${mode}"`)
+  }
+  // Si pasa a REINFORCEMENT, cerrar ciclos abiertos automáticamente (no se permiten en REINFORCEMENT)
+  const userRef = doc(db, 'users', userId)
+  await updateDoc(userRef, { cycleMode: mode, updatedAt: serverTimestamp() })
 }

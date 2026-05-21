@@ -1,4 +1,4 @@
-import type { ProjectConfig, Settlement, SettlementLine, TimeEntry, TimeEntryCalculation } from '../types/domain'
+import type { CycleScope, ProjectConfig, Settlement, SettlementLine, TimeEntry, TimeEntryCalculation, WorkCycle } from '../types/domain'
 
 const DEFAULT_CONFIG: ProjectConfig = {
   projectId: 'default',
@@ -16,6 +16,7 @@ const DEFAULT_CONFIG: ProjectConfig = {
   reengancheHours: 0,
   penaltyHours: 0,
   jornadaAdicionalMultiplier: 1,
+  futureDatePolicy: 'ALLOW',
 }
 
 function toMinutes(timeHHMM: string): number {
@@ -50,7 +51,7 @@ export function getDefaultProjectConfig(projectId: string): ProjectConfig {
 
 /**
  * Calcula las métricas de una entrada individual.
- * - penalties / isJornadaAdicional vienen del form.
+ * - penalties / isJornadaAdicional vienen del form o se derivan del ciclo (cycleInfo).
  * - engancheExtraHours / reengancheExtraHours se calculan en el lote (recalculate) y llegan via opts.
  */
 export function calculateEntry(
@@ -68,32 +69,40 @@ export function calculateEntry(
   let end = toMinutes(timeOut)
   if (end <= start) end += 24 * 60
 
-  const mult = opts?.isJornadaAdicional ? (config.jornadaAdicionalMultiplier || 1) : 1
+  const adicMult = opts?.isJornadaAdicional ? (config.jornadaAdicionalMultiplier || 1) : 1
   const rawMinutes = end - start
 
-  const workedHours   = round2(rawMinutes * mult / 60)
-  const regularHours  = round2(Math.min(workedHours, config.regularDailyHours * mult))
-  const overtimeHours = round2(Math.max(0, workedHours - config.regularDailyHours * mult))
+  // Horas REALES (sin multiplicador de jornada adicional). El efecto del multiplicador
+  // se refleja únicamente en el pago (extraPayUnits y en la liquidación).
+  const workedHours   = round2(rawMinutes / 60)
+  const regularHours  = round2(Math.min(workedHours, config.regularDailyHours))
+  const overtimeHours = round2(Math.max(0, workedHours - config.regularDailyHours))
 
   // Horas nocturnas: todas las horas del turno que caen en la ventana nocturna
-  const nightHours = round2(calcNightOverlapHours(start, end, config) * mult)
+  const nightHours = round2(calcNightOverlapHours(start, end, config))
 
   // Nocturnidad doble: horas EXTRA que caen en la ventana nocturna
   const overtimeStart = start + config.regularDailyHours * 60
-  const nightOvertimeHours = round2(calcNightOverlapHours(Math.max(start, overtimeStart), end, config) * mult)
+  const nightOvertimeHours = round2(calcNightOverlapHours(Math.max(start, overtimeStart), end, config))
 
   // Penalties
-  const penaltyHours = round2((opts?.penalties ?? 0) * (config.penaltyHours || 0) * mult)
+  const penaltyHours = round2((opts?.penalties ?? 0) * (config.penaltyHours || 0))
 
   // Enganche / reenganche (calculados externamente en lote)
   const engancheExtraHours   = round2(opts?.engancheExtraHours ?? 0)
   const reengancheExtraHours = round2(opts?.reengancheExtraHours ?? 0)
 
-  const totalExtras = overtimeHours + penaltyHours + engancheExtraHours + reengancheExtraHours
+  // Para "unidades a cobrar" sí aplicamos el multiplicador de jornada adicional
+  // (al overtime/penalty/nocturnidad extra). Enganche/reenganche no se afectan.
+  const totalExtrasForPay =
+    overtimeHours * adicMult +
+    penaltyHours * adicMult +
+    engancheExtraHours +
+    reengancheExtraHours
 
   const extraPayUnits = round2(
-    totalExtras * config.overtimeMultiplier +
-    nightOvertimeHours * (config.nightAdditionalMultiplier - 1),
+    totalExtrasForPay * config.overtimeMultiplier +
+    (nightOvertimeHours * adicMult) * (config.nightAdditionalMultiplier - 1),
   )
 
   return {
@@ -109,21 +118,69 @@ export function calculateEntry(
   }
 }
 
-// ── Helpers para enganche/reenganche en lote ──────────────────────────────
+// ── Helpers de ciclo laboral ────────────────────────────────────────────────
 
-const DAY_NAME_TO_NUM: Record<string, number> = { SUN: 0, MON: 1, TUE: 2, WED: 3, THU: 4, FRI: 5, SAT: 6 }
-
-/** Devuelve la fecha de inicio de la semana laboral a la que pertenece dateStr. */
-function getWorkWeekStart(dateStr: string, workWeekStartDay: string): string {
-  const startNum = DAY_NAME_TO_NUM[workWeekStartDay] ?? 1
-  // Usamos UTC para evitar problemas de zona horaria
-  const date = new Date(dateStr + 'T12:00:00Z')
-  const dow = date.getUTCDay()
-  const daysBack = (dow - startNum + 7) % 7
-  const weekStart = new Date(date)
-  weekStart.setUTCDate(weekStart.getUTCDate() - daysBack)
-  return weekStart.toISOString().slice(0, 10)
+/** Diferencia en días (UTC) entre dos fechas YYYY-MM-DD (b - a). */
+function daysBetween(a: string, b: string): number {
+  const ta = new Date(a + 'T00:00:00Z').getTime()
+  const tb = new Date(b + 'T00:00:00Z').getTime()
+  return Math.round((tb - ta) / 86400000)
 }
+
+export interface CycleInfo {
+  scope: CycleScope                  // IN_CYCLE | OUT_OF_CYCLE | REINFORCEMENT
+  dayInWeek?: number                 // 0..6 (solo IN_CYCLE)
+  weekIndex?: number                 // 0..N (solo IN_CYCLE)
+  isJornadaAdicional: boolean        // derivado
+}
+
+/**
+ * Devuelve el ciclo activo del usuario para una fecha (workDate) dada.
+ * Un ciclo aplica si anchorDate <= workDate AND (no cerrado OR workDate < closedFromDate).
+ * Si hay varios candidatos (no debería), toma el de anchorDate más reciente.
+ */
+export function findCycleForDate(cycles: WorkCycle[], workDate: string): WorkCycle | null {
+  let best: WorkCycle | null = null
+  for (const c of cycles) {
+    if (c.anchorDate > workDate) continue
+    if (c.closedFromDate && workDate >= c.closedFromDate) continue
+    if (!best || c.anchorDate > best.anchorDate) best = c
+  }
+  return best
+}
+
+/**
+ * Calcula la cycleInfo de una entry según el modo del usuario y sus ciclos.
+ * - REINFORCEMENT: no aplica ciclo (solo enganche, no reenganche, no jornada adicional).
+ * - CYCLE con ciclo cubriendo workDate: IN_CYCLE; dayInWeek = (workDate - anchor) % 7;
+ *   semana cronológica = floor((workDate - anchor) / 7); isJornadaAdicional = dayInWeek >= weeklyWorkDays.
+ * - CYCLE sin ciclo cubriendo (sin anchor, antes del anchor, o tras closedFromDate): OUT_OF_CYCLE.
+ */
+export function getCycleInfo(
+  workDate: string,
+  cycleMode: 'CYCLE' | 'REINFORCEMENT',
+  cycles: WorkCycle[],
+  config: ProjectConfig,
+): CycleInfo {
+  if (cycleMode === 'REINFORCEMENT') {
+    return { scope: 'REINFORCEMENT', isJornadaAdicional: false }
+  }
+  const cycle = findCycleForDate(cycles, workDate)
+  if (!cycle) {
+    return { scope: 'OUT_OF_CYCLE', isJornadaAdicional: false }
+  }
+  const days = daysBetween(cycle.anchorDate, workDate)
+  if (days < 0) {
+    return { scope: 'OUT_OF_CYCLE', isJornadaAdicional: false }
+  }
+  const dayInWeek = days % 7
+  const weekIndex = Math.floor(days / 7)
+  const wd = Math.max(0, Math.min(7, config.weeklyWorkDays || 0))
+  const isAdicional = dayInWeek >= wd
+  return { scope: 'IN_CYCLE', dayInWeek, weekIndex, isJornadaAdicional: isAdicional }
+}
+
+// ── Helpers para enganche/reenganche en lote ──────────────────────────────
 
 /** Timestamp UTC del inicio del turno. */
 function shiftStartTs(workDate: string, timeIn: string): number {
@@ -139,11 +196,34 @@ function shiftEndTs(workDate: string, timeIn: string, timeOut: string): number {
 
 /**
  * Calcula extras por enganche/reenganche para cada entrada (por userId, ordenadas).
+ *
+ * Regla simple: si la jornada `prev` está marcada como 6to día (isJornadaAdicional=true),
+ * la siguiente jornada (`curr`) inicia una NUEVA semana laboral → se evalúa REENGANCHE.
+ * En caso contrario → ENGANCHE normal.
+ *
+ * El monto se calcula siempre como shortfall respecto al umbral correspondiente
+ * (engancheHours o engancheHours + reengancheHours).
+ *
  * Retorna un Map<entryId, {enganche, reenganche}>.
  */
 export function calcEngancheExtras(
-  entries: Array<{ id: string; userId: string; workDate: string; timeIn: string; timeOut: string }>,
+  entries: Array<{
+    id: string
+    userId: string
+    workDate: string
+    timeIn: string
+    timeOut: string
+    isJornadaAdicional?: boolean
+  }>,
   config: ProjectConfig,
+  /**
+   * Modo de ciclo por usuario. Si un usuario es 'REINFORCEMENT' se calcula el
+   * enganche normal entre sus jornadas, pero NUNCA se evalúa reenganche
+   * (un refuerzo no tiene ciclo semanal, así que la marca de 6to día de la
+   * jornada previa se ignora a estos efectos).
+   * Usuarios no presentes en el mapa se asumen 'CYCLE'.
+   */
+  userCycleModes?: Map<string, 'CYCLE' | 'REINFORCEMENT'>,
 ): Map<string, { enganche: number; reenganche: number }> {
   const result = new Map<string, { enganche: number; reenganche: number }>()
   if (config.engancheHours === 0 && config.reengancheHours === 0) return result
@@ -156,8 +236,8 @@ export function calcEngancheExtras(
     byUser.set(e.userId, arr)
   }
 
-  for (const userEntries of byUser.values()) {
-    // Ordenar por fecha+hora de inicio
+  for (const [userId, userEntries] of byUser.entries()) {
+    const isReinforcement = userCycleModes?.get(userId) === 'REINFORCEMENT'
     userEntries.sort((a, b) => {
       const tsA = shiftStartTs(a.workDate, a.timeIn)
       const tsB = shiftStartTs(b.workDate, b.timeIn)
@@ -168,23 +248,22 @@ export function calcEngancheExtras(
       const prev = userEntries[i - 1]
       const curr = userEntries[i]
 
-      const prevEnd  = shiftEndTs(prev.workDate, prev.timeIn, prev.timeOut)
+      const prevEnd   = shiftEndTs(prev.workDate, prev.timeIn, prev.timeOut)
       const currStart = shiftStartTs(curr.workDate, curr.timeIn)
       const gapHours = (currStart - prevEnd) / 3600000
 
       if (gapHours < 0) continue // solapamiento, ignorar
 
-      const prevWeek = getWorkWeekStart(prev.workDate, config.workWeekStartDay)
-      const currWeek = getWorkWeekStart(curr.workDate, config.workWeekStartDay)
-      const sameWeek = prevWeek === currWeek
+      // Refuerzo: nunca aplica reenganche aunque la previa esté marcada como 6to día.
+      const reengancheApplies = !isReinforcement && prev.isJornadaAdicional === true
 
-      if (sameWeek && config.engancheHours > 0) {
-        const shortfall = round2(Math.max(0, config.engancheHours - gapHours))
-        if (shortfall > 0) result.set(curr.id, { enganche: shortfall, reenganche: 0 })
-      } else if (!sameWeek && config.reengancheHours > 0) {
+      if (reengancheApplies && config.reengancheHours > 0) {
         const reengancheMin = config.reengancheHours + config.engancheHours
         const shortfall = round2(Math.max(0, reengancheMin - gapHours))
         if (shortfall > 0) result.set(curr.id, { enganche: 0, reenganche: shortfall })
+      } else if (config.engancheHours > 0) {
+        const shortfall = round2(Math.max(0, config.engancheHours - gapHours))
+        if (shortfall > 0) result.set(curr.id, { enganche: shortfall, reenganche: 0 })
       }
     }
   }
@@ -203,7 +282,11 @@ export function calculateSettlement(
     regular: number; overtime: number; night: number
     nightOvertime: number; enganche: number; reenganche: number
     jornadaAdicionalCount: number; penalty: number
+    // Horas "ponderadas" por jornada adicional, usadas solo para el cálculo de pago.
+    regularPaid: number; overtimePaid: number; nightPaid: number; penaltyPaid: number
   }>()
+
+  const adicMult = config.jornadaAdicionalMultiplier || 1
 
   for (const e of entries) {
     const existing = byUser.get(e.userId) ?? {
@@ -211,14 +294,26 @@ export function calculateSettlement(
       regular: 0, overtime: 0, night: 0,
       nightOvertime: 0, enganche: 0, reenganche: 0,
       jornadaAdicionalCount: 0, penalty: 0,
+      regularPaid: 0, overtimePaid: 0, nightPaid: 0, penaltyPaid: 0,
     }
-    existing.regular       += e.calculation.regularHours   ?? 0
-    existing.overtime       += e.calculation.overtimeHours  ?? 0
-    existing.night          += e.calculation.nightHours     ?? 0
-    existing.nightOvertime  += e.calculation.nightOvertimeHours  ?? 0
-    existing.enganche       += e.calculation.engancheExtraHours  ?? 0
-    existing.reenganche     += e.calculation.reengancheExtraHours ?? 0
-    existing.penalty        += e.calculation.penaltyHours   ?? 0
+    const m = e.isJornadaAdicional ? adicMult : 1
+    const reg = e.calculation.regularHours ?? 0
+    const ot  = e.calculation.overtimeHours ?? 0
+    const nh  = e.calculation.nightHours ?? 0
+    const noh = e.calculation.nightOvertimeHours ?? 0
+    const pen = e.calculation.penaltyHours ?? 0
+    existing.regular       += reg
+    existing.overtime      += ot
+    existing.night         += nh
+    existing.nightOvertime += noh
+    existing.enganche      += e.calculation.engancheExtraHours  ?? 0
+    existing.reenganche    += e.calculation.reengancheExtraHours ?? 0
+    existing.penalty       += pen
+    // Acumulado para pago, aplicando multiplicador de jornada adicional cuando corresponda.
+    existing.regularPaid   += reg * m
+    existing.overtimePaid  += ot * m
+    existing.nightPaid     += nh * m
+    existing.penaltyPaid   += pen * m
     if (e.isJornadaAdicional) existing.jornadaAdicionalCount += 1
     byUser.set(e.userId, existing)
   }
@@ -226,11 +321,11 @@ export function calculateSettlement(
   const lines: SettlementLine[] = Array.from(byUser.entries()).map(([userId, data]) => {
     const rateInfo  = userRates.get(userId)
     const hourlyRate = rateInfo?.hourlyRate ?? 0
-    const regularPay  = round2(data.regular * hourlyRate)
+    const regularPay  = round2(data.regularPaid * hourlyRate)
     const overtimePay = round2(
-      (data.overtime + data.penalty + data.enganche + data.reenganche) * hourlyRate * config.overtimeMultiplier,
+      (data.overtimePaid + data.penaltyPaid + data.enganche + data.reenganche) * hourlyRate * config.overtimeMultiplier,
     )
-    const nightPay   = round2(data.night * hourlyRate * config.nightAdditionalMultiplier)
+    const nightPay   = round2(data.nightPaid * hourlyRate * config.nightAdditionalMultiplier)
     const totalHours  = round2(data.regular + data.overtime)
     return {
       userId,
