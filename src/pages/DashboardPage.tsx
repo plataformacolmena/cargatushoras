@@ -40,6 +40,7 @@ import {
   listApprovedUsers,
   listPendingUsers,
   listImportedPlaceholders,
+  repairMergedPlaceholders,
   subscribeToMyEntries,
   subscribeToProjectEntries,
   subscribeToAreaEntries,
@@ -433,6 +434,23 @@ export function DashboardPage() {
   useEffect(() => {
     void loadUsersPanels()
   }, [loadUsersPanels])
+
+  const [repairBusy, setRepairBusy] = useState(false)
+  const handleRepairMerged = useCallback(async () => {
+    if (repairBusy) return
+    if (!window.confirm('Reparar placeholders huérfanos: marcará como fusionados los placeholders cuyo usuario real ya existe. ¿Continuar?')) return
+    setRepairBusy(true)
+    try {
+      const { repaired, orphans } = await repairMergedPlaceholders()
+      window.alert(`Reparados: ${repaired}\nHuérfanos sin placeholder original: ${orphans}`)
+      await loadUsersPanels()
+    } catch (err) {
+      console.error('[repairMergedPlaceholders] error:', err)
+      window.alert('Error al reparar. Revisar consola.')
+    } finally {
+      setRepairBusy(false)
+    }
+  }, [repairBusy, loadUsersPanels])
 
   // Carga áreas al seleccionar proyecto en modal de aprobación
   useEffect(() => {
@@ -2721,6 +2739,14 @@ export function DashboardPage() {
               title="Recargar listados de usuarios"
             >
               Refrescar
+            </button>
+            <button
+              className="btn-sm btn-outline"
+              disabled={repairBusy}
+              onClick={() => { void handleRepairMerged() }}
+              title="Marca como fusionados los placeholders cuyo usuario real ya existe (limpia duplicados por mail)"
+            >
+              {repairBusy ? 'Reparando…' : 'Reparar duplicados'}
             </button>
           </nav>
 

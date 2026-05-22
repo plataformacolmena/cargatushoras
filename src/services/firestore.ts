@@ -1074,6 +1074,39 @@ export async function deleteImportedPlaceholder(placeholderUid: string): Promise
   await deleteDoc(doc(db, 'users', placeholderUid))
 }
 
+/** Repara placeholders huérfanos: usuarios reales con `migratedFromUid` cuyo placeholder original
+ *  no fue marcado como fusionado (por un bug histórico de reglas).
+ *  Solo admins. Retorna la cantidad de placeholders reparados.
+ */
+export async function repairMergedPlaceholders(): Promise<{ repaired: number; orphans: number }> {
+  const usersSnap = await getDocs(collection(db, 'users'))
+  let repaired = 0
+  let orphans = 0
+  for (const d of usersSnap.docs) {
+    const user = d.data() as UserProfile & { migratedFromUid?: string }
+    if (!user.migratedFromUid) continue
+    const placeholderRef = doc(db, 'users', user.migratedFromUid)
+    const phSnap = await getDoc(placeholderRef)
+    if (!phSnap.exists()) {
+      orphans += 1
+      continue
+    }
+    const ph = phSnap.data() as UserProfile
+    if (ph.mergedToUid) continue
+    try {
+      await updateDoc(placeholderRef, {
+        isPlaceholder: false,
+        mergedToUid: user.uid,
+        updatedAt: serverTimestamp(),
+      })
+      repaired += 1
+    } catch (err) {
+      if (import.meta.env.DEV) console.error('[repairMergedPlaceholders] failed for', user.migratedFromUid, err)
+    }
+  }
+  return { repaired, orphans }
+}
+
 export async function importMembers(
   rows: { email: string; displayName: string }[],
 ): Promise<{ imported: number; duplicates: string[] }> {
@@ -1109,6 +1142,7 @@ export async function importMembers(
       role: 'MEMBER',
       approvalStatus: 'PENDING',
       isPlaceholder: true,
+      mergedToUid: null,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     }

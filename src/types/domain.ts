@@ -17,7 +17,7 @@ export interface UserProfile {
   roleId?: string
   cycleMode?: CycleMode      // default 'CYCLE'
   isPlaceholder?: boolean    // true = creado por admin, aún no ha iniciado sesión
-  mergedToUid?: string       // UID real al que se migró este placeholder
+  mergedToUid?: string | null // UID real al que se migró este placeholder (null cuando aún no se reclamó)
   migratedFromUid?: string   // UID del placeholder del que proviene este perfil real
   auditReviewColor?: string  // color de revisión asignado por admin en reporte "sin informar"
   disabled?: boolean         // true = inhabilitado por admin; no puede iniciar sesión

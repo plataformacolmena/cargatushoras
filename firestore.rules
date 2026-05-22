@@ -49,7 +49,7 @@ service cloud.firestore {
         // (No requiere estar APPROVED — el placeholder PENDING también se puede reclamar al primer login.)
         isSignedIn() &&
         resource.data.isPlaceholder == true &&
-        resource.data.mergedToUid == null &&
+        resource.data.get('mergedToUid', null) == null &&
         request.auth.token.email != null &&
         resource.data.email == request.auth.token.email.lower() &&
         request.resource.data.mergedToUid == request.auth.uid &&
