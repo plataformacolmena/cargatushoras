@@ -179,22 +179,6 @@ service cloud.firestore {
       allow update, delete: if isSuperUser();
     }
 
-    match /imported_members/{email} {
-      // Cualquier usuario autenticado puede leer (necesario para la auto-aprobación al login)
-      allow read: if isSignedIn();
-      // Solo admins pueden crear o borrar
-      allow create, delete: if isAdminRole();
-      // Admins O el propio usuario reclamando su registro (solo puede marcar claimed=true con su uid)
-      allow update: if isAdminRole() || (
-        isSignedIn() &&
-        request.resource.data.claimed == true &&
-        request.resource.data.claimedByUid == request.auth.uid &&
-        request.resource.data.email == resource.data.email &&
-        request.resource.data.displayName == resource.data.displayName &&
-        request.resource.data.importedAt == resource.data.importedAt
-      );
-    }
-
     // ─── Chat / Soporte ────────────────────────────────────────────────────
     match /chat_threads/{threadId} {
       // Helper: ¿el usuario actual puede ver el hilo?

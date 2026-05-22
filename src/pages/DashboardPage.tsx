@@ -18,7 +18,6 @@ import {
   deleteSettlement,
   approveImportedPlaceholder,
   deleteImportedPlaceholder,
-  migrateLegacyImportedMembers,
   getProjectConfig,
   importMembers,
   listAllProjects,
@@ -57,6 +56,7 @@ import {
   updateProjectRole,
   updateTimeEntry,
   updateUserProfileAdmin,
+  recalculateUserEntries,
 } from '../services/firestore'
 import type {
   AppRole,
@@ -352,12 +352,15 @@ export function DashboardPage() {
   useEffect(() => {
     const currentProfile = profile
     if (!currentProfile || !activeProjectId) return
-    // Ventana de jornadas en tiempo real: \u00faltimos ~180 d\u00edas para limitar
+    // Solo montar el listener cuando el usuario está en la pestaña de proyectos.
+    // En USERS / HELP / PROJECT_MANAGEMENT no se necesita.
+    if (mainTab !== 'PROJECTS') return
+    // Ventana de jornadas en tiempo real: últimos ~90 días para limitar
     // lecturas de Firestore. Reportes y liquidaciones (que requieran fechas
-    // m\u00e1s antiguas) usan listAllTimeEntries con rango espec\u00edfico.
+    // más antiguas) usan listAllTimeEntries con rango específico.
     const since = (() => {
       const d = new Date()
-      d.setDate(d.getDate() - 180)
+      d.setDate(d.getDate() - 90)
       return d.toISOString().slice(0, 10)
     })()
     if (canAudit(currentProfile.role)) {
@@ -369,7 +372,7 @@ export function DashboardPage() {
     } else {
       return subscribeToMyEntries(currentProfile.uid, activeProjectId, setEntries, { since })
     }
-  }, [activeProjectId, profile])
+  }, [activeProjectId, profile, mainTab])
 
   // Suscripción en tiempo real a usuarios del proyecto (formulario admin en auditoría)
   useEffect(() => {
@@ -450,10 +453,6 @@ export function DashboardPage() {
   useEffect(() => {
     const currentProfile = profile
     if (!currentProfile || !canAudit(currentProfile.role)) return
-    // Migración one-shot de la colección legacy imported_members
-    void migrateLegacyImportedMembers()
-      .then((n) => { if (n > 0) console.log('[migration] legacy imported_members migrated:', n) })
-      .catch((e) => console.warn('[migration] legacy migration skipped:', e))
     return subscribeToImportedPlaceholders(
       setImportedMembers,
       (err) => console.error('[subscribeToImportedPlaceholders] error:', err),
@@ -1275,13 +1274,25 @@ export function DashboardPage() {
     event.preventDefault()
     if (!editingUser) return
     try {
+      const previousCycleMode = editingUser.cycleMode ?? 'CYCLE'
+      const newCycleMode = editUserForm.cycleMode
+      const targetProjectId = editUserForm.projectId || editingUser.projectId
       await updateUserProfileAdmin(editingUser.uid, {
         displayName: editUserForm.displayName || undefined,
         areaId: editUserForm.areaId || undefined,
         roleId: editUserForm.roleId || undefined,
         projectId: editUserForm.projectId || undefined,
-        cycleMode: editUserForm.cycleMode,
+        cycleMode: newCycleMode,
       })
+      // Si cambió el modo de ciclo, recalcular las jornadas previas del usuario
+      // para que reflejen el nuevo cálculo de enganche/reenganche.
+      if (previousCycleMode !== newCycleMode && targetProjectId) {
+        try {
+          await recalculateUserEntries(targetProjectId, editingUser.uid)
+        } catch (recalcErr) {
+          console.warn('[handleSaveUserEdit] recalc on cycleMode change failed:', recalcErr)
+        }
+      }
       showToast('Usuario actualizado.')
       setEditingUser(null)
     } catch (err) {

@@ -4,6 +4,8 @@ import './index.css'
 import App from './App.tsx'
 import { AuthProvider } from './auth/AuthContext'
 import { registerServiceWorker } from './pwa'
+import { initSingleInstance } from './lib/singleInstance'
+import { flushPendingRecalculations } from './services/firestore'
 
 /**
  * Kill-switch único: en versiones previas el Service Worker interceptaba
@@ -41,6 +43,14 @@ async function bootstrap() {
     location.reload()
     return
   }
+  // Guard de instancia única (BroadcastChannel). Si esta pestaña detecta
+  // otra activa, muestra un overlay bloqueante con opción de "Usar aquí".
+  initSingleInstance()
+  // Antes de cerrar la pestaña, ejecutar cualquier recálculo de usuario
+  // pendiente que esté en el debounce.
+  window.addEventListener('pagehide', () => {
+    void flushPendingRecalculations()
+  })
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
       <AuthProvider>

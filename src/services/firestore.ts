@@ -40,6 +40,60 @@ import type {
 
 const CALCULATION_VERSION = 'v1-client'
 
+// ─── Debounce de recalculateUserEntries ───────────────────────────────────
+// Agrupa ediciones consecutivas del mismo usuario en un único recálculo,
+// reduciendo lecturas/escrituras a Firestore cuando el usuario edita varias
+// jornadas seguidas.
+const RECALC_DEBOUNCE_MS = 7000
+const pendingRecalcs = new Map<string, { projectId: string; userId: string; timer: ReturnType<typeof setTimeout> }>()
+
+function recalcKey(projectId: string, userId: string): string {
+  return `${projectId}::${userId}`
+}
+
+/** Programa un recálculo del usuario; reintenta agrupar llamadas en una ventana corta. */
+export function scheduleRecalculateUserEntries(projectId: string, userId: string): void {
+  const key = recalcKey(projectId, userId)
+  const existing = pendingRecalcs.get(key)
+  if (existing) clearTimeout(existing.timer)
+  const timer = setTimeout(() => {
+    pendingRecalcs.delete(key)
+    void recalculateUserEntries(projectId, userId).catch((err) => {
+      if (import.meta.env.DEV) console.warn('[recalc][debounced] failed:', err)
+    })
+  }, RECALC_DEBOUNCE_MS)
+  pendingRecalcs.set(key, { projectId, userId, timer })
+}
+
+/** Ejecuta de inmediato todos los recálculos pendientes (e.g. antes de cerrar pestaña). */
+export async function flushPendingRecalculations(): Promise<void> {
+  const tasks: Array<Promise<void>> = []
+  for (const [key, info] of pendingRecalcs.entries()) {
+    clearTimeout(info.timer)
+    pendingRecalcs.delete(key)
+    tasks.push(
+      recalculateUserEntries(info.projectId, info.userId).catch((err) => {
+        if (import.meta.env.DEV) console.warn('[recalc][flush] failed:', err)
+      }),
+    )
+  }
+  await Promise.all(tasks)
+}
+
+// ─── Cache en memoria para user_work_cycles ───────────────────────────────
+const WORK_CYCLES_TTL_MS = 5 * 60 * 1000
+interface WorkCyclesCacheEntry { data: WorkCycle[]; ts: number }
+const workCyclesCacheByProject = new Map<string, WorkCyclesCacheEntry>()
+
+function invalidateWorkCyclesCache(projectId?: string): void {
+  if (projectId) {
+    workCyclesCacheByProject.delete(projectId)
+  } else {
+    workCyclesCacheByProject.clear()
+  }
+}
+
+
 // ---------- Validadores defensivos (defensa en profundidad) ----------
 // Las reglas de Firestore son la fuente de verdad de seguridad, pero
 // validar también en cliente evita escrituras inválidas y reduce
@@ -343,8 +397,8 @@ export async function saveTimeEntry(
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
-  // Recalcular enganche/reenganche para todo el historial del usuario
-  await recalculateUserEntries(input.projectId, user.uid)
+  // Recalcular enganche/reenganche (debounced para agrupar ediciones consecutivas)
+  scheduleRecalculateUserEntries(input.projectId, user.uid)
 }
 
 export async function saveTimeEntryForUser(
@@ -371,7 +425,7 @@ export async function saveTimeEntryForUser(
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
-  await recalculateUserEntries(input.projectId, targetUser.uid)
+  scheduleRecalculateUserEntries(input.projectId, targetUser.uid)
 }
 
 export async function listMyTimeEntries(userId: string, projectId: string): Promise<TimeEntry[]> {
@@ -524,7 +578,7 @@ export async function recalculateUserEntries(projectId: string, userId: string):
 
 export async function deleteTimeEntry(entryId: string, projectId: string, userId: string): Promise<void> {
   await deleteDoc(doc(db, 'time_entries', entryId))
-  await recalculateUserEntries(projectId, userId)
+  scheduleRecalculateUserEntries(projectId, userId)
 }
 
 export async function updateTimeEntry(
@@ -551,7 +605,7 @@ export async function updateTimeEntry(
     calculation,
     updatedAt: serverTimestamp(),
   })
-  await recalculateUserEntries(projectId, userId)
+  scheduleRecalculateUserEntries(projectId, userId)
 }
 
 export async function listProjectAreas(projectId: string): Promise<ProjectArea[]> {
@@ -1040,68 +1094,6 @@ export async function importMembers(
   return { imported: toImport.length, duplicates }
 }
 
-/** Migra la colección legacy imported_members → users (placeholders).
- *  Se ejecuta una sola vez por admin si quedan registros antiguos.
- */
-export async function migrateLegacyImportedMembers(): Promise<number> {
-  const legacySnap = await getDocs(collection(db, 'imported_members'))
-  if (legacySnap.empty) return 0
-
-  // Email → uid del placeholder ya existente en users (si fue preApproved con placeholderUid)
-  const usersSnap = await getDocs(query(collection(db, 'users'), where('isPlaceholder', '==', true)))
-  const existingPlaceholderEmails = new Set<string>()
-  usersSnap.docs.forEach((d) => {
-    const data = d.data() as UserProfile
-    if (data.email && !data.mergedToUid) existingPlaceholderEmails.add(data.email.toLowerCase())
-  })
-
-  let migrated = 0
-  const batch = writeBatch(db)
-  for (const d of legacySnap.docs) {
-    const data = d.data() as Record<string, unknown>
-    const email = (data.email as string) || d.id
-    const displayName = (data.displayName as string) || ''
-    const claimed = data.claimed === true
-    const placeholderUid = data.placeholderUid as string | undefined
-    const projectId = data.projectId as string | undefined
-
-    // Si ya fue reclamado, simplemente borrar el legacy
-    if (claimed) {
-      batch.delete(d.ref)
-      continue
-    }
-
-    // Si tiene placeholderUid → ese placeholder ya existe en users (admin lo preaprobó)
-    if (placeholderUid) {
-      batch.delete(d.ref)
-      continue
-    }
-
-    // Si no hay placeholder y el email no existe en users → crear placeholder
-    if (!existingPlaceholderEmails.has(email.toLowerCase())) {
-      const ref = doc(collection(db, 'users'))
-      const placeholder: UserProfile = {
-        uid: ref.id,
-        email: email.toLowerCase(),
-        displayName: displayName || null,
-        role: 'MEMBER',
-        approvalStatus: 'PENDING',
-        isPlaceholder: true,
-        ...(projectId ? { projectId } : {}),
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      }
-      batch.set(ref, placeholder)
-      existingPlaceholderEmails.add(email.toLowerCase())
-      migrated++
-    }
-
-    batch.delete(d.ref)
-  }
-  await batch.commit()
-  return migrated
-}
-
 // ─── Auditoría: usuarios sin informar + color de revisión ──────────────────
 
 /** Asigna (o limpia con '') el color de revisión de un usuario en el reporte de "sin informar". */
@@ -1233,14 +1225,21 @@ export async function setAuditLockEnabled(
 
 /** Lista todos los ciclos (abiertos y cerrados) del usuario en el proyecto. */
 export async function listUserWorkCycles(projectId: string, userId: string): Promise<WorkCycle[]> {
+  const cached = workCyclesCacheByProject.get(projectId)
+  if (cached && Date.now() - cached.ts < WORK_CYCLES_TTL_MS) {
+    return cached.data
+      .filter((c) => c.userId === userId)
+      .sort((a, b) => a.anchorDate.localeCompare(b.anchorDate))
+  }
   const q = query(
     collection(db, 'user_work_cycles'),
     where('projectId', '==', projectId),
-    where('userId', '==', userId),
   )
   const snap = await getDocs(q)
-  return snap.docs
-    .map((d) => ({ id: d.id, ...(d.data() as Omit<WorkCycle, 'id'>) }))
+  const all = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<WorkCycle, 'id'>) }))
+  workCyclesCacheByProject.set(projectId, { data: all, ts: Date.now() })
+  return all
+    .filter((c) => c.userId === userId)
     .sort((a, b) => a.anchorDate.localeCompare(b.anchorDate))
 }
 
@@ -1284,10 +1283,18 @@ export function subscribeToUserWorkCycles(
 
 /** Lista los ciclos de todos los usuarios del proyecto (uso ADMIN). */
 export async function listProjectWorkCycles(projectId: string): Promise<WorkCycle[]> {
+  const cached = workCyclesCacheByProject.get(projectId)
+  if (cached && Date.now() - cached.ts < WORK_CYCLES_TTL_MS) {
+    return cached.data
+      .slice()
+      .sort((a, b) => a.userId.localeCompare(b.userId) || a.anchorDate.localeCompare(b.anchorDate))
+  }
   const q = query(collection(db, 'user_work_cycles'), where('projectId', '==', projectId))
   const snap = await getDocs(q)
-  return snap.docs
-    .map((d) => ({ id: d.id, ...(d.data() as Omit<WorkCycle, 'id'>) }))
+  const all = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<WorkCycle, 'id'>) }))
+  workCyclesCacheByProject.set(projectId, { data: all, ts: Date.now() })
+  return all
+    .slice()
     .sort((a, b) => a.userId.localeCompare(b.userId) || a.anchorDate.localeCompare(b.anchorDate))
 }
 
@@ -1326,6 +1333,7 @@ export async function createUserWorkCycle(input: {
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
+  invalidateWorkCyclesCache(input.projectId)
 
   // Recalcular para aplicar cycleScope/isJornadaAdicional a entradas existentes
   await recalculateUserEntries(input.projectId, input.userId)
@@ -1359,6 +1367,7 @@ export async function closeUserWorkCycle(
     updatedAt: serverTimestamp(),
     updatedBy: closedBy,
   })
+  invalidateWorkCyclesCache(cycle.projectId)
   await recalculateUserEntries(cycle.projectId, cycle.userId)
 }
 
@@ -1381,6 +1390,7 @@ export async function reopenUserWorkCycle(cycleId: string, updatedBy: string): P
     updatedAt: serverTimestamp(),
     updatedBy,
   })
+  invalidateWorkCyclesCache(cycle.projectId)
   await recalculateUserEntries(cycle.projectId, cycle.userId)
 }
 
@@ -1405,6 +1415,7 @@ export async function updateUserWorkCycleAnchor(
     updatedAt: serverTimestamp(),
     updatedBy,
   })
+  invalidateWorkCyclesCache(cycle.projectId)
   await recalculateUserEntries(cycle.projectId, cycle.userId)
 }
 
@@ -1415,6 +1426,7 @@ export async function deleteUserWorkCycle(cycleId: string): Promise<void> {
   if (!snap.exists()) return
   const cycle = snap.data() as Omit<WorkCycle, 'id'>
   await deleteDoc(ref)
+  invalidateWorkCyclesCache(cycle.projectId)
   await recalculateUserEntries(cycle.projectId, cycle.userId)
 }
 
