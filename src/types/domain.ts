@@ -50,19 +50,6 @@ export interface WorkCycle {
 // REINFORCEMENT: el usuario es refuerzo por jornada.
 export type CycleScope = 'IN_CYCLE' | 'OUT_OF_CYCLE' | 'REINFORCEMENT'
 
-// Bloqueo de ediciones a nivel de proyecto.
-// Cuando enabled=true, las entradas con workDate entre dateFrom y dateTo
-// quedan marcadas con lockedByAudit=true y los miembros no pueden
-// editarlas/eliminarlas ni crear nuevas en ese rango (los admins sí).
-export interface AuditLock {
-  projectId: string
-  enabled: boolean
-  dateFrom: string  // YYYY-MM-DD
-  dateTo: string    // YYYY-MM-DD
-  updatedAt?: unknown
-  updatedBy?: string
-}
-
 export interface Project {
   id: string
   name: string
@@ -145,7 +132,6 @@ export interface TimeEntry extends TimeEntryInput {
   calculationVersion: string
   calculationSource: 'client'
   lockedByAdmin: boolean
-  lockedByAudit?: boolean            // bloqueado por auditoría (impide edición a miembros)
   reviewColor?: string               // color de revisión asignado por admin
   // Campos derivados del ciclo laboral del usuario (calculados al guardar/recalcular):
   cycleScope?: CycleScope            // IN_CYCLE | OUT_OF_CYCLE | REINFORCEMENT

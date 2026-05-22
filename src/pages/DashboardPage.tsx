@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import * as XLSX from 'xlsx'
 import { useAuth } from '../auth/useAuth'
 import { SupportChatPanel } from '../components/SupportChatPanel'
@@ -36,14 +36,13 @@ import {
   saveTimeEntryForUser,
   setEntryReviewColor,
   setUserAuditReviewColor,
-  setAuditLockEnabled,
   setUserRole,
-  subscribeToApprovedUsers,
-  subscribeToAuditLock,
+  listApprovedUsers,
+  listPendingUsers,
+  listImportedPlaceholders,
   subscribeToMyEntries,
-  subscribeToImportedPlaceholders,
-  subscribeToPendingUsers,
   subscribeToProjectEntries,
+  subscribeToAreaEntries,
   subscribeToProjectUsers,
   subscribeToProjects,
   listUsersWithoutEntries,
@@ -60,7 +59,6 @@ import {
 } from '../services/firestore'
 import type {
   AppRole,
-  AuditLock,
   Project,
   ProjectArea,
   ProjectConfig,
@@ -302,10 +300,9 @@ export function DashboardPage() {
   // Rangos bloqueados por liquidaciones
   const [lockedRanges, setLockedRanges] = useState<Array<{ dateFrom: string; dateTo: string }>>([])
 
-  // Auditoría: bloqueo de ediciones (por proyecto)
-  const [auditLock, setAuditLock] = useState<AuditLock | null>(null)
-  const [auditLockForm, setAuditLockForm] = useState<{ dateFrom: string; dateTo: string }>({ dateFrom: '', dateTo: '' })
-  const [auditLockBusy, setAuditLockBusy] = useState(false)
+  // Modal de recálculo/sync de áreas por rango
+  const [rangeOpModal, setRangeOpModal] = useState<{ op: 'RECALC' | 'SYNC_AREAS'; dateFrom: string; dateTo: string } | null>(null)
+  const [rangeOpBusy, setRangeOpBusy] = useState(false)
 
   // Auditoría: usuarios sin informar
   const [noReportFilters, setNoReportFilters] = useState<{ dateFrom: string; dateTo: string; areaId: string }>({ dateFrom: '', dateTo: '', areaId: '' })
@@ -366,9 +363,7 @@ export function DashboardPage() {
     if (canAudit(currentProfile.role)) {
       return subscribeToProjectEntries(activeProjectId, setEntries, { since })
     } else if (currentProfile.areaId) {
-      return subscribeToProjectEntries(activeProjectId, (all) => {
-        setEntries(all.filter((e) => e.areaId === currentProfile.areaId))
-      }, { since })
+      return subscribeToAreaEntries(activeProjectId, currentProfile.areaId, setEntries, { since })
     } else {
       return subscribeToMyEntries(currentProfile.uid, activeProjectId, setEntries, { since })
     }
@@ -380,19 +375,6 @@ export function DashboardPage() {
     if (!currentProfile || !canAudit(currentProfile.role) || !activeProjectId) return
     return subscribeToProjectUsers(activeProjectId, setProjectUsers)
   }, [activeProjectId, profile])
-
-  // Suscripción al bloqueo de ediciones del proyecto activo
-  useEffect(() => {
-    if (!activeProjectId) {
-      setAuditLock(null)
-      return
-    }
-    return subscribeToAuditLock(activeProjectId, (lock) => {
-      setAuditLock(lock)
-      // Prellenar el form con los últimos valores almacenados
-      if (lock) setAuditLockForm({ dateFrom: lock.dateFrom, dateTo: lock.dateTo })
-    })
-  }, [activeProjectId])
 
   useEffect(() => {
     if (!activeProjectId) return
@@ -429,35 +411,28 @@ export function DashboardPage() {
     void listAllProjects().then(setAllProjects)
   }, [profile])
 
-  // Suscripción en tiempo real a usuarios aprobados (panel Usuarios + lista admin)
-  useEffect(() => {
+  // Carga one-shot de usuarios aprobados/pendientes/placeholders (con botón Refrescar)
+  const loadUsersPanels = useCallback(async () => {
     const currentProfile = profile
     if (!currentProfile || !canAudit(currentProfile.role)) return
-    return subscribeToApprovedUsers(
-      (users) => {
-        setApprovedUsers(users)
-        setApprovedUsersList(users)
-      },
-      (err) => console.error('[subscribeToApprovedUsers] error:', err),
-    )
+    try {
+      const [approved, pending, placeholders] = await Promise.all([
+        listApprovedUsers(),
+        listPendingUsers(),
+        listImportedPlaceholders(),
+      ])
+      setApprovedUsers(approved)
+      setApprovedUsersList(approved)
+      setPendingUsers(pending)
+      setImportedMembers(placeholders)
+    } catch (err) {
+      console.error('[loadUsersPanels] error:', err)
+    }
   }, [profile])
 
-  // Suscripción en tiempo real a usuarios pendientes (badge + tab)
   useEffect(() => {
-    const currentProfile = profile
-    if (!currentProfile || !canAudit(currentProfile.role)) return
-    return subscribeToPendingUsers(setPendingUsers)
-  }, [profile])
-
-  // Suscripción en tiempo real a miembros pre-importados (placeholders en users)
-  useEffect(() => {
-    const currentProfile = profile
-    if (!currentProfile || !canAudit(currentProfile.role)) return
-    return subscribeToImportedPlaceholders(
-      setImportedMembers,
-      (err) => console.error('[subscribeToImportedPlaceholders] error:', err),
-    )
-  }, [profile])
+    void loadUsersPanels()
+  }, [loadUsersPanels])
 
   // Carga áreas al seleccionar proyecto en modal de aprobación
   useEffect(() => {
@@ -783,19 +758,6 @@ export function DashboardPage() {
         return
       }
     }
-    // Bloqueo de auditoría: si el miembro ya informó fechas en el rango, no puede agregar más.
-    // (Los admins quedan exentos de esta validación.)
-    if (
-      !canAudit(currentProfile.role) &&
-      isDateAuditLocked(form.workDate) &&
-      memberHasEntriesInAuditLockRange()
-    ) {
-      showToast(
-        `El rango ${auditLock?.dateFrom} → ${auditLock?.dateTo} está bloqueado por auditoría y ya informá jornadas en él.`,
-        'error',
-      )
-      return
-    }
     const fechaDuplicada = entries.some((e) => e.workDate === form.workDate && e.userId === currentProfile.uid)
     if (fechaDuplicada) {
       showToast(`Ya existe un registro para el ${form.workDate} en este proyecto.`, 'error')
@@ -899,8 +861,8 @@ export function DashboardPage() {
   async function submitEditEntry(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!editingEntry) return
-    if (!canAudit(currentProfile.role) && (editingEntry.lockedByAudit === true || isDateAuditLocked(editEntryForm.workDate))) {
-      showToast('Esta jornada está bloqueada por auditoría y no se puede editar.', 'error')
+    if (!canAudit(currentProfile.role) && isDateLocked(editEntryForm.workDate)) {
+      showToast('Esta jornada está bloqueada y no se puede editar.', 'error')
       return
     }
     // Bloqueo por política de fechas futuras (admins exentos).
@@ -929,8 +891,8 @@ export function DashboardPage() {
 
   async function handleDeleteEntry(entryId: string, userId: string) {
     const target = entries.find((e) => e.id === entryId)
-    if (!canAudit(currentProfile.role) && target?.lockedByAudit === true) {
-      showToast('Esta jornada está bloqueada por auditoría y no se puede eliminar.', 'error')
+    if (!canAudit(currentProfile.role) && target && isDateLocked(target.workDate)) {
+      showToast('Esta jornada está bloqueada y no se puede eliminar.', 'error')
       return
     }
     if (!window.confirm('¿Eliminar esta jornada?')) return
@@ -1237,25 +1199,40 @@ export function DashboardPage() {
     }
   }
 
-  async function handleRecalculate() {
-    if (!window.confirm('¿Recalcular todos los registros no liquidados? Esto actualiza horas de todos los registros usando la configuración actual del proyecto.')) return
-    try {
-      const count = await recalculateProjectEntries(activeProjectId, lockedRanges)
-      showToast(`${count} registro${count !== 1 ? 's' : ''} recalculado${count !== 1 ? 's' : ''}.`)
-    } catch (err) {
-      showToast('Error al recalcular.', 'error')
-      console.error(err)
-    }
+  function openRecalcModal() {
+    setRangeOpModal({ op: 'RECALC', dateFrom: '', dateTo: '' })
   }
 
-  async function handleSyncAreas() {
-    if (!window.confirm('¿Actualizar el área en todos los registros no liquidados según el área actual de cada usuario?')) return
+  function openSyncAreasModal() {
+    setRangeOpModal({ op: 'SYNC_AREAS', dateFrom: '', dateTo: '' })
+  }
+
+  async function runRangeOp() {
+    if (!rangeOpModal) return
+    const { op, dateFrom, dateTo } = rangeOpModal
+    if (!dateFrom || !dateTo) {
+      showToast('Indicá un rango de fechas.', 'error')
+      return
+    }
+    if (dateFrom > dateTo) {
+      showToast('La fecha desde no puede ser mayor que la fecha hasta.', 'error')
+      return
+    }
+    setRangeOpBusy(true)
     try {
-      const count = await syncUserAreasToEntries(activeProjectId, lockedRanges)
-      showToast(count > 0 ? `${count} registro${count !== 1 ? 's' : ''} actualizado${count !== 1 ? 's' : ''} con el área actual.` : 'No hay registros que actualizar.')
+      if (op === 'RECALC') {
+        const count = await recalculateProjectEntries(activeProjectId, lockedRanges, { dateFrom, dateTo })
+        showToast(`${count} registro${count !== 1 ? 's' : ''} recalculado${count !== 1 ? 's' : ''}.`)
+      } else {
+        const count = await syncUserAreasToEntries(activeProjectId, lockedRanges, { dateFrom, dateTo })
+        showToast(count > 0 ? `${count} registro${count !== 1 ? 's' : ''} actualizado${count !== 1 ? 's' : ''} con el área actual.` : 'No hay registros que actualizar.')
+      }
+      setRangeOpModal(null)
     } catch (err) {
-      showToast('Error al sincronizar áreas.', 'error')
+      showToast(op === 'RECALC' ? 'Error al recalcular.' : 'Error al sincronizar áreas.', 'error')
       console.error(err)
+    } finally {
+      setRangeOpBusy(false)
     }
   }
 
@@ -1355,23 +1332,6 @@ export function DashboardPage() {
     return lockedRanges.some((r) => workDate >= r.dateFrom && workDate <= r.dateTo)
   }
 
-  /** True si la fecha cae dentro del rango del bloqueo de auditoría activo. */
-  function isDateAuditLocked(workDate: string): boolean {
-    if (!auditLock || !auditLock.enabled) return false
-    return workDate >= auditLock.dateFrom && workDate <= auditLock.dateTo
-  }
-
-  /** True si el usuario actual ya tiene al menos una entrada propia dentro del rango del bloqueo de auditoría. */
-  function memberHasEntriesInAuditLockRange(): boolean {
-    if (!auditLock || !auditLock.enabled) return false
-    return entries.some(
-      (e) =>
-        e.userId === currentProfile.uid &&
-        e.workDate >= auditLock.dateFrom &&
-        e.workDate <= auditLock.dateTo,
-    )
-  }
-
   async function loadNoReportUsers() {
     if (!activeProjectId) return
     if (!noReportFilters.dateFrom || !noReportFilters.dateTo) {
@@ -1405,37 +1365,6 @@ export function DashboardPage() {
       showToast('Error al guardar el color.', 'error')
       console.error(err)
       void loadNoReportUsers()
-    }
-  }
-
-  async function handleToggleAuditLock(targetEnabled: boolean) {
-    if (!activeProjectId) return
-    if (!auditLockForm.dateFrom || !auditLockForm.dateTo) {
-      showToast('Indicá el rango de fechas a bloquear.', 'error')
-      return
-    }
-    if (auditLockForm.dateFrom > auditLockForm.dateTo) {
-      showToast('La fecha desde no puede ser mayor que la fecha hasta.', 'error')
-      return
-    }
-    const action = targetEnabled ? 'activar' : 'desactivar'
-    if (!window.confirm(`¿Seguro que querés ${action} el bloqueo de ediciones para ${auditLockForm.dateFrom} → ${auditLockForm.dateTo}?`)) {
-      return
-    }
-    setAuditLockBusy(true)
-    try {
-      const count = await setAuditLockEnabled(activeProjectId, {
-        enabled: targetEnabled,
-        dateFrom: auditLockForm.dateFrom,
-        dateTo: auditLockForm.dateTo,
-        updatedBy: currentProfile.uid,
-      })
-      showToast(targetEnabled ? `Bloqueo activado (${count} jornadas marcadas).` : `Bloqueo desactivado (${count} jornadas liberadas).`)
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : 'Error al cambiar el bloqueo.', 'error')
-      console.error(err)
-    } finally {
-      setAuditLockBusy(false)
     }
   }
 
@@ -2156,8 +2085,8 @@ export function DashboardPage() {
                         </div>
                         {(canAudit(currentProfile.role) || entry.userId === currentProfile.uid) && (
                           <div className="row" style={{ gap: '6px' }}>
-                            {entry.lockedByAudit && !canAudit(currentProfile.role) ? (
-                              <span className="chip" title="Esta jornada está bloqueada por auditoría" style={{ fontSize: '0.75rem' }}>
+                            {isDateLocked(entry.workDate) && !canAudit(currentProfile.role) ? (
+                              <span className="chip" title="Esta jornada está dentro de un período liquidado" style={{ fontSize: '0.75rem' }}>
                                 🔒 Bloqueada
                               </span>
                             ) : (
@@ -2187,74 +2116,6 @@ export function DashboardPage() {
           {projectTab === 'TIME_ENTRY_AUDIT' && canAudit(currentProfile.role) && (
             <section className="card">
               <h2>Auditoría de horarios</h2>
-
-              {/* ── Bloqueo de ediciones ───────────────────────────────────── */}
-              <details
-                style={{
-                  marginBottom: '1rem',
-                  borderBottom: '1px solid var(--line)',
-                  paddingBottom: '1rem',
-                  background: auditLock?.enabled ? 'rgba(239,68,68,0.06)' : 'transparent',
-                  padding: '0.75rem',
-                  borderRadius: 'var(--radius)',
-                }}
-                open={auditLock?.enabled}
-              >
-                <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none' }}>
-                  🔒 Bloqueo de ediciones
-                  {auditLock?.enabled ? (
-                    <span className="chip" style={{ marginLeft: '8px', background: '#ef4444', color: 'white' }}>
-                      Activo: {formatDate(auditLock.dateFrom)} → {formatDate(auditLock.dateTo)}
-                    </span>
-                  ) : (
-                    <span className="chip" style={{ marginLeft: '8px' }}>Inactivo</span>
-                  )}
-                </summary>
-                <p className="muted" style={{ fontSize: '0.85rem', marginTop: '0.5rem' }}>
-                  Cuando está activo, los miembros no pueden editar ni eliminar jornadas dentro del rango,
-                  ni agregar nuevas jornadas en él si ya informaron días en ese período.
-                  Los administradores pueden seguir editando libremente.
-                </p>
-                <div className="time-grid" style={{ marginTop: '0.5rem' }}>
-                  <label>
-                    Desde
-                    <input
-                      type="date"
-                      value={auditLockForm.dateFrom}
-                      onChange={(e) => setAuditLockForm((p) => ({ ...p, dateFrom: e.target.value }))}
-                      disabled={auditLockBusy}
-                    />
-                  </label>
-                  <label>
-                    Hasta
-                    <input
-                      type="date"
-                      value={auditLockForm.dateTo}
-                      onChange={(e) => setAuditLockForm((p) => ({ ...p, dateTo: e.target.value }))}
-                      disabled={auditLockBusy}
-                    />
-                  </label>
-                </div>
-                <div className="row" style={{ flexWrap: 'wrap', gap: '8px', marginTop: '0.5rem' }}>
-                  {!auditLock?.enabled ? (
-                    <button
-                      className="btn"
-                      onClick={() => { void handleToggleAuditLock(true) }}
-                      disabled={auditLockBusy}
-                    >
-                      {auditLockBusy ? <><Spinner size={14} inline /> Bloqueando…</> : 'Activar bloqueo'}
-                    </button>
-                  ) : (
-                    <button
-                      className="btn btn-outline"
-                      onClick={() => { void handleToggleAuditLock(false) }}
-                      disabled={auditLockBusy}
-                    >
-                      {auditLockBusy ? <><Spinner size={14} inline /> Liberando…</> : 'Desactivar bloqueo'}
-                    </button>
-                  )}
-                </div>
-              </details>
 
               {/* ── Usuarios sin informar ──────────────────────────────────── */}
               <details style={{ marginBottom: '1rem', borderBottom: '1px solid var(--line)', paddingBottom: '1rem' }}>
@@ -2451,17 +2312,17 @@ export function DashboardPage() {
                   )}
                   <button
                     className="btn btn-outline"
-                    onClick={() => { void handleRecalculate() }}
-                    title="Recalcula todos los registros no liquidados usando la configuración actual del proyecto"
+                    onClick={openRecalcModal}
+                    title="Recalcula registros no liquidados en el rango de fechas elegido"
                   >
-                    Recalcular todo
+                    Recalcular…
                   </button>
                   <button
                     className="btn btn-outline"
-                    onClick={() => { void handleSyncAreas() }}
-                    title="Actualiza el área en todos los registros no liquidados según el área actual de cada usuario"
+                    onClick={openSyncAreasModal}
+                    title="Actualiza el área en los registros no liquidados del rango de fechas elegido"
                   >
-                    Sincronizar áreas
+                    Sincronizar áreas…
                   </button>
                 </div>
               </div>
@@ -2840,7 +2701,7 @@ export function DashboardPage() {
       {/* === USUARIOS === */}
       {mainTab === 'USERS' && canAudit(currentProfile.role) && (
         <>
-          <nav className="subtab-row">
+          <nav className="subtab-row" style={{ alignItems: 'center' }}>
             <button
               className={`subtab ${userTab === 'PENDING' ? 'active' : ''}`}
               onClick={() => setUserTab('PENDING')}
@@ -2852,6 +2713,14 @@ export function DashboardPage() {
               onClick={() => setUserTab('APPROVED')}
             >
               Aprobados
+            </button>
+            <button
+              className="btn-sm btn-outline"
+              style={{ marginLeft: 'auto' }}
+              onClick={() => { void loadUsersPanels() }}
+              title="Recargar listados de usuarios"
+            >
+              Refrescar
             </button>
           </nav>
 
@@ -3169,6 +3038,44 @@ export function DashboardPage() {
           </ul>
         </section>
         </>
+      )}
+
+      {/* === MODAL: Recalcular / Sincronizar áreas por rango === */}
+      {rangeOpModal && (
+        <div className="modal-overlay" onClick={() => { if (!rangeOpBusy) setRangeOpModal(null) }}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>{rangeOpModal.op === 'RECALC' ? 'Recalcular registros' : 'Sincronizar áreas'}</h3>
+            <p className="muted" style={{ fontSize: '0.85rem' }}>
+              {rangeOpModal.op === 'RECALC'
+                ? 'Recalcula las horas de los registros NO liquidados dentro del rango usando la configuración actual del proyecto.'
+                : 'Actualiza el área en los registros NO liquidados dentro del rango según el área actual de cada usuario.'}
+            </p>
+            <div className="time-grid">
+              <label>Desde
+                <input
+                  type="date"
+                  value={rangeOpModal.dateFrom}
+                  onChange={(e) => setRangeOpModal((p) => p ? { ...p, dateFrom: e.target.value } : p)}
+                  disabled={rangeOpBusy}
+                />
+              </label>
+              <label>Hasta
+                <input
+                  type="date"
+                  value={rangeOpModal.dateTo}
+                  onChange={(e) => setRangeOpModal((p) => p ? { ...p, dateTo: e.target.value } : p)}
+                  disabled={rangeOpBusy}
+                />
+              </label>
+            </div>
+            <div className="row" style={{ gap: '8px', justifyContent: 'flex-end' }}>
+              <button className="btn btn-outline" onClick={() => setRangeOpModal(null)} disabled={rangeOpBusy}>Cancelar</button>
+              <button className="btn" onClick={() => { void runRangeOp() }} disabled={rangeOpBusy}>
+                {rangeOpBusy ? <><Spinner size={14} inline /> Procesando…</> : (rangeOpModal.op === 'RECALC' ? 'Recalcular' : 'Sincronizar')}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* === MODAL: Editar propia jornada === */}

@@ -114,7 +114,6 @@ service cloud.firestore {
         isApproved() &&
         resource.data.userId == request.auth.uid &&
         resource.data.lockedByAdmin == false &&
-        resource.data.get('lockedByAudit', false) == false &&
         request.resource.data.calculationSource == resource.data.calculationSource &&
         request.resource.data.calculationVersion == resource.data.calculationVersion
       ) || (
@@ -128,16 +127,8 @@ service cloud.firestore {
       allow delete: if isSuperUser() || isAdminRole() || (
         isApproved() &&
         resource.data.userId == request.auth.uid &&
-        resource.data.lockedByAdmin == false &&
-        resource.data.get('lockedByAudit', false) == false
+        resource.data.lockedByAdmin == false
       );
-    }
-
-    // ─── Bloqueo de ediciones por auditoría ───────────────────────────────
-    match /audit_locks/{projectId} {
-      allow read: if isApproved();
-      allow create, update: if isAdminRole();
-      allow delete: if isSuperUser();
     }
 
     // ─── Ciclos laborales por usuario ─────────────────────────────────────

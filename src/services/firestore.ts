@@ -21,7 +21,6 @@ import { db } from '../firebase'
 import { calcEngancheExtras, calculateEntry, calculateSettlement, getDefaultProjectConfig } from '../lib/calc'
 import type {
   AppRole,
-  AuditLock,
   CycleMode,
   Project,
   ProjectArea,
@@ -393,7 +392,6 @@ export async function saveTimeEntry(
     calculationSource: 'client',
     calculationVersion: CALCULATION_VERSION,
     lockedByAdmin: false,
-    lockedByAudit: false,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
@@ -421,7 +419,6 @@ export async function saveTimeEntryForUser(
     calculationSource: 'client',
     calculationVersion: CALCULATION_VERSION,
     lockedByAdmin: false,
-    lockedByAudit: false,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
@@ -687,9 +684,10 @@ export async function updateUserProfileAdmin(
 export async function recalculateProjectEntries(
   projectId: string,
   lockedRanges: Array<{ dateFrom: string; dateTo: string }>,
+  range?: { dateFrom?: string; dateTo?: string },
 ): Promise<number> {
   const [entries, config, usersSnap] = await Promise.all([
-    listAllTimeEntries(projectId, {}),
+    listAllTimeEntries(projectId, { dateFrom: range?.dateFrom, dateTo: range?.dateTo }),
     getProjectConfig(projectId),
     getDocs(query(collection(db, 'users'), where('projectId', '==', projectId))),
   ])
@@ -748,9 +746,10 @@ export async function recalculateProjectEntries(
 export async function syncUserAreasToEntries(
   projectId: string,
   lockedRanges: Array<{ dateFrom: string; dateTo: string }>,
+  range?: { dateFrom?: string; dateTo?: string },
 ): Promise<number> {
   const [entries, usersSnap] = await Promise.all([
-    listAllTimeEntries(projectId, {}),
+    listAllTimeEntries(projectId, { dateFrom: range?.dateFrom, dateTo: range?.dateTo }),
     getDocs(query(collection(db, 'users'), where('projectId', '==', projectId), where('approvalStatus', '==', 'APPROVED'))),
   ])
 
@@ -961,11 +960,37 @@ export function subscribeToProjectEntries(
   })
 }
 
+/** Suscripción filtrada por área (server-side). Requiere índice (projectId, areaId, workDate desc). */
+export function subscribeToAreaEntries(
+  projectId: string,
+  areaId: string,
+  callback: (entries: TimeEntry[]) => void,
+  opts?: { since?: string },
+): () => void {
+  const conditions = [where('projectId', '==', projectId), where('areaId', '==', areaId)]
+  if (opts?.since) {
+    conditions.push(where('workDate', '>=', opts.since))
+  }
+  const q = query(collection(db, 'time_entries'), ...conditions, orderBy('workDate', 'desc'))
+  return onSnapshot(q, (snap) => {
+    callback(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<TimeEntry, 'id'>) })))
+  })
+}
+
 export function subscribeToPendingUsers(callback: (users: UserProfile[]) => void): () => void {
   const q = query(collection(db, 'users'), where('approvalStatus', '==', 'PENDING'))
   return onSnapshot(q, (snap) => {
     callback(snap.docs.map((d) => d.data() as UserProfile))
   })
+}
+
+export async function listImportedPlaceholders(): Promise<UserProfile[]> {
+  const q = query(collection(db, 'users'), where('isPlaceholder', '==', true))
+  const snap = await getDocs(q)
+  return snap.docs
+    .map((d) => d.data() as UserProfile)
+    .filter((u) => !u.mergedToUid && u.approvalStatus === 'PENDING')
+    .sort((a, b) => (a.displayName ?? '').localeCompare(b.displayName ?? ''))
 }
 
 export function subscribeToApprovedUsers(
@@ -1156,68 +1181,6 @@ export async function listUsersWithoutEntries(
     }))
     .filter((row) => row.daysWithEntries === 0)
     .sort((a, b) => (a.user.displayName ?? '').localeCompare(b.user.displayName ?? ''))
-}
-
-// ─── Auditoría: bloqueo de ediciones (audit_locks/{projectId}) ─────────────
-
-export async function getAuditLock(projectId: string): Promise<AuditLock | null> {
-  const snap = await getDoc(doc(db, 'audit_locks', projectId))
-  if (!snap.exists()) return null
-  return { projectId, ...(snap.data() as Omit<AuditLock, 'projectId'>) }
-}
-
-export function subscribeToAuditLock(
-  projectId: string,
-  callback: (lock: AuditLock | null) => void,
-): () => void {
-  return onSnapshot(doc(db, 'audit_locks', projectId), (snap) => {
-    if (!snap.exists()) {
-      callback(null)
-    } else {
-      callback({ projectId, ...(snap.data() as Omit<AuditLock, 'projectId'>) })
-    }
-  })
-}
-
-/** Activa o desactiva el bloqueo de ediciones para el proyecto en un rango de fechas.
- *  Cuando se activa: marca lockedByAudit=true en todas las entradas existentes del rango.
- *  Cuando se desactiva: marca lockedByAudit=false en las entradas del rango previamente bloqueadas.
- *  Devuelve la cantidad de entradas afectadas.
- */
-export async function setAuditLockEnabled(
-  projectId: string,
-  opts: { enabled: boolean; dateFrom: string; dateTo: string; updatedBy: string },
-): Promise<number> {
-  const { enabled, dateFrom, dateTo, updatedBy } = opts
-  if (!DATE_RE.test(dateFrom) || !DATE_RE.test(dateTo)) {
-    throw new Error('Fechas inválidas (formato esperado YYYY-MM-DD)')
-  }
-  if (dateFrom > dateTo) {
-    throw new Error('La fecha desde no puede ser mayor que la fecha hasta.')
-  }
-
-  // 1) Persistir el documento del lock
-  await setDoc(
-    doc(db, 'audit_locks', projectId),
-    { projectId, enabled, dateFrom, dateTo, updatedBy, updatedAt: serverTimestamp() },
-    { merge: true },
-  )
-
-  // 2) Actualizar entradas en rango
-  const entries = await listAllTimeEntries(projectId, { dateFrom, dateTo })
-  const toUpdate = entries.filter((e) => (e.lockedByAudit ?? false) !== enabled)
-
-  for (let i = 0; i < toUpdate.length; i += 400) {
-    const batch = writeBatch(db)
-    for (const entry of toUpdate.slice(i, i + 400)) {
-      batch.update(doc(db, 'time_entries', entry.id), {
-        lockedByAudit: enabled,
-        updatedAt: serverTimestamp(),
-      })
-    }
-    await batch.commit()
-  }
-  return toUpdate.length
 }
 
 
