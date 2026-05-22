@@ -54,8 +54,9 @@ import {
   type NoReportUserRow,
   updateProject,
   updateProjectArea,
-  countUserTimeEntries,
-  deleteUserProfile,
+  countUserTimeEntriesDeep,
+  deleteUserProfileDeep,
+  EmailConflictError,
   setUserDisabled,
   updateProjectRole,
   updateTimeEntry,
@@ -1152,7 +1153,14 @@ export function DashboardPage() {
       showToast(`${approvingUser.displayName ?? 'Usuario'} aprobado correctamente.`)
       closeApproveModal()
     } catch (err) {
-      showToast('Error al aprobar usuario.', 'error')
+      if (err instanceof EmailConflictError) {
+        showToast(
+          `No se puede aprobar: ya existe otro usuario activo con el email "${err.email}". Ejecutá "Reconciliar duplicados" primero.`,
+          'error',
+        )
+      } else {
+        showToast('Error al aprobar usuario.', 'error')
+      }
       console.error(err)
     }
   }
@@ -1363,10 +1371,21 @@ export function DashboardPage() {
       return
     }
     try {
-      const count = await countUserTimeEntries(u.uid)
-      if (count > 0) {
+      // Plan D: contar entries en TODOS los uids relacionados (placeholders fusionados,
+      // placeholder original, duplicados por email).
+      const { total, byUid, relatedUids } = await countUserTimeEntriesDeep(u.uid)
+      const hasUnknown = Object.values(byUid).some((n) => n < 0)
+      if (hasUnknown) {
+        showToast('No se pudo verificar todas las jornadas (error de lectura). Reintentá.', 'error')
+        return
+      }
+      if (total > 0) {
+        const detail = Object.entries(byUid)
+          .filter(([, n]) => n > 0)
+          .map(([uid, n]) => `  • ${uid}: ${n}`)
+          .join('\n')
         const offerDisable = window.confirm(
-          `No se puede eliminar a ${u.displayName ?? u.email}: tiene ${count} jornada(s) cargada(s).\n\n¿Querés inhabilitarlo en su lugar? El usuario no podrá acceder hasta ser rehabilitado.`,
+          `No se puede eliminar a ${u.displayName ?? u.email}: tiene ${total} jornada(s) en uids relacionados:\n${detail}\n\n¿Querés inhabilitarlo en su lugar? El usuario no podrá acceder hasta ser rehabilitado.`,
         )
         if (offerDisable) {
           await setUserDisabled(u.uid, true)
@@ -1374,12 +1393,15 @@ export function DashboardPage() {
         }
         return
       }
+      const extras = relatedUids.length > 1
+        ? `\n\nAdemás del doc principal, se eliminarán ${relatedUids.length - 1} doc(s) relacionado(s) (placeholders/duplicados).`
+        : ''
       const confirmDelete = window.confirm(
-        `¿Eliminar permanentemente a ${u.displayName ?? u.email}?\n\nEsta acción no se puede deshacer.`,
+        `¿Eliminar permanentemente a ${u.displayName ?? u.email}?${extras}\n\nEsta acción no se puede deshacer.`,
       )
       if (!confirmDelete) return
-      await deleteUserProfile(u.uid)
-      showToast('Usuario eliminado.')
+      const { deletedUids } = await deleteUserProfileDeep(u.uid)
+      showToast(`Usuario eliminado (${deletedUids.length} doc${deletedUids.length === 1 ? '' : 's'}).`)
     } catch (err) {
       console.error(err)
       showToast('Error al eliminar el usuario.', 'error')

@@ -523,6 +523,47 @@ export async function listProjectUsers(projectId: string): Promise<UserProfile[]
   return users.sort((a, b) => (a.displayName ?? '').localeCompare(b.displayName ?? ''))
 }
 
+/**
+ * Error específico para conflicto de email duplicado al aprobar/promover un usuario.
+ * La UI puede detectarlo (`err instanceof EmailConflictError`) y mostrar mensaje accionable.
+ */
+export class EmailConflictError extends Error {
+  readonly email: string
+  readonly conflictingUids: string[]
+  constructor(email: string, conflictingUids: string[]) {
+    super(
+      `Ya existe otro usuario activo con el email "${email}" (uid${conflictingUids.length > 1 ? 's' : ''}: ${conflictingUids.join(', ')}). ` +
+        `Ejecutá "Reconciliar duplicados" antes de aprobar.`,
+    )
+    this.name = 'EmailConflictError'
+    this.email = email
+    this.conflictingUids = conflictingUids
+  }
+}
+
+/**
+ * Busca docs /users activos (no fusionados) con el mismo email, excluyendo opcionalmente un uid.
+ * Devuelve la lista de uids en conflicto. Email se normaliza a minúsculas + trim.
+ */
+export async function findActiveUsersByEmail(
+  email: string,
+  excludeUid?: string,
+): Promise<string[]> {
+  const normalized = email.toLowerCase().trim()
+  if (!normalized) return []
+  const q = query(collection(db, 'users'), where('email', '==', normalized))
+  const snap = await getDocs(q)
+  const conflicts: string[] = []
+  for (const d of snap.docs) {
+    if (d.id === excludeUid) continue
+    const data = d.data() as UserProfile
+    // Filtrar fusionados o placeholders ya migrados
+    if (data.mergedToUid) continue
+    conflicts.push(d.id)
+  }
+  return conflicts
+}
+
 export async function approveUser(
   userId: string,
   role: AppRole = 'MEMBER',
@@ -531,6 +572,15 @@ export async function approveUser(
   roleId?: string,
 ): Promise<void> {
   const userRef = doc(db, 'users', userId)
+  // Plan C: verificar unicidad de email antes de aprobar
+  const snap = await getDoc(userRef)
+  if (snap.exists()) {
+    const data = snap.data() as UserProfile
+    if (data.email) {
+      const conflicts = await findActiveUsersByEmail(data.email, userId)
+      if (conflicts.length > 0) throw new EmailConflictError(data.email, conflicts)
+    }
+  }
   const updates: Record<string, unknown> = {
     approvalStatus: 'APPROVED',
     role,
@@ -567,6 +617,78 @@ export async function countUserTimeEntries(userId: string): Promise<number> {
  */
 export async function deleteUserProfile(userId: string): Promise<void> {
   await deleteDoc(doc(db, 'users', userId))
+}
+
+/**
+ * Plan D: Encuentra todos los uids "relacionados" a un usuario:
+ *  - El uid en sí.
+ *  - Su `migratedFromUid` (placeholder original del primer login).
+ *  - Cualquier doc en /users con `mergedToUid == uid` (placeholders fusionados a él).
+ *  - Cualquier doc activo con el mismo email (no fusionado).
+ * Útil para contar entries y borrar TODOS los rastros de una identidad antes de eliminar.
+ */
+export async function findRelatedUserUids(userId: string): Promise<string[]> {
+  const related = new Set<string>([userId])
+  const snap = await getDoc(doc(db, 'users', userId))
+  if (!snap.exists()) return Array.from(related)
+  const data = snap.data() as UserProfile & { migratedFromUid?: string }
+  if (data.migratedFromUid) related.add(data.migratedFromUid)
+
+  // Docs fusionados hacia este uid
+  const mergedQ = query(collection(db, 'users'), where('mergedToUid', '==', userId))
+  const mergedSnap = await getDocs(mergedQ)
+  for (const d of mergedSnap.docs) related.add(d.id)
+
+  // Docs activos (no fusionados) con el mismo email — también deben contar al eliminar
+  if (data.email) {
+    const sameEmail = await findActiveUsersByEmail(data.email, userId)
+    for (const uid of sameEmail) related.add(uid)
+  }
+  return Array.from(related)
+}
+
+/**
+ * Plan D: cuenta time_entries de TODOS los uids relacionados a este usuario.
+ * Usa getCountFromServer (1 lectura facturada por uid).
+ */
+export async function countUserTimeEntriesDeep(userId: string): Promise<{
+  total: number
+  byUid: Record<string, number>
+  relatedUids: string[]
+}> {
+  const relatedUids = await findRelatedUserUids(userId)
+  const byUid: Record<string, number> = {}
+  let total = 0
+  for (const uid of relatedUids) {
+    try {
+      const q = query(collection(db, 'time_entries'), where('userId', '==', uid))
+      const snap = await getCountFromServer(q)
+      const n = snap.data().count
+      byUid[uid] = n
+      total += n
+    } catch (err) {
+      if (import.meta.env.DEV) console.warn('[countUserTimeEntriesDeep] failed for', uid, err)
+      byUid[uid] = -1 // marca de error; no podemos confirmar 0
+    }
+  }
+  return { total, byUid, relatedUids }
+}
+
+/**
+ * Plan D: elimina /users/{uid} + TODOS los docs relacionados (placeholders fusionados,
+ * placeholder original, duplicados por email). NO borra time_entries — se asume que
+ * el caller ya verificó vía countUserTimeEntriesDeep que no hay entries.
+ * Borrado en batch (atómico hasta 500 ops).
+ */
+export async function deleteUserProfileDeep(userId: string): Promise<{ deletedUids: string[] }> {
+  const relatedUids = await findRelatedUserUids(userId)
+  // Firestore batch admite hasta 500 ops; relatedUids realista es <10
+  const batch = writeBatch(db)
+  for (const uid of relatedUids) {
+    batch.delete(doc(db, 'users', uid))
+  }
+  await batch.commit()
+  return { deletedUids: relatedUids }
 }
 
 /** Marca un usuario como inhabilitado / rehabilitado. */
@@ -1126,6 +1248,15 @@ export async function approveImportedPlaceholder(
   roleId?: string,
 ): Promise<void> {
   const userRef = doc(db, 'users', placeholderUid)
+  // Plan C: verificar unicidad de email antes de aprobar el placeholder
+  const snap = await getDoc(userRef)
+  if (snap.exists()) {
+    const data = snap.data() as UserProfile
+    if (data.email) {
+      const conflicts = await findActiveUsersByEmail(data.email, placeholderUid)
+      if (conflicts.length > 0) throw new EmailConflictError(data.email, conflicts)
+    }
+  }
   await updateDoc(userRef, {
     role,
     approvalStatus: 'APPROVED',
