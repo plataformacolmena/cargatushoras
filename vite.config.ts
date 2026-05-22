@@ -70,19 +70,13 @@ export default defineConfig(({ mode }) => ({
               expiration: { maxEntries: 30, maxAgeSeconds: 60 * 60 * 24 * 7 },
             },
           },
-          {
-            // NO cachear apis.google.com / accounts.google.com: Firebase Auth
-            // los usa con querystrings dinámicos (callbacks JSONP) y cachearlos
-            // provoca "FetchEvent.respondWith received an error: no-response"
-            // rompiendo el login con Google (especialmente en móviles).
-            urlPattern: ({ url }) =>
-              url.origin === 'https://apis.google.com' ||
-              url.origin === 'https://accounts.google.com' ||
-              url.hostname.endsWith('.googleapis.com') ||
-              url.hostname.endsWith('.firebaseio.com') ||
-              url.hostname.endsWith('.firebaseapp.com'),
-            handler: 'NetworkOnly',
-          },
+          // IMPORTANTE: NO registrar ninguna regla para apis.google.com /
+          // accounts.google.com / *.googleapis.com / *.firebaseio.com /
+          // *.firebaseapp.com. Cualquier regla (incluso NetworkOnly) hace que
+          // Workbox llame respondWith() y, en Safari, los fetch JSONP/iframe
+          // de Firebase Auth fallan con "no-response: no-response" rompiendo
+          // el login. Sin regla, el SW no intercepta y el navegador maneja
+          // esas peticiones de forma nativa.
         ],
         // No cachear las llamadas a Firestore/Auth/Identity (el SDK ya las gestiona).
         navigateFallbackAllowlist: [/^(?!.*\.(?:googleapis|firebaseio|firebaseapp)\.com).*/],
