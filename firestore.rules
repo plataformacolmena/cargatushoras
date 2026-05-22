@@ -94,6 +94,15 @@ service cloud.firestore {
       allow delete: if isSuperUser();
     }
 
+    // Configuración global de la app (modo mantenimiento, banners, etc.)
+    // Lectura abierta a cualquier usuario autenticado (incluso PENDING) para que
+    // todos puedan recibir la señal de mantenimiento. Escritura solo SUPERUSER.
+    match /app_config/{docId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSuperUser();
+      allow delete: if false;
+    }
+
     match /time_entries/{entryId} {
       allow read: if isApproved();
 

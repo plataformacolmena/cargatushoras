@@ -41,6 +41,9 @@ import {
   listPendingUsers,
   listImportedPlaceholders,
   repairMergedPlaceholders,
+  subscribeToMaintenance,
+  setMaintenanceMode,
+  type MaintenanceState,
   subscribeToMyEntries,
   subscribeToProjectEntries,
   subscribeToAreaEntries,
@@ -451,6 +454,38 @@ export function DashboardPage() {
       setRepairBusy(false)
     }
   }, [repairBusy, loadUsersPanels])
+
+  // ─── Modo Mantenimiento (solo SUPERUSER) ──────────────────────────────────
+  const [maintenance, setMaintenance] = useState<MaintenanceState>({ enabled: false, message: null, version: 0 })
+  const [maintenanceMessage, setMaintenanceMessage] = useState('')
+  const [maintenanceBusy, setMaintenanceBusy] = useState(false)
+
+  useEffect(() => {
+    if (!profile || profile.role !== 'SUPERUSER') return
+    const unsub = subscribeToMaintenance((state) => {
+      setMaintenance(state)
+      setMaintenanceMessage((prev) => (prev === '' ? state.message ?? '' : prev))
+    })
+    return () => unsub()
+  }, [profile])
+
+  const handleToggleMaintenance = useCallback(async () => {
+    if (maintenanceBusy) return
+    const turningOn = !maintenance.enabled
+    const confirmMsg = turningOn
+      ? '¿Activar modo mantenimiento? Todos los usuarios (excepto SUPERUSER) verán una pantalla bloqueante y se limpiarán sus cachés.'
+      : '¿Desactivar modo mantenimiento? Los usuarios podrán volver a entrar y se recargará automáticamente su app.'
+    if (!window.confirm(confirmMsg)) return
+    setMaintenanceBusy(true)
+    try {
+      await setMaintenanceMode(turningOn, turningOn ? (maintenanceMessage.trim() || null) : null)
+    } catch (err) {
+      console.error('[setMaintenanceMode] error:', err)
+      window.alert('No se pudo cambiar el modo mantenimiento. Revisar consola.')
+    } finally {
+      setMaintenanceBusy(false)
+    }
+  }, [maintenance.enabled, maintenanceBusy, maintenanceMessage])
 
   // Carga áreas al seleccionar proyecto en modal de aprobación
   useEffect(() => {
@@ -1477,6 +1512,40 @@ export function DashboardPage() {
       </nav>
 
       {mainTab === 'PROJECT_MANAGEMENT' && canSeeProjectAdmin(currentProfile.role) && (
+        <>
+        <section className="card" style={{ borderLeft: maintenance.enabled ? '4px solid #ef4444' : '4px solid #64748b' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
+            <div>
+              <h2 style={{ margin: 0 }}>🛠️ Modo mantenimiento</h2>
+              <p className="muted" style={{ margin: '0.25rem 0 0' }}>
+                {maintenance.enabled
+                  ? 'ACTIVO — todos los usuarios (excepto vos) ven la pantalla de mantenimiento y sus cachés se limpian.'
+                  : 'Inactivo. Activalo cuando necesites forzar a todos los usuarios a recargar la app con recursos frescos.'}
+              </p>
+            </div>
+            <button
+              className="btn"
+              disabled={maintenanceBusy}
+              onClick={() => { void handleToggleMaintenance() }}
+              style={{ background: maintenance.enabled ? '#ef4444' : undefined }}
+            >
+              {maintenanceBusy ? 'Aplicando…' : maintenance.enabled ? 'Desactivar' : 'Activar'}
+            </button>
+          </div>
+          {!maintenance.enabled && (
+            <label style={{ display: 'block', marginTop: '0.75rem' }}>
+              Mensaje opcional para los usuarios
+              <input
+                type="text"
+                value={maintenanceMessage}
+                onChange={(e) => setMaintenanceMessage(e.target.value)}
+                placeholder="Ej: Estamos actualizando la app. Volvé en 5 minutos."
+                disabled={maintenanceBusy}
+              />
+            </label>
+          )}
+        </section>
+
         <section className="card">
           <h2>Gestión de proyectos</h2>
 
@@ -1612,6 +1681,7 @@ export function DashboardPage() {
             </div>
           )}
         </section>
+        </>
       )}
 
       {mainTab === 'PROJECTS' && (

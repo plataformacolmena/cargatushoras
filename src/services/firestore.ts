@@ -1153,6 +1153,53 @@ export async function importMembers(
   return { imported: toImport.length, duplicates }
 }
 
+// ─── Modo Mantenimiento (solo SUPERUSER) ──────────────────────────────────
+
+export interface MaintenanceState {
+  enabled: boolean
+  message?: string | null
+  version: number
+}
+
+const MAINTENANCE_DOC = doc(db, 'app_config', 'maintenance')
+
+export function subscribeToMaintenance(callback: (state: MaintenanceState) => void): () => void {
+  return onSnapshot(
+    MAINTENANCE_DOC,
+    (snap) => {
+      if (!snap.exists()) {
+        callback({ enabled: false, message: null, version: 0 })
+        return
+      }
+      const data = snap.data() as Partial<MaintenanceState>
+      callback({
+        enabled: data.enabled === true,
+        message: data.message ?? null,
+        version: typeof data.version === 'number' ? data.version : 0,
+      })
+    },
+    (err) => {
+      if (import.meta.env.DEV) console.warn('[subscribeToMaintenance] error:', err)
+      callback({ enabled: false, message: null, version: 0 })
+    },
+  )
+}
+
+export async function setMaintenanceMode(enabled: boolean, message?: string | null): Promise<void> {
+  const snap = await getDoc(MAINTENANCE_DOC)
+  const prevVersion = snap.exists() ? ((snap.data() as { version?: number }).version ?? 0) : 0
+  await setDoc(
+    MAINTENANCE_DOC,
+    {
+      enabled,
+      message: message ?? null,
+      version: prevVersion + 1,
+      updatedAt: serverTimestamp(),
+    },
+    { merge: true },
+  )
+}
+
 // ─── Auditoría: usuarios sin informar + color de revisión ──────────────────
 
 /** Asigna (o limpia con '') el color de revisión de un usuario en el reporte de "sin informar". */
