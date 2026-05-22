@@ -431,6 +431,16 @@ export function DashboardPage() {
       setApprovedUsersList(approved)
       setPendingUsers(pending)
       setImportedMembers(placeholders)
+      // Auditoría: detectar MEMBERs aprobados sin área o sin proyecto.
+      const conflicts = approved.filter(
+        (u) => u.role === 'MEMBER' && !u.mergedToUid && (!u.projectId || !u.areaId),
+      )
+      if (conflicts.length > 0) {
+        showToast(
+          `⚠️ ${conflicts.length} miembro(s) aprobado(s) sin área/proyecto asignado. Revisá la pestaña Aprobados.`,
+          'error',
+        )
+      }
     } catch (err) {
       console.error('[loadUsersPanels] error:', err)
     }
@@ -557,6 +567,23 @@ export function DashboardPage() {
         (u.email ?? '').toLowerCase().includes(s),
     )
   }, [approvedUsers, userSearch])
+
+  // Regla: todo MEMBER aprobado debe tener proyecto Y un área específica.
+  // "sin área" y "todas las áreas" se codifican igual (areaId vacío) y están prohibidos para MEMBER.
+  const memberAreaConflicts = useMemo(() => {
+    return approvedUsers
+      .filter((u) => u.role === 'MEMBER' && !u.mergedToUid && (!u.projectId || !u.areaId))
+      .map((u) => ({
+        uid: u.uid,
+        displayName: u.displayName ?? u.email ?? u.uid,
+        email: u.email ?? '',
+        reason: !u.projectId ? 'NO_PROJECT' : 'NO_AREA',
+      }))
+  }, [approvedUsers])
+  const memberAreaConflictUids = useMemo(
+    () => new Set(memberAreaConflicts.map((c) => c.uid)),
+    [memberAreaConflicts],
+  )
 
   // ─── Paginación ─────────────────────────────────────────────────────────
   const entriesPagination = usePagedItems(entries, 25)
@@ -1131,6 +1158,17 @@ export function DashboardPage() {
   async function submitApproval(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!approvingUser) return
+    // Regla: MEMBER aprobado debe tener proyecto y área específicos.
+    if (approveForm.role === 'MEMBER') {
+      if (!approveForm.projectId) {
+        showToast('Un miembro requiere proyecto asignado.', 'error')
+        return
+      }
+      if (!approveForm.areaId) {
+        showToast('Un miembro requiere un área específica (no se admite “todas las áreas”).', 'error')
+        return
+      }
+    }
     try {
       if (approvingUser.uid.startsWith('__imported__:')) {
         const placeholderUid = approvingUser.uid.slice('__imported__:'.length)
@@ -1333,6 +1371,17 @@ export function DashboardPage() {
   async function handleSaveUserEdit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!editingUser) return
+    // Regla: si el usuario es MEMBER, exigir proyecto y área específicos.
+    if (editingUser.role === 'MEMBER') {
+      if (!editUserForm.projectId) {
+        showToast('Un miembro requiere proyecto asignado.', 'error')
+        return
+      }
+      if (!editUserForm.areaId) {
+        showToast('Un miembro requiere un área específica (no se admite “todas las áreas”).', 'error')
+        return
+      }
+    }
     try {
       const previousCycleMode = editingUser.cycleMode ?? 'CYCLE'
       const newCycleMode = editUserForm.cycleMode
@@ -2984,6 +3033,33 @@ export function DashboardPage() {
           {userTab === 'APPROVED' && (
             <section className="card">
               <h2>Usuarios aprobados</h2>
+              {memberAreaConflicts.length > 0 && (
+                <div
+                  className="alert"
+                  style={{
+                    background: '#fef3c7',
+                    border: '1px solid #f59e0b',
+                    color: '#7c2d12',
+                    padding: '10px 12px',
+                    borderRadius: 6,
+                    marginBottom: '0.75rem',
+                  }}
+                >
+                  <strong>⚠️ {memberAreaConflicts.length} miembro(s) sin área / proyecto:</strong>
+                  <ul style={{ margin: '6px 0 0 18px', padding: 0 }}>
+                    {memberAreaConflicts.map((c) => (
+                      <li key={c.uid}>
+                        {c.displayName} {c.email ? <span className="muted">({c.email})</span> : null}
+                        {' — '}
+                        <em>{c.reason === 'NO_PROJECT' ? 'sin proyecto' : 'sin área'}</em>
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="muted" style={{ margin: '6px 0 0' }}>
+                    Editá cada usuario y asigná un área específica (no se admite “todas las áreas”).
+                  </p>
+                </div>
+              )}
               <input
                 type="search"
                 placeholder="Buscar por nombre o email..."
@@ -3009,6 +3085,15 @@ export function DashboardPage() {
                           )}
                           {u.cycleMode === 'REINFORCEMENT' && (
                             <span className="chip" style={{ background: '#8b5cf6', color: '#fff', fontSize: '0.72rem' }}>Refuerzo</span>
+                          )}
+                          {memberAreaConflictUids.has(u.uid) && (
+                            <span
+                              className="chip"
+                              style={{ background: '#f59e0b', color: '#fff', fontSize: '0.72rem' }}
+                              title="Miembro sin área o sin proyecto asignado"
+                            >
+                              ⚠️ Sin área
+                            </span>
                           )}
                           <span className="chip">{u.role}</span>
                           {u.projectId && (
@@ -3300,7 +3385,11 @@ export function DashboardPage() {
                       value={approveForm.areaId}
                       onChange={(e) => setApproveForm((f) => ({ ...f, areaId: e.target.value }))}
                     >
-                      <option value="">— TODAS (sin filtro de área) —</option>
+                      {approveForm.role === 'MEMBER' ? (
+                        <option value="">— Seleccioná un área —</option>
+                      ) : (
+                        <option value="">— TODAS (sin filtro de área) —</option>
+                      )}
                       {approveAreas.map((a) => (
                         <option key={a.id} value={a.id}>{a.name}</option>
                       ))}
@@ -3350,7 +3439,11 @@ export function DashboardPage() {
               <label>
                 Área
                 <select value={editUserForm.areaId} onChange={(e) => setEditUserForm((f) => ({ ...f, areaId: e.target.value }))}>
-                  <option value="">— TODAS (sin filtro de área) —</option>
+                  {editingUser?.role === 'MEMBER' ? (
+                    <option value="">— Seleccioná un área —</option>
+                  ) : (
+                    <option value="">— TODAS (sin filtro de área) —</option>
+                  )}
                   {editUserAreas.map((a) => (
                     <option key={a.id} value={a.id}>{a.name}</option>
                   ))}
