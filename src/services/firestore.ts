@@ -152,29 +152,57 @@ export async function upsertUserProfile(payload: {
     throw e
   }
 
-  if (!snapshot.exists()) {
-    // Verificar si el email coincide con un placeholder importado en users
-    if (payload.email) {
-      const emailLower = payload.email.toLowerCase().trim()
-      const placeholderQuery = query(
-        collection(db, 'users'),
-        where('email', '==', emailLower),
-        where('isPlaceholder', '==', true),
+  const emailLower = payload.email ? payload.email.toLowerCase().trim() : null
+
+  // Helper: reasignar time_entries de un uid placeholder al uid real.
+  // Best-effort: si una sub-batch falla (permisos, red), loguea y continúa.
+  // La reconciliación admin posterior limpia lo que quede.
+  async function reassignEntriesBestEffort(fromUid: string, toUid: string): Promise<void> {
+    let entriesSnap
+    try {
+      entriesSnap = await getDocs(
+        query(collection(db, 'time_entries'), where('userId', '==', fromUid)),
       )
-
-      let placeholderSnap: Awaited<ReturnType<typeof getDocs>>
-      try {
-        placeholderSnap = await getDocs(placeholderQuery)
-      } catch (e) {
-        if (import.meta.env.DEV) console.error('[upsert] placeholder query failed:', e)
-        throw e
+    } catch (e) {
+      if (import.meta.env.DEV) console.warn('[migration] reassign getDocs skipped:', e)
+      return
+    }
+    const CHUNK = 440
+    for (let i = 0; i < entriesSnap.docs.length; i += CHUNK) {
+      const b = writeBatch(db)
+      for (const e of entriesSnap.docs.slice(i, i + CHUNK)) {
+        b.update(e.ref, { userId: toUid })
       }
+      try {
+        await b.commit()
+      } catch (e) {
+        if (import.meta.env.DEV) console.warn('[migration] reassign batch skipped:', e)
+        // continuar con el siguiente chunk; no abortar
+      }
+    }
+  }
 
-      // Tomar el primer placeholder no fusionado
-      const placeholderDoc = placeholderSnap.docs.find((d) => {
-        const data = d.data() as UserProfile
-        return !data.mergedToUid
-      })
+  // Helper: busca un placeholder no fusionado con el email indicado.
+  async function findUnmergedPlaceholderByEmail(email: string) {
+    const q = query(
+      collection(db, 'users'),
+      where('email', '==', email),
+      where('isPlaceholder', '==', true),
+    )
+    let snap
+    try {
+      snap = await getDocs(q)
+    } catch (e) {
+      if (import.meta.env.DEV) console.warn('[upsert] placeholder query failed:', e)
+      return null
+    }
+    return snap.docs.find((d) => !(d.data() as UserProfile).mergedToUid) ?? null
+  }
+
+  // ─── CASO 1: el doc real NO existe (primer login) ───────────────────────
+  if (!snapshot.exists()) {
+    if (emailLower) {
+      const placeholderDoc = await findUnmergedPlaceholderByEmail(emailLower)
 
       if (placeholderDoc) {
         const placeholderData = placeholderDoc.data() as UserProfile
@@ -182,60 +210,39 @@ export async function upsertUserProfile(payload: {
 
         const newProfile: UserProfile = {
           uid: payload.uid,
-          email: payload.email,
+          email: emailLower,
           displayName: payload.displayName ?? placeholderData.displayName ?? null,
           role: placeholderData.role ?? 'MEMBER',
           approvalStatus: placeholderData.approvalStatus ?? 'PENDING',
           ...(placeholderData.projectId ? { projectId: placeholderData.projectId } : {}),
           ...(placeholderData.areaId ? { areaId: placeholderData.areaId } : {}),
           ...(placeholderData.roleId ? { roleId: placeholderData.roleId } : {}),
+          ...(placeholderData.cycleMode ? { cycleMode: placeholderData.cycleMode } : {}),
           migratedFromUid: placeholderUid,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         }
 
-        // 1. Crear perfil real
+        // Paso 1+3 ATÓMICO: crear doc real + marcar placeholder fusionado en un solo batch.
+        // Si falla, no se escribe nada (rollback automático de Firestore).
+        const fuseBatch = writeBatch(db)
+        fuseBatch.set(userRef, newProfile)
+        fuseBatch.update(placeholderDoc.ref, {
+          isPlaceholder: false,
+          mergedToUid: payload.uid,
+          updatedAt: serverTimestamp(),
+        })
         try {
+          await fuseBatch.commit()
+        } catch (e) {
+          if (import.meta.env.DEV) console.error('[migration] fuseBatch failed, fallback a setDoc:', e)
+          // Si el batch falla (p.ej. reglas), al menos crear el doc real para no dejar al usuario sin acceso
           await setDoc(userRef, newProfile)
-        } catch (e) {
-          if (import.meta.env.DEV) console.error('[migration] step1 setDoc failed:', e)
-          throw e
         }
 
-        // 2. Reasignar entradas de tiempo en lotes
-        let entriesSnap
-        try {
-          entriesSnap = await getDocs(
-            query(collection(db, 'time_entries'), where('userId', '==', placeholderUid)),
-          )
-        } catch (e) {
-          if (import.meta.env.DEV) console.error('[migration] step2 getDocs failed:', e)
-          throw e
-        }
-        const CHUNK = 440
-        for (let i = 0; i < entriesSnap.docs.length; i += CHUNK) {
-          const b = writeBatch(db)
-          for (const e of entriesSnap.docs.slice(i, i + CHUNK)) {
-            b.update(e.ref, { userId: payload.uid })
-          }
-          try {
-            await b.commit()
-          } catch (e) {
-            if (import.meta.env.DEV) console.error('[migration] step2 batch failed:', e)
-            throw e
-          }
-        }
-
-        // 3. Marcar placeholder como fusionado
-        try {
-          await updateDoc(placeholderDoc.ref, {
-            isPlaceholder: false,
-            mergedToUid: payload.uid,
-            updatedAt: serverTimestamp(),
-          })
-        } catch (e) {
-          if (import.meta.env.DEV) console.warn('[migration] step3 placeholder merge skipped:', e)
-        }
+        // Paso 2 (best effort): reasignar time_entries al uid real.
+        // Si el placeholder estaba APPROVED, el usuario ya es approved y puede reasignar.
+        await reassignEntriesBestEffort(placeholderUid, payload.uid)
 
         return newProfile
       }
@@ -255,9 +262,69 @@ export async function upsertUserProfile(payload: {
     return initial
   }
 
+  // ─── CASO 2: el doc real YA existe ──────────────────────────────────────
   const data = snapshot.data() as UserProfile
   const updateData: Record<string, unknown> = { email: payload.email, updatedAt: serverTimestamp() }
   if (payload.displayName != null) updateData.displayName = payload.displayName
+
+  // RECONCILIACIÓN PASIVA: si quedó un placeholder huérfano con mi email
+  // (caso típico: admin aprobó/configuró el placeholder DESPUÉS de mi primer
+  // login), propagar sus campos al doc real y marcar placeholder fusionado.
+  let orphan: Awaited<ReturnType<typeof findUnmergedPlaceholderByEmail>> = null
+  if (emailLower) {
+    orphan = await findUnmergedPlaceholderByEmail(emailLower)
+  }
+
+  if (orphan) {
+    const orphanData = orphan.data() as UserProfile
+    const orphanUid = orphan.id
+
+    // Propagar SOLO campos que el doc real no tiene (no sobrescribir nada existente)
+    if (orphanData.projectId && !data.projectId) updateData.projectId = orphanData.projectId
+    if (orphanData.areaId && !data.areaId) updateData.areaId = orphanData.areaId
+    if (orphanData.roleId && !data.roleId) updateData.roleId = orphanData.roleId
+    if (orphanData.cycleMode && !data.cycleMode) updateData.cycleMode = orphanData.cycleMode
+    // Rol: si el placeholder tenía un rol elevado, propagarlo
+    if (
+      orphanData.role &&
+      orphanData.role !== 'MEMBER' &&
+      data.role === 'MEMBER'
+    ) {
+      updateData.role = orphanData.role
+    }
+    // approvalStatus: si el placeholder está APPROVED y el doc real PENDING, propagar
+    if (orphanData.approvalStatus === 'APPROVED' && data.approvalStatus !== 'APPROVED') {
+      updateData.approvalStatus = 'APPROVED'
+    }
+    if (!data.migratedFromUid) updateData.migratedFromUid = orphanUid
+
+    // Batch atómico: actualizar doc real + marcar placeholder fusionado.
+    const reconcileBatch = writeBatch(db)
+    reconcileBatch.update(userRef, updateData)
+    reconcileBatch.update(orphan.ref, {
+      isPlaceholder: false,
+      mergedToUid: payload.uid,
+      updatedAt: serverTimestamp(),
+    })
+    try {
+      await reconcileBatch.commit()
+    } catch (e) {
+      if (import.meta.env.DEV) console.warn('[upsert] reconcile batch failed, fallback a updateDoc:', e)
+      try {
+        await updateDoc(userRef, updateData)
+      } catch (e2) {
+        if (import.meta.env.DEV) console.error('[upsert] updateDoc fallback failed:', e2)
+        throw e2
+      }
+    }
+
+    // Reasignar entries del placeholder al uid real
+    await reassignEntriesBestEffort(orphanUid, payload.uid)
+
+    return { ...data, ...updateData } as UserProfile
+  }
+
+  // Sin placeholder huérfano: actualizar normal (email/displayName)
   try {
     await updateDoc(userRef, updateData)
   } catch (e) {
@@ -1105,6 +1172,166 @@ export async function repairMergedPlaceholders(): Promise<{ repaired: number; or
     }
   }
   return { repaired, orphans }
+}
+
+/**
+ * Reconciliación COMPLETA de usuarios duplicados por email.
+ * Solo admins. Para cada email con múltiples docs:
+ *  1. Elige el "ganador" (doc canónico) según heurística:
+ *     - Si hay un doc con `migratedFromUid` → ese es el ganador.
+ *     - Si hay un solo doc sin `isPlaceholder` y otro con → el sin placeholder gana.
+ *     - Si no se puede decidir → se reporta para revisión manual.
+ *  2. Copia campos faltantes (projectId, areaId, roleId, role, approvalStatus, cycleMode)
+ *     del perdedor al ganador (sin sobrescribir lo que ya tenga).
+ *  3. Reasigna time_entries.userId del perdedor al ganador.
+ *  4. Marca el perdedor con `mergedToUid` + `isPlaceholder:false`.
+ *
+ * NO borra docs; deja todo trazable.
+ */
+export async function reconcileDuplicateUsers(): Promise<{
+  emailsScanned: number
+  duplicatesFound: number
+  reconciled: number
+  entriesReassigned: number
+  manualReview: string[]
+}> {
+  const usersSnap = await getDocs(collection(db, 'users'))
+  const byEmail = new Map<string, Array<{ id: string; data: UserProfile }>>()
+  for (const d of usersSnap.docs) {
+    const data = d.data() as UserProfile
+    if (!data.email) continue
+    const key = data.email.toLowerCase().trim()
+    if (!byEmail.has(key)) byEmail.set(key, [])
+    byEmail.get(key)!.push({ id: d.id, data })
+  }
+
+  let duplicatesFound = 0
+  let reconciled = 0
+  let entriesReassigned = 0
+  const manualReview: string[] = []
+
+  for (const [email, docs] of byEmail.entries()) {
+    if (docs.length < 2) continue
+    duplicatesFound += 1
+
+    // Excluir docs ya fusionados (mergedToUid presente Y apunta a otro doc del grupo)
+    const active = docs.filter((d) => !d.data.mergedToUid)
+    if (active.length < 2) {
+      // Ya está fusionado o solo queda uno activo — nada que hacer
+      continue
+    }
+
+    // Elegir ganador
+    let winner: { id: string; data: UserProfile } | null = null
+
+    // Caso A: uno tiene migratedFromUid → es el doc real creado en login. Gana.
+    const withMigrated = active.filter((d) => d.data.migratedFromUid)
+    if (withMigrated.length === 1) {
+      winner = withMigrated[0]
+    } else if (withMigrated.length > 1) {
+      // Múltiples docs con migratedFromUid → estado raro, revisión manual
+      manualReview.push(`${email} (múltiples docs con migratedFromUid)`)
+      continue
+    } else {
+      // Caso B: ninguno tiene migratedFromUid. Preferir el que NO es placeholder.
+      const nonPlaceholder = active.filter((d) => !d.data.isPlaceholder)
+      if (nonPlaceholder.length === 1) {
+        winner = nonPlaceholder[0]
+      } else {
+        // Todos son placeholders, o todos son no-placeholder → ambigüo
+        manualReview.push(`${email} (no se puede elegir ganador automáticamente)`)
+        continue
+      }
+    }
+
+    const losers = active.filter((d) => d.id !== winner!.id)
+    const winnerRef = doc(db, 'users', winner.id)
+
+    // Construir patch del ganador con campos faltantes copiados de los perdedores
+    const winnerPatch: Record<string, unknown> = {}
+    for (const loser of losers) {
+      const l = loser.data
+      if (l.projectId && !winner.data.projectId && !winnerPatch.projectId) winnerPatch.projectId = l.projectId
+      if (l.areaId && !winner.data.areaId && !winnerPatch.areaId) winnerPatch.areaId = l.areaId
+      if (l.roleId && !winner.data.roleId && !winnerPatch.roleId) winnerPatch.roleId = l.roleId
+      if (l.cycleMode && !winner.data.cycleMode && !winnerPatch.cycleMode) winnerPatch.cycleMode = l.cycleMode
+      if (
+        l.role && l.role !== 'MEMBER' &&
+        winner.data.role === 'MEMBER' &&
+        (!winnerPatch.role || winnerPatch.role === 'MEMBER')
+      ) {
+        winnerPatch.role = l.role
+      }
+      if (
+        l.approvalStatus === 'APPROVED' &&
+        winner.data.approvalStatus !== 'APPROVED' &&
+        winnerPatch.approvalStatus !== 'APPROVED'
+      ) {
+        winnerPatch.approvalStatus = 'APPROVED'
+      }
+      if (!winner.data.migratedFromUid && !winnerPatch.migratedFromUid && loser.data.isPlaceholder) {
+        winnerPatch.migratedFromUid = loser.id
+      }
+    }
+    if (Object.keys(winnerPatch).length > 0) {
+      winnerPatch.updatedAt = serverTimestamp()
+      try {
+        await updateDoc(winnerRef, winnerPatch)
+      } catch (err) {
+        if (import.meta.env.DEV) console.warn('[reconcile] update winner failed for', email, err)
+      }
+    }
+
+    // Por cada perdedor: reasignar entries y marcar como fusionado
+    for (const loser of losers) {
+      // Reasignar time_entries.userId loser → winner
+      let entriesSnap
+      try {
+        entriesSnap = await getDocs(
+          query(collection(db, 'time_entries'), where('userId', '==', loser.id)),
+        )
+      } catch (err) {
+        if (import.meta.env.DEV) console.warn('[reconcile] get entries failed for', loser.id, err)
+        entriesSnap = null
+      }
+      if (entriesSnap) {
+        const CHUNK = 440
+        for (let i = 0; i < entriesSnap.docs.length; i += CHUNK) {
+          const b = writeBatch(db)
+          for (const e of entriesSnap.docs.slice(i, i + CHUNK)) {
+            b.update(e.ref, { userId: winner.id })
+          }
+          try {
+            await b.commit()
+            entriesReassigned += Math.min(CHUNK, entriesSnap.docs.length - i)
+          } catch (err) {
+            if (import.meta.env.DEV) console.warn('[reconcile] reassign batch failed for', loser.id, err)
+          }
+        }
+      }
+
+      // Marcar perdedor como fusionado
+      try {
+        await updateDoc(doc(db, 'users', loser.id), {
+          isPlaceholder: false,
+          mergedToUid: winner.id,
+          updatedAt: serverTimestamp(),
+        })
+      } catch (err) {
+        if (import.meta.env.DEV) console.warn('[reconcile] mark loser fused failed for', loser.id, err)
+      }
+    }
+
+    reconciled += 1
+  }
+
+  return {
+    emailsScanned: byEmail.size,
+    duplicatesFound,
+    reconciled,
+    entriesReassigned,
+    manualReview,
+  }
 }
 
 export async function importMembers(

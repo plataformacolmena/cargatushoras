@@ -41,6 +41,7 @@ import {
   listPendingUsers,
   listImportedPlaceholders,
   repairMergedPlaceholders,
+  reconcileDuplicateUsers,
   subscribeToMaintenance,
   setMaintenanceMode,
   type MaintenanceState,
@@ -441,15 +442,36 @@ export function DashboardPage() {
   const [repairBusy, setRepairBusy] = useState(false)
   const handleRepairMerged = useCallback(async () => {
     if (repairBusy) return
-    if (!window.confirm('Reparar placeholders huérfanos: marcará como fusionados los placeholders cuyo usuario real ya existe. ¿Continuar?')) return
+    if (!window.confirm(
+      'Reconciliar usuarios duplicados por email:\n\n' +
+      '• Elige el doc canónico de cada email duplicado (el real con migratedFromUid, o el no-placeholder).\n' +
+      '• Copia al canónico los campos que le falten (proyecto, área, rol, aprobación) desde el duplicado.\n' +
+      '• Reasigna time_entries del duplicado al canónico.\n' +
+      '• Marca el duplicado como fusionado (mergedToUid).\n\n' +
+      'NO borra ningún doc. ¿Continuar?'
+    )) return
     setRepairBusy(true)
     try {
-      const { repaired, orphans } = await repairMergedPlaceholders()
-      window.alert(`Reparados: ${repaired}\nHuérfanos sin placeholder original: ${orphans}`)
+      // Primero ejecutar la reparación legacy (placeholders con migratedFromUid sin mergedToUid)
+      const legacy = await repairMergedPlaceholders()
+      // Luego la reconciliación completa por email
+      const result = await reconcileDuplicateUsers()
+      const msg = [
+        `Emails escaneados: ${result.emailsScanned}`,
+        `Duplicados encontrados: ${result.duplicatesFound}`,
+        `Reconciliados automáticamente: ${result.reconciled}`,
+        `Entries reasignadas: ${result.entriesReassigned}`,
+        `Placeholders legacy reparados: ${legacy.repaired}`,
+        legacy.orphans > 0 ? `Huérfanos sin placeholder original: ${legacy.orphans}` : '',
+        result.manualReview.length > 0
+          ? `\n⚠️ Requieren revisión manual (${result.manualReview.length}):\n${result.manualReview.join('\n')}`
+          : '',
+      ].filter(Boolean).join('\n')
+      window.alert(msg)
       await loadUsersPanels()
     } catch (err) {
-      console.error('[repairMergedPlaceholders] error:', err)
-      window.alert('Error al reparar. Revisar consola.')
+      console.error('[reconcileDuplicateUsers] error:', err)
+      window.alert('Error al reconciliar. Revisar consola.')
     } finally {
       setRepairBusy(false)
     }
@@ -2814,9 +2836,9 @@ export function DashboardPage() {
               className="btn-sm btn-outline"
               disabled={repairBusy}
               onClick={() => { void handleRepairMerged() }}
-              title="Marca como fusionados los placeholders cuyo usuario real ya existe (limpia duplicados por mail)"
+              title="Reconcilia usuarios duplicados por email: copia campos faltantes, reasigna entries y marca el duplicado como fusionado"
             >
-              {repairBusy ? 'Reparando…' : 'Reparar duplicados'}
+              {repairBusy ? 'Reconciliando…' : 'Reconciliar duplicados'}
             </button>
           </nav>
 
