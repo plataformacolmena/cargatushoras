@@ -57,11 +57,18 @@ service cloud.firestore {
         request.resource.data.role == resource.data.role &&
         request.resource.data.email == resource.data.email
       );
-      allow delete: if isAdminRole() && (
-        resource.data.isPlaceholder == true ||
-        (
-          resource.data.role != 'SUPERUSER' &&
-          request.auth.uid != uid
+      allow delete: if (
+        // SUPERUSER puede borrar cualquier doc de /users (incluyendo placeholders,
+        // duplicados y otros SUPERUSER) excepto el propio. Necesario para
+        // limpiar duplicados/conflictos por email vía Plan D (deep delete).
+        isSuperUser() && request.auth.uid != uid
+      ) || (
+        isAdminRole() && (
+          resource.data.isPlaceholder == true ||
+          (
+            resource.data.role != 'SUPERUSER' &&
+            request.auth.uid != uid
+          )
         )
       );
     }
@@ -115,7 +122,10 @@ service cloud.firestore {
         request.resource.data.calculationSource == 'client' &&
         request.resource.data.calculationVersion == 'v1-client');
 
-      allow update: if (isAdminRole() && (
+      allow update: if (
+        // Bloqueo total: las jornadas archivadas son inmutables (excepto para SUPERUSER).
+        resource.data.get('archived', false) == false || isSuperUser()
+      ) && ((isAdminRole() && (
         // Defensa en profundidad: si se cambia el color de revisión, debe estar en el set permitido.
         !('reviewColor' in request.resource.data) ||
         request.resource.data.reviewColor in ['', 'green', 'yellow', 'red', 'orange', 'blue']
@@ -123,6 +133,7 @@ service cloud.firestore {
         isApproved() &&
         resource.data.userId == request.auth.uid &&
         resource.data.lockedByAdmin == false &&
+        resource.data.get('lockedByAudit', false) == false &&
         request.resource.data.calculationSource == resource.data.calculationSource &&
         request.resource.data.calculationVersion == resource.data.calculationVersion
       ) || (
@@ -131,13 +142,24 @@ service cloud.firestore {
         resource.data.lockedByAdmin == false &&
         request.resource.data.userId == request.auth.uid &&
         get(/databases/$(database)/documents/users/$(resource.data.userId)).data.isPlaceholder == true
-      );
+      ));
 
-      allow delete: if isSuperUser() || isAdminRole() || (
+      allow delete: if isSuperUser() || ((
+        // Las jornadas archivadas sólo las puede borrar SUPERUSER (cubierto arriba).
+        resource.data.get('archived', false) == false
+      ) && (isAdminRole() || (
         isApproved() &&
         resource.data.userId == request.auth.uid &&
-        resource.data.lockedByAdmin == false
-      );
+        resource.data.lockedByAdmin == false &&
+        resource.data.get('lockedByAudit', false) == false
+      )));
+    }
+
+    // ─── Bloqueo de ediciones por auditoría ──────────────────────────────
+    match /audit_locks/{projectId} {
+      allow read: if isApproved();
+      allow create, update: if isAdminRole();
+      allow delete: if isSuperUser();
     }
 
     // ─── Ciclos laborales por usuario ─────────────────────────────────────
@@ -176,7 +198,12 @@ service cloud.firestore {
     match /settlements/{settlementId} {
       allow read: if isApproved();
       allow create: if isAdminRole();
-      allow update, delete: if isSuperUser();
+      // Admins pueden actualizar una liquidación no archivada (para archivarla).
+      // Una vez archivada (archivedAt presente), sólo SUPERUSER puede modificar.
+      allow update: if isSuperUser() || (
+        isAdminRole() && resource.data.get('archivedAt', null) == null
+      );
+      allow delete: if isSuperUser();
     }
 
     // ─── Chat / Soporte ────────────────────────────────────────────────────

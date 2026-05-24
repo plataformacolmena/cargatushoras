@@ -17,6 +17,8 @@ const DEFAULT_CONFIG: ProjectConfig = {
   penaltyHours: 0,
   jornadaAdicionalMultiplier: 1,
   futureDatePolicy: 'ALLOW',
+  engancheAlertEnabled: false,
+  engancheAlertThreshold: 12,
 }
 
 function toMinutes(timeHHMM: string): number {

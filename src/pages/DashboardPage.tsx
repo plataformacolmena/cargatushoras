@@ -16,6 +16,7 @@ import {
   deleteProjectRole,
   deleteTimeEntry,
   deleteSettlement,
+  archiveSettlementWithDriveLink,
   approveImportedPlaceholder,
   deleteImportedPlaceholder,
   getProjectConfig,
@@ -36,6 +37,8 @@ import {
   saveTimeEntryForUser,
   setEntryReviewColor,
   setUserAuditReviewColor,
+  setAuditLockEnabled,
+  subscribeToAuditLock,
   setUserRole,
   listApprovedUsers,
   listPendingUsers,
@@ -45,9 +48,6 @@ import {
   subscribeToMaintenance,
   setMaintenanceMode,
   type MaintenanceState,
-  subscribeToMyEntries,
-  subscribeToProjectEntries,
-  subscribeToAreaEntries,
   subscribeToProjectUsers,
   subscribeToProjects,
   listUsersWithoutEntries,
@@ -65,6 +65,7 @@ import {
 } from '../services/firestore'
 import type {
   AppRole,
+  AuditLock,
   Project,
   ProjectArea,
   ProjectConfig,
@@ -124,6 +125,39 @@ function formatDate(dateStr: string): string {
   return `${d}-${m}-${y.slice(2)}`
 }
 
+/** Convierte Firestore Timestamp (o similar) a Date. Devuelve null si no se puede. */
+function tsToDate(ts: unknown): Date | null {
+  if (!ts) return null
+  if (typeof ts === 'object' && ts !== null && 'toDate' in ts && typeof (ts as { toDate: () => Date }).toDate === 'function') {
+    try { return (ts as { toDate: () => Date }).toDate() } catch { return null }
+  }
+  if (ts instanceof Date) return ts
+  return null
+}
+
+/** Devuelve el max(updatedAt) de la lista formateado en es-UY, o null si la lista está vacía/sin updatedAt. */
+function formatLastUpdate(items: Array<{ updatedAt?: unknown }>): string | null {
+  let max: Date | null = null
+  for (const it of items) {
+    const d = tsToDate(it.updatedAt)
+    if (d && (!max || d.getTime() > max.getTime())) max = d
+  }
+  if (!max) return null
+  return max.toLocaleString('es-UY', { timeZone: 'America/Montevideo' })
+}
+
+/** Determina si una jornada supera el umbral configurado de enganche/reenganche. */
+function isLongEngancheEntry(
+  entry: { calculation?: { engancheExtraHours?: number; reengancheExtraHours?: number } },
+  cfg: { engancheAlertEnabled?: boolean; engancheAlertThreshold?: number } | null | undefined,
+): boolean {
+  if (!cfg?.engancheAlertEnabled) return false
+  const threshold = cfg.engancheAlertThreshold ?? 12
+  const eng = entry.calculation?.engancheExtraHours ?? 0
+  const reeng = entry.calculation?.reengancheExtraHours ?? 0
+  return eng >= threshold || reeng >= threshold
+}
+
 function downloadEntriesCSV(entries: TimeEntry[], downloader: UserProfile, areas: ProjectArea[]) {
   const areaName = areas.find((a) => a.id === downloader.areaId)?.name ?? 'Todas las áreas'
   const downloadedAt = new Date().toLocaleString('es-UY', { timeZone: 'America/Montevideo' })
@@ -168,7 +202,7 @@ const REVIEW_COLORS = [
   { value: 'yellow', defaultLabel: 'En revisión',   bg: '#eab308', tint: 'rgba(234,179,8,0.15)'  },
   { value: 'red',    defaultLabel: 'Con problemas', bg: '#ef4444', tint: 'rgba(239,68,68,0.13)'  },
   { value: 'orange', defaultLabel: 'Pendiente',     bg: '#f97316', tint: 'rgba(249,115,22,0.13)' },
-  { value: 'blue',   defaultLabel: 'Consulta',      bg: '#3b82f6', tint: 'rgba(59,130,246,0.13)' },
+  { value: 'blue',   defaultLabel: '6to día',       bg: '#3b82f6', tint: 'rgba(59,130,246,0.13)' },
 ] as const
 
 // ─── Persistencia de navegación ───────────────────────────────────────────
@@ -206,6 +240,7 @@ export function DashboardPage() {
   const [projects, setProjects] = useState<Project[]>([])
   const [activeProjectId, setActiveProjectId] = useState('')
   const [entries, setEntries] = useState<TimeEntry[]>([])
+  const [entriesLoading, setEntriesLoading] = useState(false)
   const [pendingUsers, setPendingUsers] = useState<UserProfile[]>([])
   const [approvedUsers, setApprovedUsers] = useState<UserProfile[]>([])
   const [importedMembers, setImportedMembers] = useState<UserProfile[]>([])
@@ -238,6 +273,14 @@ export function DashboardPage() {
     penalties: 0,
     isJornadaAdicional: false,
   })
+
+  // Buscador en Horarios del proyecto/área/mis horarios
+  const [entrySearch, setEntrySearch] = useState('')
+  // Motivo de penalty
+  const [penaltyReason, setPenaltyReason] = useState('')
+  const [showPenaltyReason, setShowPenaltyReason] = useState(false)
+  const [editPenaltyReason, setEditPenaltyReason] = useState('')
+  const [showEditPenaltyReason, setShowEditPenaltyReason] = useState(false)
 
   // Auditoría
   const [auditEntries, setAuditEntries] = useState<TimeEntry[]>([])
@@ -306,8 +349,15 @@ export function DashboardPage() {
   // Rangos bloqueados por liquidaciones
   const [lockedRanges, setLockedRanges] = useState<Array<{ dateFrom: string; dateTo: string }>>([])
 
+  // Auditoría: bloqueo de ediciones (por proyecto)
+  const [auditLock, setAuditLock] = useState<AuditLock | null>(null)
+  const [auditLockForm, setAuditLockForm] = useState<{ dateFrom: string; dateTo: string }>({ dateFrom: '', dateTo: '' })
+  const [auditLockBusy, setAuditLockBusy] = useState(false)
+
   // Modal de recálculo/sync de áreas por rango
   const [rangeOpModal, setRangeOpModal] = useState<{ op: 'RECALC' | 'SYNC_AREAS'; dateFrom: string; dateTo: string } | null>(null)
+  // Modal de archivar liquidación (paso 2: pegar link de Drive)
+  const [archiveModal, setArchiveModal] = useState<{ settlement: Settlement; fileName: string; driveUrl: string; busy: boolean } | null>(null)
   const [rangeOpBusy, setRangeOpBusy] = useState(false)
 
   // Auditoría: usuarios sin informar
@@ -352,35 +402,67 @@ export function DashboardPage() {
     if (activeProjectId) writeLS('activeProjectId', activeProjectId)
   }, [activeProjectId])
 
-  useEffect(() => {
+  // Carga one-shot de jornadas (sin onSnapshot). Se invoca al montar la
+  // pestaña de proyectos, al cambiar de proyecto y manualmente desde el
+  // botón "Refrescar" o tras una mutación (crear/editar/eliminar).
+  const loadEntries = useCallback(async () => {
     const currentProfile = profile
-    if (!currentProfile || !activeProjectId) return
-    // Solo montar el listener cuando el usuario está en la pestaña de proyectos.
-    // En USERS / HELP / PROJECT_MANAGEMENT no se necesita.
-    if (mainTab !== 'PROJECTS') return
-    // Ventana de jornadas en tiempo real: últimos ~90 días para limitar
-    // lecturas de Firestore. Reportes y liquidaciones (que requieran fechas
-    // más antiguas) usan listAllTimeEntries con rango específico.
+    if (!currentProfile || !activeProjectId) {
+      setEntries([])
+      return
+    }
     const since = (() => {
       const d = new Date()
       d.setDate(d.getDate() - 90)
       return d.toISOString().slice(0, 10)
     })()
-    if (canAudit(currentProfile.role)) {
-      return subscribeToProjectEntries(activeProjectId, setEntries, { since })
-    } else if (currentProfile.areaId) {
-      return subscribeToAreaEntries(activeProjectId, currentProfile.areaId, setEntries, { since })
-    } else {
-      return subscribeToMyEntries(currentProfile.uid, activeProjectId, setEntries, { since })
+    setEntriesLoading(true)
+    try {
+      const filters: { dateFrom: string; userId?: string; areaId?: string } = { dateFrom: since }
+      if (!canAudit(currentProfile.role)) {
+        if (currentProfile.areaId) filters.areaId = currentProfile.areaId
+        else filters.userId = currentProfile.uid
+      }
+      const loaded = await listAllTimeEntries(activeProjectId, filters)
+      setEntries(loaded)
+    } catch (err) {
+      console.error('[loadEntries] error:', err)
+      showToast(`Error al cargar horarios: ${err instanceof Error ? err.message : 'Desconocido'}`, 'error')
+    } finally {
+      setEntriesLoading(false)
     }
-  }, [activeProjectId, profile, mainTab])
+  }, [activeProjectId, profile])
 
+  useEffect(() => {
+    const currentProfile = profile
+    if (!currentProfile || !activeProjectId) return
+    // Solo cargar cuando el usuario está en la pestaña de proyectos.
+    // En USERS / HELP / PROJECT_MANAGEMENT no se necesita.
+    if (mainTab !== 'PROJECTS') return
+    // Cambiamos onSnapshot por fetch one-shot (getDocs) para reducir lecturas.
+    // El usuario refresca con el botón "Refrescar" o automáticamente tras crear/editar/eliminar.
+    void loadEntries()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProjectId, profile?.uid, profile?.role, profile?.areaId, mainTab])
   // Suscripción en tiempo real a usuarios del proyecto (formulario admin en auditoría)
   useEffect(() => {
     const currentProfile = profile
     if (!currentProfile || !canAudit(currentProfile.role) || !activeProjectId) return
     return subscribeToProjectUsers(activeProjectId, setProjectUsers)
   }, [activeProjectId, profile])
+
+  // Suscripción al bloqueo de ediciones del proyecto activo
+  useEffect(() => {
+    if (!activeProjectId) {
+      setAuditLock(null)
+      return
+    }
+    return subscribeToAuditLock(activeProjectId, (lock) => {
+      setAuditLock(lock)
+      // Prellenar el form con los últimos valores almacenados
+      if (lock) setAuditLockForm({ dateFrom: lock.dateFrom, dateTo: lock.dateTo })
+    })
+  }, [activeProjectId])
 
   useEffect(() => {
     if (!activeProjectId) return
@@ -585,8 +667,25 @@ export function DashboardPage() {
     [memberAreaConflicts],
   )
 
+  // ─── Filtro de búsqueda de Horarios del proyecto ────────────────────────
+  const filteredEntries = useMemo(() => {
+    const q = entrySearch.trim().toLowerCase()
+    if (!q) return entries
+    return entries.filter((e) => {
+      const hay = [
+        e.userName,
+        e.workDate,
+        e.shiftLabel,
+        e.timeIn,
+        e.timeOut,
+        e.notes ?? '',
+      ].join(' ').toLowerCase()
+      return hay.includes(q)
+    })
+  }, [entries, entrySearch])
+
   // ─── Paginación ─────────────────────────────────────────────────────────
-  const entriesPagination = usePagedItems(entries, 25)
+  const entriesPagination = usePagedItems(filteredEntries, 25)
   const auditPagination = usePagedItems(auditEntries, 50)
   const settlementsPagination = usePagedItems(pastSettlements, 10)
 
@@ -615,19 +714,34 @@ export function DashboardPage() {
 
   function exportAuditExcel() {
     if (auditEntries.length === 0) return
-    const rows = auditEntries.map((e) => ({
-      Fecha: e.workDate,
-      Jornada: e.shiftLabel,
-      Usuario: e.userName,
-      'Hora Entrada': e.timeIn,
-      'Hora Salida': e.timeOut,
-      'Horas Trabajadas': e.calculation.workedHours,
-      'Horas Regulares': e.calculation.regularHours,
-      'Horas Extra': e.calculation.overtimeHours,
-      'Horas Nocturnas': e.calculation.nightHours,
-      'Unidades Extra Pay': e.calculation.extraPayUnits,
-      Observaciones: e.notes || '',
-    }))
+    const rows = auditEntries.map((e) => {
+      const overtime = e.calculation.overtimeHours ?? 0
+      const nightOvertime = e.calculation.nightOvertimeHours ?? 0
+      const overtimeDay = Math.max(0, Math.round((overtime - nightOvertime) * 100) / 100)
+      const areaName = e.areaId ? (areas.find((a) => a.id === e.areaId)?.name ?? '') : ''
+      const userOfEntry = projectUsers.find((u) => u.uid === e.userId)
+      const roleName = userOfEntry?.roleId ? (projectRoles.find((r) => r.id === userOfEntry.roleId)?.name ?? '') : ''
+      return {
+        Fecha: e.workDate,
+        Jornada: e.shiftLabel,
+        Usuario: e.userName,
+        Área: areaName,
+        Rol: roleName,
+        'Hora Entrada': e.timeIn,
+        'Hora Salida': e.timeOut,
+        'Horas Trabajadas': e.calculation.workedHours,
+        'Horas Regulares': e.calculation.regularHours,
+        'Extras Día': overtimeDay,
+        'Extras Noche': nightOvertime,
+        'Horas Nocturnas': e.calculation.nightHours,
+        Enganche: e.calculation.engancheExtraHours ?? 0,
+        Reenganche: e.calculation.reengancheExtraHours ?? 0,
+        Penalty: e.calculation.penaltyHours ?? 0,
+        '6to día': e.isJornadaAdicional ? 'Sí' : 'No',
+        'Unidades Extra Pay': e.calculation.extraPayUnits,
+        Observaciones: e.notes || '',
+      }
+    })
     const ws = XLSX.utils.json_to_sheet(rows)
     const wb = XLSX.utils.book_new()
     XLSX.utils.book_append_sheet(wb, ws, 'Auditoría')
@@ -761,6 +875,145 @@ export function DashboardPage() {
     XLSX.writeFile(wb, `liquidacion_${s.projectName}_${s.dateFrom}_${s.dateTo}.xlsx`)
   }
 
+  /** Construye el Excel de archivado: hoja "Liquidación" + hoja "Detalle" con todas las jornadas del rango. */
+  async function buildSettlementArchiveBlob(s: Settlement): Promise<Blob> {
+    // Hoja 1: Liquidación (idéntica a exportSettlementExcel)
+    const liqRows = s.lines.map((l) => ({
+      Colaborador: l.userName,
+      Rol: l.roleName ?? '',
+      'Hs. Normales': l.regularHours,
+      'Hs. Extras': l.overtimeHours,
+      'Hs. Nocturnas': l.nightHours,
+      'Hs. Noct. Extras': l.nightOvertimeHours,
+      'Hs. Enganche': l.engancheExtraHours,
+      'Hs. Reenganche': l.reengancheExtraHours,
+      '6to día': l.jornadaAdicionalCount,
+      Penalties: l.penaltyHours,
+      'Total Hs.': l.totalHours,
+      '$/h': l.hourlyRate,
+      'Pago Normal ($)': l.regularPay,
+      'Pago Extra ($)': l.overtimePay,
+      'Pago Nocturno ($)': l.nightPay,
+      'Total ($)': l.totalPay,
+    }))
+    liqRows.push({
+      Colaborador: 'TOTAL',
+      Rol: '',
+      'Hs. Normales': s.lines.reduce((a, l) => a + l.regularHours, 0),
+      'Hs. Extras': s.lines.reduce((a, l) => a + l.overtimeHours, 0),
+      'Hs. Nocturnas': s.lines.reduce((a, l) => a + l.nightHours, 0),
+      'Hs. Noct. Extras': s.lines.reduce((a, l) => a + l.nightOvertimeHours, 0),
+      'Hs. Enganche': s.lines.reduce((a, l) => a + l.engancheExtraHours, 0),
+      'Hs. Reenganche': s.lines.reduce((a, l) => a + l.reengancheExtraHours, 0),
+      '6to día': s.lines.reduce((a, l) => a + l.jornadaAdicionalCount, 0),
+      Penalties: s.lines.reduce((a, l) => a + l.penaltyHours, 0),
+      'Total Hs.': s.lines.reduce((a, l) => a + l.totalHours, 0),
+      '$/h': 0,
+      'Pago Normal ($)': s.lines.reduce((a, l) => a + l.regularPay, 0),
+      'Pago Extra ($)': s.lines.reduce((a, l) => a + l.overtimePay, 0),
+      'Pago Nocturno ($)': s.lines.reduce((a, l) => a + l.nightPay, 0),
+      'Total ($)': s.totalPay,
+    })
+    const wsLiq = XLSX.utils.json_to_sheet(liqRows)
+
+    // Hoja 2: Detalle (todas las jornadas del rango)
+    const allEntries = await listAllTimeEntries(s.projectId, { dateFrom: s.dateFrom, dateTo: s.dateTo })
+    const detalleRows = allEntries.map((e) => {
+      const calc = e.calculation
+      const area = areas.find((a) => a.id === e.areaId)
+      return {
+        Fecha: e.workDate,
+        Colaborador: e.userName,
+        Área: area?.name ?? '',
+        Turno: e.shiftLabel,
+        Entrada: e.timeIn,
+        Salida: e.timeOut,
+        'Hs. trabajadas': calc.workedHours,
+        'Hs. normales': calc.regularHours,
+        'Ext. día': Math.max(0, calc.overtimeHours - (calc.nightOvertimeHours ?? 0)),
+        'Ext. noche': calc.nightOvertimeHours ?? 0,
+        'Hs. nocturnas': calc.nightHours,
+        '6to día': (e as TimeEntry & { isJornadaAdicional?: boolean }).isJornadaAdicional ? 'Sí' : '',
+        Penalties: (e as TimeEntry & { penalties?: number }).penalties ?? 0,
+        Notas: e.notes ?? '',
+      }
+    })
+    const wsDet = XLSX.utils.json_to_sheet(detalleRows)
+
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, wsLiq, 'Liquidación')
+    XLSX.utils.book_append_sheet(wb, wsDet, 'Detalle')
+    const arrBuf = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer
+    return new Blob([arrBuf], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    })
+  }
+
+  async function handleArchiveSettlement(s: Settlement) {
+    if (!s.id) return
+    const msg =
+      `⚠️ ARCHIVAR esta liquidación es PERMANENTE.\n\n` +
+      `• Se descargará un Excel (Liquidación + Detalle) a tu PC.\n` +
+      `• Después tendrás que subirlo a tu Google Drive y pegar el link aquí.\n` +
+      `• Las ${s.lines.length} líneas y todas las jornadas del rango ${s.dateFrom} → ${s.dateTo} quedarán BLOQUEADAS para todos (incluso admins).\n` +
+      `• No se podrá "Liberar" el período una vez archivado.\n\n` +
+      `¿Continuar y descargar el Excel?`
+    if (!window.confirm(msg)) return
+    try {
+      setSettlementLoading(true)
+      const blob = await buildSettlementArchiveBlob(s)
+      const fileName = `liquidacion_${s.projectName}_${s.dateFrom}_${s.dateTo}.xlsx`
+      // Disparar descarga al navegador.
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = fileName
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      // Abrir modal para pegar el link de Drive.
+      setArchiveModal({ settlement: s, fileName, driveUrl: '', busy: false })
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Error al generar el Excel.', 'error')
+      console.error(err)
+    } finally {
+      setSettlementLoading(false)
+    }
+  }
+
+  async function confirmArchiveWithDriveLink() {
+    if (!archiveModal || !archiveModal.settlement.id) return
+    const driveUrl = archiveModal.driveUrl.trim()
+    if (!driveUrl) {
+      showToast('Pegá el link de Drive antes de confirmar.', 'error')
+      return
+    }
+    const isDriveLink = /^https:\/\/(drive|docs)\.google\.com\//i.test(driveUrl)
+    if (!isDriveLink) {
+      showToast('El link debe empezar con https://drive.google.com/ o https://docs.google.com/', 'error')
+      return
+    }
+    try {
+      setArchiveModal((p) => p ? { ...p, busy: true } : p)
+      await archiveSettlementWithDriveLink(
+        archiveModal.settlement.id,
+        driveUrl,
+        archiveModal.fileName,
+        currentProfile.uid,
+      )
+      const loaded = await listSettlements(activeProjectId)
+      setPastSettlements(loaded)
+      void loadEntries()
+      setArchiveModal(null)
+      showToast('Liquidación archivada y período cerrado permanentemente.')
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Error al archivar.', 'error')
+      console.error(err)
+      setArchiveModal((p) => p ? { ...p, busy: false } : p)
+    }
+  }
+
   async function submitConfig(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!activeProjectId || !projectConfig) return
@@ -782,6 +1035,8 @@ export function DashboardPage() {
         penaltyHours: projectConfig.penaltyHours,
         jornadaAdicionalMultiplier: projectConfig.jornadaAdicionalMultiplier,
         futureDatePolicy: projectConfig.futureDatePolicy ?? 'ALLOW',
+        engancheAlertEnabled: projectConfig.engancheAlertEnabled ?? false,
+        engancheAlertThreshold: projectConfig.engancheAlertThreshold ?? 12,
       })
       setConfigStatus('')
       showToast('Configuración guardada correctamente.')
@@ -848,6 +1103,19 @@ export function DashboardPage() {
     event.preventDefault()
     if (isDateLocked(form.workDate)) {
       showToast(`La fecha ${form.workDate} pertenece a un período liquidado y no se puede modificar.`, 'error')
+      return
+    }
+    // Bloqueo de auditoría: si el miembro ya informó fechas en el rango, no puede agregar más.
+    // (Los admins quedan exentos de esta validación.)
+    if (
+      !canAudit(currentProfile.role) &&
+      isDateAuditLocked(form.workDate) &&
+      memberHasEntriesInAuditLockRange()
+    ) {
+      showToast(
+        `El rango ${auditLock?.dateFrom} → ${auditLock?.dateTo} está bloqueado por auditoría y ya informaste jornadas en él.`,
+        'error',
+      )
       return
     }
     // Bloqueo por política de fechas futuras (admins exentos).
@@ -940,6 +1208,7 @@ export function DashboardPage() {
       )
       showToast('Horario guardado correctamente.')
       setForm((prev) => ({ ...prev, notes: '' }))
+      void loadEntries()
     } catch (err) {
       showToast('Error al guardar el horario.', 'error')
       console.error(err)
@@ -964,6 +1233,14 @@ export function DashboardPage() {
   async function submitEditEntry(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!editingEntry) return
+    if (editingEntry.archived === true) {
+      showToast('Esta jornada está archivada (liquidación cerrada) y no se puede editar.', 'error')
+      return
+    }
+    if (!canAudit(currentProfile.role) && (editingEntry.lockedByAudit === true || isDateAuditLocked(editEntryForm.workDate))) {
+      showToast('Esta jornada está bloqueada por auditoría y no se puede editar.', 'error')
+      return
+    }
     if (!canAudit(currentProfile.role) && isDateLocked(editEntryForm.workDate)) {
       showToast('Esta jornada está bloqueada y no se puede editar.', 'error')
       return
@@ -984,6 +1261,7 @@ export function DashboardPage() {
       await updateTimeEntry(editingEntry.id, editEntryForm, activeProjectId, editingEntry.userId)
       setEditingEntry(null)
       showToast('Jornada actualizada.')
+      void loadEntries()
     } catch (err) {
       showToast('Error al actualizar.', 'error')
       console.error(err)
@@ -994,6 +1272,14 @@ export function DashboardPage() {
 
   async function handleDeleteEntry(entryId: string, userId: string) {
     const target = entries.find((e) => e.id === entryId)
+    if (target?.archived === true) {
+      showToast('Esta jornada está archivada (liquidación cerrada) y no se puede eliminar.', 'error')
+      return
+    }
+    if (!canAudit(currentProfile.role) && target?.lockedByAudit === true) {
+      showToast('Esta jornada está bloqueada por auditoría y no se puede eliminar.', 'error')
+      return
+    }
     if (!canAudit(currentProfile.role) && target && isDateLocked(target.workDate)) {
       showToast('Esta jornada está bloqueada y no se puede eliminar.', 'error')
       return
@@ -1003,6 +1289,7 @@ export function DashboardPage() {
       setDeletingEntryId(entryId)
       await deleteTimeEntry(entryId, activeProjectId, userId)
       showToast('Jornada eliminada.')
+      void loadEntries()
     } catch (err) {
       showToast('Error al eliminar.', 'error')
       console.error(err)
@@ -1030,6 +1317,7 @@ export function DashboardPage() {
     try {
       await updateTimeEntry(editingAuditEntry.id, editAuditForm, activeProjectId, editingAuditEntry.userId)
       await loadAuditEntries()
+      void loadEntries()
       setEditingAuditEntry(null)
       showToast('Jornada actualizada.')
     } catch (err) {
@@ -1043,6 +1331,7 @@ export function DashboardPage() {
     try {
       await deleteTimeEntry(entryId, activeProjectId, userId)
       await loadAuditEntries()
+      void loadEntries()
       showToast('Jornada eliminada.')
     } catch (err) {
       showToast('Error al eliminar.', 'error')
@@ -1066,6 +1355,7 @@ export function DashboardPage() {
       showToast(`Jornada cargada para ${targetUser.displayName ?? 'usuario'}.`)
       setAdminEntryForm({ workDate: '', shiftLabel: '', timeIn: '', timeOut: '', notes: '', penalties: 0, isJornadaAdicional: false })
       setAdminEntryUserId('')
+      void loadEntries()
     } catch (err) {
       showToast('Error al cargar jornada.', 'error')
       console.error(err)
@@ -1476,6 +1766,54 @@ export function DashboardPage() {
 
   function isDateLocked(workDate: string): boolean {
     return lockedRanges.some((r) => workDate >= r.dateFrom && workDate <= r.dateTo)
+  }
+
+  /** True si la fecha cae dentro del rango del bloqueo de auditoría activo. */
+  function isDateAuditLocked(workDate: string): boolean {
+    if (!auditLock || !auditLock.enabled) return false
+    return workDate >= auditLock.dateFrom && workDate <= auditLock.dateTo
+  }
+
+  /** True si el usuario actual ya tiene al menos una entrada propia dentro del rango del bloqueo de auditoría. */
+  function memberHasEntriesInAuditLockRange(): boolean {
+    if (!auditLock || !auditLock.enabled) return false
+    return entries.some(
+      (e) =>
+        e.userId === currentProfile.uid &&
+        e.workDate >= auditLock.dateFrom &&
+        e.workDate <= auditLock.dateTo,
+    )
+  }
+
+  async function handleToggleAuditLock(targetEnabled: boolean) {
+    if (!activeProjectId) return
+    if (!auditLockForm.dateFrom || !auditLockForm.dateTo) {
+      showToast('Indicá el rango de fechas a bloquear.', 'error')
+      return
+    }
+    if (auditLockForm.dateFrom > auditLockForm.dateTo) {
+      showToast('La fecha desde no puede ser mayor que la fecha hasta.', 'error')
+      return
+    }
+    const action = targetEnabled ? 'activar' : 'desactivar'
+    if (!window.confirm(`¿Seguro que querés ${action} el bloqueo de ediciones para ${auditLockForm.dateFrom} → ${auditLockForm.dateTo}?`)) {
+      return
+    }
+    setAuditLockBusy(true)
+    try {
+      const count = await setAuditLockEnabled(activeProjectId, {
+        enabled: targetEnabled,
+        dateFrom: auditLockForm.dateFrom,
+        dateTo: auditLockForm.dateTo,
+        updatedBy: currentProfile.uid,
+      })
+      showToast(targetEnabled ? `Bloqueo activado (${count} jornadas marcadas).` : `Bloqueo desactivado (${count} jornadas liberadas).`)
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Error al cambiar el bloqueo.', 'error')
+      console.error(err)
+    } finally {
+      setAuditLockBusy(false)
+    }
   }
 
   async function loadNoReportUsers() {
@@ -2020,6 +2358,39 @@ export function DashboardPage() {
                     </label>
                   </div>
 
+                  <div className="time-grid">
+                    <label style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
+                      <span style={{ marginBottom: '4px' }}>Alerta enganche/reenganche</span>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontWeight: 'normal' }}>
+                        <input
+                          type="checkbox"
+                          checked={projectConfig.engancheAlertEnabled ?? false}
+                          onChange={(e) =>
+                            setProjectConfig((prev) =>
+                              prev ? { ...prev, engancheAlertEnabled: e.target.checked } : prev,
+                            )
+                          }
+                        />
+                        {(projectConfig.engancheAlertEnabled ?? false)
+                          ? 'Activada — destacar jornadas con enganche/reenganche altos'
+                          : 'Desactivada'}
+                      </label>
+                    </label>
+                    <label>
+                      Umbral (horas)
+                      <input
+                        type="number" min={0} max={48} step={0.5}
+                        value={projectConfig.engancheAlertThreshold ?? 12}
+                        disabled={!(projectConfig.engancheAlertEnabled ?? false)}
+                        onChange={(e) =>
+                          setProjectConfig((prev) =>
+                            prev ? { ...prev, engancheAlertThreshold: Number(e.target.value) } : prev,
+                          )
+                        }
+                      />
+                    </label>
+                  </div>
+
                   <button className="btn" type="submit">
                     Guardar configuración
                   </button>
@@ -2168,6 +2539,7 @@ export function DashboardPage() {
                     />
                   </label>
                 </div>
+
                 <label>
                   Observaciones
                   <textarea
@@ -2177,12 +2549,65 @@ export function DashboardPage() {
                   />
                 </label>
 
+                {/* Motivo de penalty pop-up (alta) */}
+                {showPenaltyReason && (
+                  <div className="modal-overlay" onClick={() => setShowPenaltyReason(false)}>
+                    <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 380 }}>
+                      <h3>Motivo del Penalty</h3>
+                      <p className="muted" style={{ fontSize: '0.9rem' }}>Por favor, ingresá el motivo del penalty aplicado a esta jornada.</p>
+                      <textarea
+                        value={penaltyReason}
+                        onChange={e => setPenaltyReason(e.target.value)}
+                        rows={3}
+                        style={{ width: '100%' }}
+                        autoFocus
+                        maxLength={200}
+                        placeholder=""
+                      />
+                      <div className="row" style={{ gap: 8, justifyContent: 'flex-end', marginTop: 12 }}>
+                        <button className="btn btn-outline" onClick={() => setShowPenaltyReason(false)}>Cancelar</button>
+                        <button className="btn" onClick={() => { setForm(f => ({ ...f, notes: (f.notes ? f.notes + '\n' : '') + `[Penalty] ${penaltyReason}` })); setShowPenaltyReason(false); }}>Guardar motivo</button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Motivo de penalty pop-up (edición) */}
+                {showEditPenaltyReason && (
+                  <div className="modal-overlay" onClick={() => setShowEditPenaltyReason(false)}>
+                    <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 380 }}>
+                      <h3>Motivo del Penalty</h3>
+                      <p className="muted" style={{ fontSize: '0.9rem' }}>Por favor, ingresá el motivo del penalty aplicado a esta jornada.</p>
+                      <textarea
+                        value={editPenaltyReason}
+                        onChange={e => setEditPenaltyReason(e.target.value)}
+                        rows={3}
+                        style={{ width: '100%' }}
+                        autoFocus
+                        maxLength={200}
+                        placeholder=""
+                      />
+                      <div className="row" style={{ gap: 8, justifyContent: 'flex-end', marginTop: 12 }}>
+                        <button className="btn btn-outline" onClick={() => setShowEditPenaltyReason(false)}>Cancelar</button>
+                        <button className="btn" onClick={() => { setEditEntryForm(f => ({ ...f, notes: (f.notes ? f.notes + '\n' : '') + `[Penalty] ${editPenaltyReason}` })); setShowEditPenaltyReason(false); }}>Guardar motivo</button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 <div className="time-grid">
                   <label>
                     Penalties
                     <select
                       value={form.penalties}
-                      onChange={(e) => setForm((prev) => ({ ...prev, penalties: Number(e.target.value) }))}
+                      onChange={(e) => {
+                        const val = Number(e.target.value)
+                        setForm((prev) => ({ ...prev, penalties: val }))
+                        if (val > 0) {
+                          setPenaltyReason('')
+                          setShowPenaltyReason(true)
+                        }
+                      }}
                     >
                       <option value={0}>0 — Sin penalty</option>
                       <option value={1}>1 penalty</option>
@@ -2219,23 +2644,63 @@ export function DashboardPage() {
                     ? 'Horarios del área'
                     : 'Mis horarios'}
                 </h2>
-                {entries.length > 0 && (
+                <div className="row" style={{ gap: '6px', flexWrap: 'wrap' }}>
+                  <input
+                    type="search"
+                    placeholder="Buscar por nombre, fecha, turno, observaciones…"
+                    value={entrySearch}
+                    onChange={(e) => setEntrySearch(e.target.value)}
+                    style={{ minWidth: '220px', flex: '1 1 220px' }}
+                  />
                   <button
                     className="btn btn-outline"
-                    onClick={() => downloadEntriesCSV(entries, currentProfile, areas)}
-                    title="Descargar registros como CSV"
+                    onClick={() => { void loadEntries() }}
+                    disabled={entriesLoading}
+                    title="Recargar registros desde el servidor"
                   >
-                    Descargar CSV ({entries.length})
+                    {entriesLoading ? <><Spinner size={14} inline /> Cargando…</> : 'Refrescar'}
                   </button>
-                )}
+                  {entries.length > 0 && (
+                    <button
+                      className="btn btn-outline"
+                      onClick={() => downloadEntriesCSV(entries, currentProfile, areas)}
+                      title="Descargar registros como CSV"
+                    >
+                      Descargar CSV ({entries.length})
+                    </button>
+                  )}
+                </div>
               </div>
               {entries.length === 0 ? (
                 <p className="muted">No hay registros para este proyecto.</p>
               ) : (
                 <>
+                {(() => {
+                  const lu = formatLastUpdate(entries)
+                  return lu ? (
+                    <p className="muted" style={{ margin: '4px 0 8px', fontSize: '0.78rem' }}>
+                      Última actualización: <strong>{lu}</strong>
+                    </p>
+                  ) : null
+                })()}
+                {entrySearch.trim() && (
+                  <p className="muted" style={{ margin: '4px 0 8px', fontSize: '0.78rem' }}>
+                    Mostrando <strong>{filteredEntries.length}</strong> de {entries.length} registros{filteredEntries.length === 0 ? ' — sin coincidencias' : ''}.
+                  </p>
+                )}
                 <div className="mobile-table">
                   {entriesPagination.paged.map((entry) => (
-                    <article className="entry-item" key={entry.id}>
+                    <article
+                      className="entry-item"
+                      key={entry.id}
+                      style={
+                        isLongEngancheEntry(entry, projectConfig)
+                          ? { backgroundColor: '#ffe2b8', borderLeft: '4px solid #f59e0b' }
+                          : entry.isJornadaAdicional
+                          ? { backgroundColor: 'rgba(59,130,246,0.13)', borderLeft: '4px solid #3b82f6' }
+                          : undefined
+                      }
+                    >
                       <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}>
                         <div>
                           <strong>{formatDate(entry.workDate)}</strong> — {entry.shiftLabel}
@@ -2266,8 +2731,12 @@ export function DashboardPage() {
                         </div>
                         {(canAudit(currentProfile.role) || entry.userId === currentProfile.uid) && (
                           <div className="row" style={{ gap: '6px' }}>
-                            {isDateLocked(entry.workDate) && !canAudit(currentProfile.role) ? (
-                              <span className="chip" title="Esta jornada está dentro de un período liquidado" style={{ fontSize: '0.75rem' }}>
+                            {(isDateLocked(entry.workDate) || entry.lockedByAudit === true) && !canAudit(currentProfile.role) ? (
+                              <span
+                                className="chip"
+                                title={entry.lockedByAudit === true ? 'Esta jornada está bloqueada por auditoría' : 'Esta jornada está dentro de un período liquidado'}
+                                style={{ fontSize: '0.75rem' }}
+                              >
                                 🔒 Bloqueada
                               </span>
                             ) : (
@@ -2297,6 +2766,74 @@ export function DashboardPage() {
           {projectTab === 'TIME_ENTRY_AUDIT' && canAudit(currentProfile.role) && (
             <section className="card">
               <h2>Auditoría de horarios</h2>
+
+              {/* ── Bloqueo de ediciones ───────────────────────────────────── */}
+              <details
+                style={{
+                  marginBottom: '1rem',
+                  borderBottom: '1px solid var(--line)',
+                  paddingBottom: '1rem',
+                  background: auditLock?.enabled ? 'rgba(239,68,68,0.06)' : 'transparent',
+                  padding: '0.75rem',
+                  borderRadius: 'var(--radius)',
+                }}
+                open={auditLock?.enabled}
+              >
+                <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none' }}>
+                  🔒 Bloqueo de ediciones
+                  {auditLock?.enabled ? (
+                    <span className="chip" style={{ marginLeft: '8px', background: '#ef4444', color: 'white' }}>
+                      Activo: {formatDate(auditLock.dateFrom)} → {formatDate(auditLock.dateTo)}
+                    </span>
+                  ) : (
+                    <span className="chip" style={{ marginLeft: '8px' }}>Inactivo</span>
+                  )}
+                </summary>
+                <p className="muted" style={{ fontSize: '0.85rem', marginTop: '0.5rem' }}>
+                  Cuando está activo, los miembros no pueden editar ni eliminar jornadas dentro del rango,
+                  ni agregar nuevas jornadas en él si ya informaron días en ese período.
+                  Los administradores pueden seguir editando libremente.
+                </p>
+                <div className="time-grid" style={{ marginTop: '0.5rem' }}>
+                  <label>
+                    Desde
+                    <input
+                      type="date"
+                      value={auditLockForm.dateFrom}
+                      onChange={(e) => setAuditLockForm((p) => ({ ...p, dateFrom: e.target.value }))}
+                      disabled={auditLockBusy}
+                    />
+                  </label>
+                  <label>
+                    Hasta
+                    <input
+                      type="date"
+                      value={auditLockForm.dateTo}
+                      onChange={(e) => setAuditLockForm((p) => ({ ...p, dateTo: e.target.value }))}
+                      disabled={auditLockBusy}
+                    />
+                  </label>
+                </div>
+                <div className="row" style={{ flexWrap: 'wrap', gap: '8px', marginTop: '0.5rem' }}>
+                  {!auditLock?.enabled ? (
+                    <button
+                      className="btn"
+                      onClick={() => { void handleToggleAuditLock(true) }}
+                      disabled={auditLockBusy}
+                    >
+                      {auditLockBusy ? <><Spinner size={14} inline /> Bloqueando…</> : 'Activar bloqueo'}
+                    </button>
+                  ) : (
+                    <button
+                      className="btn btn-outline"
+                      onClick={() => { void handleToggleAuditLock(false) }}
+                      disabled={auditLockBusy}
+                    >
+                      {auditLockBusy ? <><Spinner size={14} inline /> Liberando…</> : 'Desactivar bloqueo'}
+                    </button>
+                  )}
+                </div>
+              </details>
 
               {/* ── Usuarios sin informar ──────────────────────────────────── */}
               <details style={{ marginBottom: '1rem', borderBottom: '1px solid var(--line)', paddingBottom: '1rem' }}>
@@ -2505,6 +3042,25 @@ export function DashboardPage() {
                   >
                     Sincronizar áreas…
                   </button>
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      if (!auditFilters.dateFrom || !auditFilters.dateTo) {
+                        showToast('Indicá "Desde" y "Hasta" en los filtros antes de liquidar.', 'error')
+                        return
+                      }
+                      if (auditFilters.dateFrom > auditFilters.dateTo) {
+                        showToast('La fecha "Desde" no puede ser posterior a "Hasta".', 'error')
+                        return
+                      }
+                      setSettlementForm({ dateFrom: auditFilters.dateFrom, dateTo: auditFilters.dateTo })
+                      setProjectTab('SETTLEMENTS')
+                      showToast('Fechas pre-cargadas en Liquidaciones. Pulsá “Calcular” para previsualizar.', 'info')
+                    }}
+                    title="Pre-carga el rango de los filtros en la pestaña Liquidaciones"
+                  >
+                    💰 Liquidar este período
+                  </button>
                 </div>
               </div>
 
@@ -2546,6 +3102,14 @@ export function DashboardPage() {
 
               {auditEntries.length > 0 ? (
                 <div style={{ overflowX: 'auto', marginTop: '0.75rem' }}>
+                  {(() => {
+                    const lu = formatLastUpdate(auditEntries)
+                    return lu ? (
+                      <p className="muted" style={{ margin: '4px 0 8px', fontSize: '0.78rem' }}>
+                        Última actualización: <strong>{lu}</strong>
+                      </p>
+                    ) : null
+                  })()}
                   {/* Leyenda de colores */}
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center', marginBottom: '8px' }}>
                     <span className="muted" style={{ fontSize: '0.78rem', marginRight: '2px' }}>Leyenda:</span>
@@ -2574,17 +3138,19 @@ export function DashboardPage() {
                         <th title="Color de revisión"></th>
                         <th>Fecha</th>
                         <th>Usuario</th>
+                        <th>Área</th>
+                        <th>Rol</th>
                         <th>Jornada</th>
                         <th>Entrada</th>
                         <th>Salida</th>
                         <th>Hs. Trab.</th>
-                        <th>Extras</th>
-                        <th>Noct.</th>
-                        <th>N.Ext.</th>
+                        <th title="Horas extras diurnas (extras totales menos extras nocturnas)">Ext. día</th>
+                        <th title="Horas extras nocturnas (parte de las extras que cae en ventana nocturna)">Ext. noche</th>
+                        <th title="Horas trabajadas dentro de la ventana nocturna (no necesariamente extras)">Noct.</th>
                         <th>Enganche</th>
                         <th>Reenganche</th>
                         <th>Pen.</th>
-                        <th title="Extras + Enganche + Reenganche + Penalties">Tot. Ext.</th>
+                        <th title="Ext. día + Ext. noche + Enganche + Reenganche + Penalties">Tot. Ext.</th>
                         <th>6to día</th>
                         <th>Obs.</th>
                         <th>Acciones</th>
@@ -2592,13 +3158,22 @@ export function DashboardPage() {
                     </thead>
                     <tbody>
                       {auditPagination.paged.map((entry) => {
-                        const totalExtras = (entry.calculation.overtimeHours ?? 0)
+                        const overtime = entry.calculation.overtimeHours ?? 0
+                        const nightOvertime = entry.calculation.nightOvertimeHours ?? 0
+                        const overtimeDay = Math.max(0, Math.round((overtime - nightOvertime) * 100) / 100)
+                        const totalExtras = overtime
                           + (entry.calculation.engancheExtraHours ?? 0)
                           + (entry.calculation.reengancheExtraHours ?? 0)
                           + (entry.calculation.penaltyHours ?? 0)
                         const rowBg = REVIEW_COLORS.find((c) => c.value === entry.reviewColor)?.tint
+                        const longEng = isLongEngancheEntry(entry, projectConfig)
+                        const sixthDayTint = entry.isJornadaAdicional ? 'rgba(59,130,246,0.13)' : undefined
+                        const effectiveBg = longEng ? '#fecaca' : (rowBg ?? sixthDayTint)
+                        const areaName = entry.areaId ? (areas.find((a) => a.id === entry.areaId)?.name ?? '—') : '—'
+                        const userOfEntry = projectUsers.find((u) => u.uid === entry.userId)
+                        const roleName = userOfEntry?.roleId ? (projectRoles.find((r) => r.id === userOfEntry.roleId)?.name ?? '—') : '—'
                         return (
-                          <tr key={entry.id} style={{ opacity: editingAuditEntry?.id === entry.id ? 0.4 : 1, backgroundColor: rowBg }}>
+                          <tr key={entry.id} style={{ opacity: editingAuditEntry?.id === entry.id ? 0.4 : 1, backgroundColor: effectiveBg }}>
                             <td style={{ padding: '4px 6px' }}>
                               <div style={{ display: 'flex', gap: '3px', alignItems: 'center' }}>
                                 {REVIEW_COLORS.map((rc) => (
@@ -2613,13 +3188,15 @@ export function DashboardPage() {
                             </td>
                             <td>{formatDate(entry.workDate)}</td>
                             <td>{entry.userName}</td>
+                            <td>{areaName}</td>
+                            <td>{roleName}</td>
                             <td>{entry.shiftLabel}</td>
                             <td>{entry.timeIn}</td>
                             <td>{entry.timeOut}</td>
                             <td><strong>{entry.calculation.workedHours}</strong></td>
-                            <td>{entry.calculation.overtimeHours}</td>
-                            <td>{entry.calculation.nightHours}</td>
-                            <td>{(entry.calculation.nightOvertimeHours ?? 0) > 0 ? entry.calculation.nightOvertimeHours : '—'}</td>
+                            <td>{overtimeDay > 0 ? overtimeDay : '—'}</td>
+                            <td>{nightOvertime > 0 ? nightOvertime : '—'}</td>
+                            <td>{(entry.calculation.nightHours ?? 0) > 0 ? entry.calculation.nightHours : '—'}</td>
                             <td>{(entry.calculation.engancheExtraHours ?? 0) > 0 ? entry.calculation.engancheExtraHours : '—'}</td>
                             <td>{(entry.calculation.reengancheExtraHours ?? 0) > 0 ? entry.calculation.reengancheExtraHours : '—'}</td>
                             <td>{(entry.calculation.penaltyHours ?? 0) > 0 ? entry.calculation.penaltyHours : '—'}</td>
@@ -2842,27 +3419,64 @@ export function DashboardPage() {
                   <hr />
                   <h3>Historial de Liquidaciones</h3>
                   <div className="stack">
-                    {settlementsPagination.paged.map((s) => (
-                      <div key={s.id} className="entry-item" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    {settlementsPagination.paged.map((s) => {
+                      const isArchived = !!s.archivedAt
+                      return (
+                      <div key={s.id} className="entry-item" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
                         <div>
                           <strong>{formatDate(s.dateFrom)} → {formatDate(s.dateTo)}</strong>
+                          {isArchived && (
+                            <span
+                              className="chip"
+                              style={{ marginLeft: '8px', background: '#10b981', color: 'white' }}
+                              title={`Archivada permanentemente. ${s.archiveEntriesCount ?? 0} jornadas bloqueadas.`}
+                            >
+                              🗂 Archivada
+                            </span>
+                          )}
                           <br />
                           <span className="muted">
                             {s.lines.length} colaborador{s.lines.length !== 1 ? 'es' : ''} — Total ${s.totalPay.toFixed(2)}
                           </span>
                         </div>
-                        <div className="row" style={{ gap: '6px' }}>
-                          <button className="btn-sm" onClick={() => exportSettlementExcel(s)}>Excel</button>
-                          <button
-                            className="btn-sm danger"
-                            onClick={() => { void handleDeleteSettlement(s.id!) }}
-                            title="Liberar fechas: permite modificar jornadas de este período"
-                          >
-                            Liberar
-                          </button>
+                        <div className="row" style={{ gap: '6px', flexWrap: 'wrap' }}>
+                          {isArchived && s.archiveFileUrl ? (
+                            <a
+                              className="btn-sm"
+                              href={s.archiveFileUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title="Descargar Excel archivado (Liquidación + Detalle)"
+                            >
+                              📥 Descargar archivo
+                            </a>
+                          ) : (
+                            <button className="btn-sm" onClick={() => exportSettlementExcel(s)}>Excel</button>
+                          )}
+                          {!isArchived && (
+                            <>
+                              <button
+                                className="btn-sm"
+                                onClick={() => { void handleArchiveSettlement(s) }}
+                                disabled={settlementLoading}
+                                title="Archivar permanentemente: genera Excel, lo sube a la nube y bloquea las jornadas para siempre"
+                                style={{ background: '#10b981', color: 'white', borderColor: '#10b981' }}
+                              >
+                                🗂 Archivar
+                              </button>
+                              <button
+                                className="btn-sm danger"
+                                onClick={() => { void handleDeleteSettlement(s.id!) }}
+                                title="Liberar fechas: permite modificar jornadas de este período"
+                              >
+                                Liberar
+                              </button>
+                            </>
+                          )}
                         </div>
                       </div>
-                    ))}
+                      )
+                    })}
                   </div>
                   <Pagination
                     totalItems={settlementsPagination.totalItems}
@@ -2912,6 +3526,14 @@ export function DashboardPage() {
               {repairBusy ? 'Reconciliando…' : 'Reconciliar duplicados'}
             </button>
           </nav>
+          {(() => {
+            const lu = formatLastUpdate([...approvedUsers, ...pendingUsers])
+            return lu ? (
+              <p className="muted" style={{ margin: '6px 0 8px', fontSize: '0.78rem' }}>
+                Última actualización: <strong>{lu}</strong>
+              </p>
+            ) : null
+          })()}
 
           {userTab === 'PENDING' && (
             <>
@@ -3303,6 +3925,68 @@ export function DashboardPage() {
         </div>
       )}
 
+      {/* === MODAL: Archivar liquidación — pegar link de Drive === */}
+      {archiveModal && (
+        <div className="modal-overlay" onClick={() => { if (!archiveModal.busy) setArchiveModal(null) }}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>🗂 Archivar liquidación</h3>
+            <p className="muted" style={{ fontSize: '0.9rem' }}>
+              <strong>Paso 1 ✓</strong> El Excel <code>{archiveModal.fileName}</code> se descargó a tu PC.
+            </p>
+            <p style={{ fontSize: '0.9rem' }}>
+              <strong>Paso 2:</strong> Subilo a tu carpeta de Google Drive, hacé clic derecho → <em>Obtener enlace</em>,
+              configurá los permisos como necesites, copiá el link y pegalo abajo.
+            </p>
+            <label style={{ display: 'block', marginTop: '0.5rem' }}>
+              Link de Google Drive
+              <input
+                type="url"
+                placeholder="https://drive.google.com/file/d/..."
+                value={archiveModal.driveUrl}
+                onChange={(e) => setArchiveModal((p) => p ? { ...p, driveUrl: e.target.value } : p)}
+                disabled={archiveModal.busy}
+                style={{ width: '100%' }}
+                autoFocus
+              />
+            </label>
+            <p className="muted" style={{ fontSize: '0.75rem', marginTop: '0.25rem' }}>
+              Debe empezar con <code>https://drive.google.com/</code> o <code>https://docs.google.com/</code>.
+            </p>
+            <div
+              style={{
+                marginTop: '0.75rem',
+                padding: '0.5rem',
+                background: 'rgba(239,68,68,0.06)',
+                border: '1px solid rgba(239,68,68,0.3)',
+                borderRadius: 'var(--radius)',
+                fontSize: '0.8rem',
+              }}
+            >
+              ⚠️ Al confirmar, las <strong>{archiveModal.settlement.lines.length}</strong> líneas y todas las jornadas
+              del rango <strong>{archiveModal.settlement.dateFrom} → {archiveModal.settlement.dateTo}</strong> quedarán
+              <strong> bloqueadas permanentemente</strong>. No se podrán editar ni eliminar (ni siquiera por admins).
+            </div>
+            <div className="row" style={{ gap: '8px', justifyContent: 'flex-end', marginTop: '0.75rem' }}>
+              <button
+                className="btn btn-outline"
+                onClick={() => setArchiveModal(null)}
+                disabled={archiveModal.busy}
+              >
+                Cancelar
+              </button>
+              <button
+                className="btn"
+                onClick={() => { void confirmArchiveWithDriveLink() }}
+                disabled={archiveModal.busy || !archiveModal.driveUrl.trim()}
+                style={{ background: '#10b981', borderColor: '#10b981' }}
+              >
+                {archiveModal.busy ? <><Spinner size={14} inline /> Archivando…</> : 'Confirmar y archivar'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* === MODAL: Editar propia jornada === */}
       {editingEntry && (
         <div className="modal-overlay" onClick={() => setEditingEntry(null)}>
@@ -3324,7 +4008,14 @@ export function DashboardPage() {
               </label>
               <div className="time-grid">
                 <label>Penalties
-                  <select value={editEntryForm.penalties} onChange={(e) => setEditEntryForm((f) => ({ ...f, penalties: Number(e.target.value) }))}>
+                  <select value={editEntryForm.penalties} onChange={(e) => {
+                    const val = Number(e.target.value)
+                    setEditEntryForm((f) => ({ ...f, penalties: val }))
+                    if (val > 0) {
+                      setEditPenaltyReason('')
+                      setShowEditPenaltyReason(true)
+                    }
+                  }}>
                     <option value={0}>0 — Sin penalty</option>
                     <option value={1}>1 penalty</option>
                   </select>

@@ -1,0 +1,36 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // ── Helpers ───────────────────────────────────────────────────────────
+    function isAuthed() {
+      return request.auth != null;
+    }
+    function userDoc() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid));
+    }
+    function isApproved() {
+      return isAuthed() && userDoc().data.approvalStatus == 'APPROVED';
+    }
+    function isAdminRole() {
+      return isAuthed() && userDoc().data.role in ['SUPERUSER', 'PROJECT_ADMIN'];
+    }
+    function isSuperUser() {
+      return isAuthed() && userDoc().data.role == 'SUPERUSER';
+    }
+
+    // ── Archivos de liquidaciones archivadas ─────────────────────────────
+    // Path: archives/{projectId}/{settlementId}.xlsx
+    match /archives/{projectId}/{fileName} {
+      allow read: if isApproved();
+      allow create, update: if isAdminRole()
+        && request.resource.size < 25 * 1024 * 1024
+        && request.resource.contentType.matches('application/vnd\\.openxmlformats.*');
+      allow delete: if isSuperUser();
+    }
+
+    // Por defecto, todo lo demás está denegado.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

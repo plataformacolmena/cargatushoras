@@ -86,7 +86,10 @@ export default defineConfig(({ mode }) => ({
       },
     }),
   ],
-  // Eliminar console.* y debugger en builds de producción para evitar
-  // exponer datos sensibles o información de depuración en el cliente.
-  esbuild: mode === 'production' ? { drop: ['console', 'debugger'] } : {},
+  // Eliminar console.log/debug/info y debugger en builds de producción para
+  // no exponer logs de depuración. Mantenemos console.warn y console.error
+  // porque son críticos para diagnosticar problemas en producción (rule
+  // denials de Firestore, fallos de red, etc.) que de otro modo quedarían
+  // silenciosos para el usuario y para nosotros.
+  esbuild: mode === 'production' ? { pure: ['console.log', 'console.debug', 'console.info'], drop: ['debugger'] } : {},
 }))

@@ -50,6 +50,19 @@ export interface WorkCycle {
 // REINFORCEMENT: el usuario es refuerzo por jornada.
 export type CycleScope = 'IN_CYCLE' | 'OUT_OF_CYCLE' | 'REINFORCEMENT'
 
+// Bloqueo de ediciones a nivel de proyecto.
+// Cuando enabled=true, las entradas con workDate entre dateFrom y dateTo
+// quedan marcadas con lockedByAudit=true y los miembros no pueden
+// editarlas/eliminarlas ni crear nuevas en ese rango (los admins sí).
+export interface AuditLock {
+  projectId: string
+  enabled: boolean
+  dateFrom: string  // YYYY-MM-DD
+  dateTo: string    // YYYY-MM-DD
+  updatedAt?: unknown
+  updatedBy?: string
+}
+
 export interface Project {
   id: string
   name: string
@@ -98,6 +111,9 @@ export interface ProjectConfig {
   //  - 'TODAY_PLUS_ONE': la fecha máxima permitida es hoy + 1 día
   futureDatePolicy?: 'ALLOW' | 'TODAY' | 'TODAY_PLUS_ONE'
   reviewColorLabels?: Record<string, string> // leyenda de colores de revisión por proyecto
+  // Resaltado por exceso de enganche/reenganche en registros y auditoría
+  engancheAlertEnabled?: boolean    // si true, destaca jornadas con enganche/reenganche altos
+  engancheAlertThreshold?: number   // umbral en horas (default 12)
 }
 
 export interface TimeEntryInput {
@@ -132,6 +148,9 @@ export interface TimeEntry extends TimeEntryInput {
   calculationVersion: string
   calculationSource: 'client'
   lockedByAdmin: boolean
+  lockedByAudit?: boolean            // bloqueado por auditoría (impide edición a miembros)
+  archived?: boolean                 // jornada archivada (liquidación cerrada): bloqueada para todos los roles
+  archivedSettlementId?: string      // id de la liquidación que la archivó
   reviewColor?: string               // color de revisión asignado por admin
   // Campos derivados del ciclo laboral del usuario (calculados al guardar/recalcular):
   cycleScope?: CycleScope            // IN_CYCLE | OUT_OF_CYCLE | REINFORCEMENT
@@ -213,6 +232,11 @@ export interface Settlement {
   totalPay: number
   createdAt?: unknown
   createdBy: string
+  archivedAt?: unknown               // si está archivada, fecha del cierre permanente
+  archivedBy?: string                // uid del admin que archivó
+  archiveFilePath?: string           // path en Firebase Storage (archives/{projectId}/{id}.xlsx)
+  archiveFileUrl?: string            // download URL del Excel archivado
+  archiveEntriesCount?: number       // cantidad de jornadas marcadas como archivadas
 }
 
 // ─── Chat / Soporte ──────────────────────────────────────────────────────────

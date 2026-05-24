@@ -17,10 +17,12 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore'
-import { db } from '../firebase'
+import { getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage'
+import { db, storage } from '../firebase'
 import { calcEngancheExtras, calculateEntry, calculateSettlement, getDefaultProjectConfig } from '../lib/calc'
 import type {
   AppRole,
+  AuditLock,
   CycleMode,
   Project,
   ProjectArea,
@@ -459,6 +461,7 @@ export async function saveTimeEntry(
     calculationSource: 'client',
     calculationVersion: CALCULATION_VERSION,
     lockedByAdmin: false,
+    lockedByAudit: false,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
@@ -486,6 +489,7 @@ export async function saveTimeEntryForUser(
     calculationSource: 'client',
     calculationVersion: CALCULATION_VERSION,
     lockedByAdmin: false,
+    lockedByAudit: false,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
@@ -1069,6 +1073,128 @@ export async function deleteSettlement(settlementId: string): Promise<void> {
   await deleteDoc(doc(db, 'settlements', settlementId))
 }
 
+/**
+ * Archiva permanentemente una liquidación:
+ *  1) Sube el Excel (generado por el caller) a Storage en archives/{projectId}/{settlementId}.xlsx
+ *  2) Marca todas las jornadas del rango como archived=true, en batches de 400.
+ *  3) Actualiza el doc settlement con archivedAt, archivedBy, archiveFileUrl, archiveFilePath, archiveEntriesCount.
+ * Una vez archivada, las reglas Firestore impiden editar/eliminar las jornadas y el settlement (excepto SUPERUSER).
+ */
+export async function archiveSettlement(
+  settlementId: string,
+  xlsxBlob: Blob,
+  archivedBy: string,
+): Promise<Settlement> {
+  // 1) Cargar el settlement actual.
+  const settlementRef = doc(db, 'settlements', settlementId)
+  const snap = await getDoc(settlementRef)
+  if (!snap.exists()) throw new Error('La liquidación ya no existe.')
+  const settlement = { id: snap.id, ...(snap.data() as Omit<Settlement, 'id'>) }
+  if (settlement.archivedAt) {
+    throw new Error('Esta liquidación ya está archivada.')
+  }
+
+  // 2) Subir el Excel a Storage.
+  const fileName = `${settlement.id}.xlsx`
+  const filePath = `archives/${settlement.projectId}/${fileName}`
+  const ref = storageRef(storage, filePath)
+  await uploadBytes(ref, xlsxBlob, {
+    contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    customMetadata: {
+      projectId: settlement.projectId,
+      settlementId: settlement.id ?? '',
+      dateFrom: settlement.dateFrom,
+      dateTo: settlement.dateTo,
+    },
+  })
+  const archiveFileUrl = await getDownloadURL(ref)
+
+  // 3) Marcar jornadas del rango como archivadas (batches de 400).
+  const entries = await listAllTimeEntries(settlement.projectId, {
+    dateFrom: settlement.dateFrom,
+    dateTo: settlement.dateTo,
+  })
+  let archivedCount = 0
+  for (let i = 0; i < entries.length; i += 400) {
+    const chunk = entries.slice(i, i + 400)
+    const batch = writeBatch(db)
+    for (const e of chunk) {
+      if (e.archived) continue
+      batch.update(doc(db, 'time_entries', e.id), {
+        archived: true,
+        archivedSettlementId: settlement.id,
+        updatedAt: serverTimestamp(),
+      })
+      archivedCount += 1
+    }
+    await batch.commit()
+  }
+
+  // 4) Actualizar el settlement con metadatos del archivo.
+  const archiveMeta = {
+    archivedAt: serverTimestamp(),
+    archivedBy,
+    archiveFilePath: filePath,
+    archiveFileUrl,
+    archiveEntriesCount: archivedCount,
+  }
+  await updateDoc(settlementRef, archiveMeta)
+
+  return { ...settlement, ...archiveMeta, archivedAt: new Date() }
+}
+
+/**
+ * Archiva una liquidación usando un link externo (Google Drive, OneDrive, etc.).
+ * No sube ningún archivo a Firebase Storage — el caller ya descargó el Excel y lo subió manualmente a su Drive.
+ * Marca jornadas como archivadas y guarda el link en el doc.
+ */
+export async function archiveSettlementWithDriveLink(
+  settlementId: string,
+  driveUrl: string,
+  fileName: string,
+  archivedBy: string,
+): Promise<Settlement> {
+  const settlementRef = doc(db, 'settlements', settlementId)
+  const snap = await getDoc(settlementRef)
+  if (!snap.exists()) throw new Error('La liquidación ya no existe.')
+  const settlement = { id: snap.id, ...(snap.data() as Omit<Settlement, 'id'>) }
+  if (settlement.archivedAt) {
+    throw new Error('Esta liquidación ya está archivada.')
+  }
+
+  // Marcar jornadas del rango como archivadas (batches de 400).
+  const entries = await listAllTimeEntries(settlement.projectId, {
+    dateFrom: settlement.dateFrom,
+    dateTo: settlement.dateTo,
+  })
+  let archivedCount = 0
+  for (let i = 0; i < entries.length; i += 400) {
+    const chunk = entries.slice(i, i + 400)
+    const batch = writeBatch(db)
+    for (const e of chunk) {
+      if (e.archived) continue
+      batch.update(doc(db, 'time_entries', e.id), {
+        archived: true,
+        archivedSettlementId: settlement.id,
+        updatedAt: serverTimestamp(),
+      })
+      archivedCount += 1
+    }
+    await batch.commit()
+  }
+
+  const archiveMeta = {
+    archivedAt: serverTimestamp(),
+    archivedBy,
+    archiveFilePath: `external:drive/${fileName}`,
+    archiveFileUrl: driveUrl,
+    archiveEntriesCount: archivedCount,
+  }
+  await updateDoc(settlementRef, archiveMeta)
+
+  return { ...settlement, ...archiveMeta, archivedAt: new Date() }
+}
+
 export async function listSettlements(projectId: string): Promise<Settlement[]> {
   const q = query(
     collection(db, 'settlements'),
@@ -1110,9 +1236,17 @@ export async function listAllTimeEntries(
 
 export function subscribeToProjects(callback: (projects: Project[]) => void): () => void {
   const q = query(collection(db, 'projects'), where('active', '==', true), orderBy('name'))
-  return onSnapshot(q, (snap) => {
-    callback(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Project, 'id'>) })))
-  })
+  return onSnapshot(
+    q,
+    (snap) => {
+      callback(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Project, 'id'>) })))
+    },
+    (err) => {
+      // Surface rule denials / index errors that otherwise quedan silenciosos.
+      console.error('[subscribeToProjects] onSnapshot error:', err)
+      callback([])
+    },
+  )
 }
 
 export function subscribeToMyEntries(
@@ -1210,9 +1344,26 @@ export function subscribeToProjectUsers(
     where('projectId', '==', projectId),
   )
   return onSnapshot(q, (snap) => {
-    const users = snap.docs
+    const all = snap.docs
       .map((d) => d.data() as UserProfile)
       .filter((u) => !u.mergedToUid)
+    // Dedupe por email normalizado (en minúsculas, sin espacios). Mantiene el más
+    // recientemente actualizado para evitar nombres repetidos en los selectores.
+    const byEmail = new Map<string, UserProfile>()
+    const noEmail: UserProfile[] = []
+    for (const u of all) {
+      const key = (u.email ?? '').trim().toLowerCase()
+      if (!key) { noEmail.push(u); continue }
+      const existing = byEmail.get(key)
+      if (!existing) {
+        byEmail.set(key, u)
+      } else {
+        const tsA = (u.updatedAt as { toMillis?: () => number } | undefined)?.toMillis?.() ?? 0
+        const tsB = (existing.updatedAt as { toMillis?: () => number } | undefined)?.toMillis?.() ?? 0
+        if (tsA > tsB) byEmail.set(key, u)
+      }
+    }
+    const users = [...byEmail.values(), ...noEmail]
       .sort((a, b) => (a.displayName ?? '').localeCompare(b.displayName ?? ''))
     callback(users)
   })
@@ -1620,6 +1771,68 @@ export async function listUsersWithoutEntries(
     }))
     .filter((row) => row.daysWithEntries === 0)
     .sort((a, b) => (a.user.displayName ?? '').localeCompare(b.user.displayName ?? ''))
+}
+
+// ─── Auditoría: bloqueo de ediciones (audit_locks/{projectId}) ─────────────
+
+export async function getAuditLock(projectId: string): Promise<AuditLock | null> {
+  const snap = await getDoc(doc(db, 'audit_locks', projectId))
+  if (!snap.exists()) return null
+  return { projectId, ...(snap.data() as Omit<AuditLock, 'projectId'>) }
+}
+
+export function subscribeToAuditLock(
+  projectId: string,
+  callback: (lock: AuditLock | null) => void,
+): () => void {
+  return onSnapshot(doc(db, 'audit_locks', projectId), (snap) => {
+    if (!snap.exists()) {
+      callback(null)
+    } else {
+      callback({ projectId, ...(snap.data() as Omit<AuditLock, 'projectId'>) })
+    }
+  })
+}
+
+/** Activa o desactiva el bloqueo de ediciones para el proyecto en un rango de fechas.
+ *  Cuando se activa: marca lockedByAudit=true en todas las entradas existentes del rango.
+ *  Cuando se desactiva: marca lockedByAudit=false en las entradas del rango previamente bloqueadas.
+ *  Devuelve la cantidad de entradas afectadas.
+ */
+export async function setAuditLockEnabled(
+  projectId: string,
+  opts: { enabled: boolean; dateFrom: string; dateTo: string; updatedBy: string },
+): Promise<number> {
+  const { enabled, dateFrom, dateTo, updatedBy } = opts
+  if (!DATE_RE.test(dateFrom) || !DATE_RE.test(dateTo)) {
+    throw new Error('Fechas inválidas (formato esperado YYYY-MM-DD)')
+  }
+  if (dateFrom > dateTo) {
+    throw new Error('La fecha desde no puede ser mayor que la fecha hasta.')
+  }
+
+  // 1) Persistir el documento del lock
+  await setDoc(
+    doc(db, 'audit_locks', projectId),
+    { projectId, enabled, dateFrom, dateTo, updatedBy, updatedAt: serverTimestamp() },
+    { merge: true },
+  )
+
+  // 2) Actualizar entradas en rango
+  const entries = await listAllTimeEntries(projectId, { dateFrom, dateTo })
+  const toUpdate = entries.filter((e) => (e.lockedByAudit ?? false) !== enabled)
+
+  for (let i = 0; i < toUpdate.length; i += 400) {
+    const batch = writeBatch(db)
+    for (const entry of toUpdate.slice(i, i + 400)) {
+      batch.update(doc(db, 'time_entries', entry.id), {
+        lockedByAudit: enabled,
+        updatedAt: serverTimestamp(),
+      })
+    }
+    await batch.commit()
+  }
+  return toUpdate.length
 }
 
 
