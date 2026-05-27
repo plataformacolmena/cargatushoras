@@ -80,12 +80,16 @@ export function calculateEntry(
   const regularHours  = round2(Math.min(workedHours, config.regularDailyHours))
   const overtimeHours = round2(Math.max(0, workedHours - config.regularDailyHours))
 
-  // Horas nocturnas: todas las horas del turno que caen en la ventana nocturna
-  const nightHours = round2(calcNightOverlapHours(start, end, config))
-
   // Nocturnidad doble: horas EXTRA que caen en la ventana nocturna
   const overtimeStart = start + config.regularDailyHours * 60
   const nightOvertimeHours = round2(calcNightOverlapHours(Math.max(start, overtimeStart), end, config))
+
+  // Horas nocturnas: TODA la porción nocturna del turno (incluye las que además
+  // son extras). `nightOvertimeHours` es un subconjunto informativo de
+  // `nightHours` (las nocturnas que también son extras). El pago se calcula
+  // sobre `nightHours` para no duplicar; el subset solo se usa para mostrar
+  // y aplicar el recargo adicional en `extraPayUnits` si la política lo pide.
+  const nightHours = round2(calcNightOverlapHours(start, end, config))
 
   // Penalties
   const penaltyHours = round2((opts?.penalties ?? 0) * (config.penaltyHours || 0))
@@ -314,6 +318,9 @@ export function calculateSettlement(
     // Acumulado para pago, aplicando multiplicador de jornada adicional cuando corresponda.
     existing.regularPaid   += reg * m
     existing.overtimePaid  += ot * m
+    // `nightPaid` paga TODAS las horas nocturnas (que ya incluyen las extras
+    // nocturnas) con `nightAdditionalMultiplier`. NO se suma `noh` porque
+    // estaría dentro de `nh`.
     existing.nightPaid     += nh * m
     existing.penaltyPaid   += pen * m
     if (e.isJornadaAdicional) existing.jornadaAdicionalCount += 1

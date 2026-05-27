@@ -1,3 +1,54 @@
+// ─── Recordatorios de jornada ─────────────────────────────────────────────
+export interface Reminder {
+  projectId: string
+  userId: string
+  workDate: string // YYYY-MM-DD
+  createdBy: string // uid del admin que lo envió
+  createdAt: any
+}
+
+/** Crea un recordatorio para un usuario y fecha. */
+export async function createReminder(projectId: string, userId: string, workDate: string, createdBy: string) {
+  const id = `${userId}_${workDate}`
+  const ref = doc(collection(db, 'reminders', projectId, 'items'), id)
+  await setDoc(ref, {
+    projectId,
+    userId,
+    workDate,
+    createdBy,
+    createdAt: serverTimestamp(),
+  })
+}
+
+/** Elimina el recordatorio (cuando el usuario informa la jornada). */
+export async function deleteReminder(projectId: string, userId: string, workDate: string) {
+  const id = `${userId}_${workDate}`
+  const ref = doc(collection(db, 'reminders', projectId, 'items'), id)
+  await deleteDoc(ref)
+}
+
+/** Obtiene todos los recordatorios pendientes para un usuario. */
+export async function listRemindersForUser(projectId: string, userId: string): Promise<Reminder[]> {
+  const q = query(collection(db, 'reminders', projectId, 'items'), where('userId', '==', userId))
+  const snap = await getDocs(q)
+  return snap.docs.map((d) => d.data() as Reminder)
+}
+
+/** Obtiene todos los recordatorios pendientes del proyecto en una sola consulta.
+ *  Pensado para que el admin compute el estado "Recordado" de muchos usuarios
+ *  con UNA sola lectura en lugar de N (una por usuario). */
+export async function listRemindersForProject(projectId: string): Promise<Reminder[]> {
+  const snap = await getDocs(collection(db, 'reminders', projectId, 'items'))
+  return snap.docs.map((d) => d.data() as Reminder)
+}
+
+/** Suscripción en tiempo real a recordatorios de un usuario. */
+export function subscribeToRemindersForUser(projectId: string, userId: string, cb: (reminders: Reminder[]) => void) {
+  const q = query(collection(db, 'reminders', projectId, 'items'), where('userId', '==', userId))
+  return onSnapshot(q, (snap) => {
+    cb(snap.docs.map((d) => d.data() as Reminder))
+  })
+}
 import {
   addDoc,
   collection,

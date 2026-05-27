@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import * as XLSX from 'xlsx'
 import { useAuth } from '../auth/useAuth'
-import { SupportChatPanel } from '../components/SupportChatPanel'
+import { SupportTicketsPanel } from '../components/SupportTicketsPanel'
 import { Pagination, usePagedItems } from '../components/Pagination'
 import { LoadingOverlay, Spinner } from '../components/Spinner'
 import { OnlineStatusIndicator } from '../components/OnlineStatusIndicator'
@@ -38,7 +38,7 @@ import {
   setEntryReviewColor,
   setUserAuditReviewColor,
   setAuditLockEnabled,
-  subscribeToAuditLock,
+  getAuditLock,
   setUserRole,
   listApprovedUsers,
   listPendingUsers,
@@ -48,7 +48,7 @@ import {
   subscribeToMaintenance,
   setMaintenanceMode,
   type MaintenanceState,
-  subscribeToProjectUsers,
+  listProjectUsers,
   subscribeToProjects,
   listUsersWithoutEntries,
   type NoReportUserRow,
@@ -62,7 +62,16 @@ import {
   updateTimeEntry,
   updateUserProfileAdmin,
   recalculateUserEntries,
+  createReminder,
+  deleteReminder,
+  listRemindersForUser,
+  listRemindersForProject,
 } from '../services/firestore'
+
+
+
+// ...otros imports y tipos
+import type { Reminder } from '../services/firestore'
 import type {
   AppRole,
   AuditLock,
@@ -225,6 +234,10 @@ const PROJECT_TABS = ['PROJECT_CONFIG', 'TIME_ENTRY_FORM', 'TIME_ENTRY_TABLE', '
 const USER_TABS = ['PENDING', 'APPROVED'] as const
 
 export function DashboardPage() {
+    // Estado para recordatorios de usuarios sin informar (vista admin).
+    const [userReminders, setUserReminders] = useState<{ [uid: string]: Reminder[] }>({})
+    // Recordatorios pendientes para el usuario actual (vista usuario).
+    const [myReminders, setMyReminders] = useState<Reminder[]>([])
   const { profile, signOutUser, user } = useAuth()
   const toastIdRef = useRef(0)
   const [toasts, setToasts] = useState<Toast[]>([])
@@ -241,6 +254,10 @@ export function DashboardPage() {
   const [activeProjectId, setActiveProjectId] = useState('')
   const [entries, setEntries] = useState<TimeEntry[]>([])
   const [entriesLoading, setEntriesLoading] = useState(false)
+  // Indica si el usuario ya consultó las jornadas al menos una vez en el
+  // contexto actual (proyecto/perfil). Mientras sea false, la tabla muestra
+  // un CTA "Refrescar" y no se hacen lecturas automáticas a Firestore.
+  const [entriesLoadedOnce, setEntriesLoadedOnce] = useState(false)
   const [pendingUsers, setPendingUsers] = useState<UserProfile[]>([])
   const [approvedUsers, setApprovedUsers] = useState<UserProfile[]>([])
   const [importedMembers, setImportedMembers] = useState<UserProfile[]>([])
@@ -319,7 +336,8 @@ export function DashboardPage() {
   // Admin: cargar jornadas para otros usuarios
   const [projectUsers, setProjectUsers] = useState<UserProfile[]>([])
   const [adminEntryUserId, setAdminEntryUserId] = useState('')
-  const [adminEntryForm, setAdminEntryForm] = useState<Omit<TimeEntryInput, 'projectId'>>({ workDate: '', shiftLabel: '', timeIn: '', timeOut: '', notes: '', penalties: 0, isJornadaAdicional: false })
+  const [adminEntryForm, setAdminEntryForm] = useState<Omit<TimeEntryInput, 'projectId'>>({
+    workDate: '', shiftLabel: '', timeIn: '', timeOut: '', notes: '', penalties: 0, isJornadaAdicional: false })
 
   // Roles del proyecto activo
   const [projectRoles, setProjectRoles] = useState<ProjectRole[]>([])
@@ -402,9 +420,10 @@ export function DashboardPage() {
     if (activeProjectId) writeLS('activeProjectId', activeProjectId)
   }, [activeProjectId])
 
-  // Carga one-shot de jornadas (sin onSnapshot). Se invoca al montar la
-  // pestaña de proyectos, al cambiar de proyecto y manualmente desde el
-  // botón "Refrescar" o tras una mutación (crear/editar/eliminar).
+  // Carga one-shot de jornadas (sin onSnapshot). Se invoca SOLO de forma
+  // explícita: al pulsar el botón "Refrescar" o tras una mutación
+  // (crear/editar/eliminar). Para reducir lecturas a Firestore, ya no se
+  // ejecuta automáticamente al abrir el dashboard ni al cambiar de proyecto.
   const loadEntries = useCallback(async () => {
     const currentProfile = profile
     if (!currentProfile || !activeProjectId) {
@@ -425,6 +444,7 @@ export function DashboardPage() {
       }
       const loaded = await listAllTimeEntries(activeProjectId, filters)
       setEntries(loaded)
+      setEntriesLoadedOnce(true)
     } catch (err) {
       console.error('[loadEntries] error:', err)
       showToast(`Error al cargar horarios: ${err instanceof Error ? err.message : 'Desconocido'}`, 'error')
@@ -433,36 +453,46 @@ export function DashboardPage() {
     }
   }, [activeProjectId, profile])
 
+  // Al cambiar de proyecto o de identidad/área, limpiar la lista local y
+  // marcarla como "no consultada". No disparamos `loadEntries()`: el usuario
+  // debe pulsar Refrescar explícitamente para reducir lecturas a Firestore.
   useEffect(() => {
+    setEntries([])
+    setEntriesLoadedOnce(false)
+  }, [activeProjectId, profile?.uid, profile?.role, profile?.areaId])
+  // Carga one-shot de usuarios del proyecto (form admin en auditoría).
+  // Sin listener: se refresca tras mutaciones (aprobar/editar/asignar área).
+  const loadProjectUsers = useCallback(async () => {
     const currentProfile = profile
-    if (!currentProfile || !activeProjectId) return
-    // Solo cargar cuando el usuario está en la pestaña de proyectos.
-    // En USERS / HELP / PROJECT_MANAGEMENT no se necesita.
-    if (mainTab !== 'PROJECTS') return
-    // Cambiamos onSnapshot por fetch one-shot (getDocs) para reducir lecturas.
-    // El usuario refresca con el botón "Refrescar" o automáticamente tras crear/editar/eliminar.
-    void loadEntries()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProjectId, profile?.uid, profile?.role, profile?.areaId, mainTab])
-  // Suscripción en tiempo real a usuarios del proyecto (formulario admin en auditoría)
-  useEffect(() => {
-    const currentProfile = profile
-    if (!currentProfile || !canAudit(currentProfile.role) || !activeProjectId) return
-    return subscribeToProjectUsers(activeProjectId, setProjectUsers)
+    if (!currentProfile || !canAudit(currentProfile.role) || !activeProjectId) {
+      setProjectUsers([])
+      return
+    }
+    try {
+      const users = await listProjectUsers(activeProjectId)
+      setProjectUsers(users)
+    } catch (err) {
+      console.error('[loadProjectUsers] error:', err)
+    }
   }, [activeProjectId, profile])
+  useEffect(() => { void loadProjectUsers() }, [loadProjectUsers])
 
-  // Suscripción al bloqueo de ediciones del proyecto activo
-  useEffect(() => {
+  // Carga one-shot del bloqueo de ediciones del proyecto activo.
+  // Sin listener: se refresca tras activar/desactivar el lock.
+  const loadAuditLock = useCallback(async () => {
     if (!activeProjectId) {
       setAuditLock(null)
       return
     }
-    return subscribeToAuditLock(activeProjectId, (lock) => {
+    try {
+      const lock = await getAuditLock(activeProjectId)
       setAuditLock(lock)
-      // Prellenar el form con los últimos valores almacenados
       if (lock) setAuditLockForm({ dateFrom: lock.dateFrom, dateTo: lock.dateTo })
-    })
+    } catch (err) {
+      console.error('[loadAuditLock] error:', err)
+    }
   }, [activeProjectId])
+  useEffect(() => { void loadAuditLock() }, [loadAuditLock])
 
   useEffect(() => {
     if (!activeProjectId) return
@@ -493,11 +523,14 @@ export function DashboardPage() {
     void listSettlements(activeProjectId).then(setPastSettlements)
   }, [activeProjectId, projectTab])
 
+  // Diferido: solo cargar la lista de todos los proyectos cuando el admin
+  // entra a la pestaña "Gestión de proyectos". Reduce lecturas al abrir.
   useEffect(() => {
     const currentProfile = profile
     if (!currentProfile || !canSeeProjectAdmin(currentProfile.role)) return
+    if (mainTab !== 'PROJECT_MANAGEMENT') return
     void listAllProjects().then(setAllProjects)
-  }, [profile])
+  }, [profile, mainTab])
 
   // Carga one-shot de usuarios aprobados/pendientes/placeholders (con botón Refrescar)
   const loadUsersPanels = useCallback(async () => {
@@ -624,12 +657,14 @@ export function DashboardPage() {
     void listProjectRoles(editingUser.projectId).then(setEditUserRoles)
   }, [editingUser?.projectId])
 
-  // Carga templates al montar
+  // Diferido: solo cargar las plantillas cuando el admin entra a la pestaña
+  // "Gestión de proyectos" (que es donde se renderizan).
   useEffect(() => {
     const currentProfile = profile
     if (!currentProfile || !canSeeConfig(currentProfile.role)) return
+    if (mainTab !== 'PROJECT_MANAGEMENT') return
     void listProjectTemplates().then(setTemplates)
-  }, [profile])
+  }, [profile, mainTab])
 
   const activeProjectName = useMemo(() => {
     return projects.find((p) => p.id === activeProjectId)?.name || 'Sin proyecto'
@@ -902,11 +937,11 @@ export function DashboardPage() {
       'Hs. Normales': s.lines.reduce((a, l) => a + l.regularHours, 0),
       'Hs. Extras': s.lines.reduce((a, l) => a + l.overtimeHours, 0),
       'Hs. Nocturnas': s.lines.reduce((a, l) => a + l.nightHours, 0),
-      'Hs. Noct. Extras': s.lines.reduce((a, l) => a + l.nightOvertimeHours, 0),
-      'Hs. Enganche': s.lines.reduce((a, l) => a + l.engancheExtraHours, 0),
-      'Hs. Reenganche': s.lines.reduce((a, l) => a + l.reengancheExtraHours, 0),
-      '6to día': s.lines.reduce((a, l) => a + l.jornadaAdicionalCount, 0),
-      Penalties: s.lines.reduce((a, l) => a + l.penaltyHours, 0),
+      'Hs. Noct. Extras': s.lines.reduce((a, l) => a + (l.nightOvertimeHours ?? 0), 0),
+      'Hs. Enganche': s.lines.reduce((a, l) => a + (l.engancheExtraHours ?? 0), 0),
+      'Hs. Reenganche': s.lines.reduce((a, l) => a + (l.reengancheExtraHours ?? 0), 0),
+      '6to día': s.lines.reduce((a, l) => a + (l.jornadaAdicionalCount ?? 0), 0),
+      Penalties: s.lines.reduce((a, l) => a + (l.penaltyHours ?? 0), 0),
       'Total Hs.': s.lines.reduce((a, l) => a + l.totalHours, 0),
       '$/h': 0,
       'Pago Normal ($)': s.lines.reduce((a, l) => a + l.regularPay, 0),
@@ -1206,6 +1241,10 @@ export function DashboardPage() {
         { ...form, projectId: activeProjectId },
         { uid: currentProfile.uid, displayName: currentProfile.displayName, areaId: currentProfile.areaId },
       )
+      // Si esta fecha tenía un recordatorio pendiente, lo limpiamos.
+      try { await deleteReminder(activeProjectId, currentProfile.uid, form.workDate) } catch { /* noop */ }
+      // Actualización optimista del banner (ya no hay listener en tiempo real).
+      setMyReminders((prev) => prev.filter((r) => r.workDate !== form.workDate))
       showToast('Horario guardado correctamente.')
       setForm((prev) => ({ ...prev, notes: '' }))
       void loadEntries()
@@ -1352,6 +1391,13 @@ export function DashboardPage() {
         { ...adminEntryForm, projectId: activeProjectId },
         targetUser,
       )
+      // Si esta fecha tenía un recordatorio pendiente para el usuario destino, lo limpiamos.
+      try { await deleteReminder(activeProjectId, targetUser.uid, adminEntryForm.workDate) } catch { /* noop */ }
+      // Actualización optimista local (ya no hay listener en tiempo real).
+      setUserReminders((prev) => {
+        const list = (prev[targetUser.uid] ?? []).filter((r) => r.workDate !== adminEntryForm.workDate)
+        return { ...prev, [targetUser.uid]: list }
+      })
       showToast(`Jornada cargada para ${targetUser.displayName ?? 'usuario'}.`)
       setAdminEntryForm({ workDate: '', shiftLabel: '', timeIn: '', timeOut: '', notes: '', penalties: 0, isJornadaAdicional: false })
       setAdminEntryUserId('')
@@ -1808,6 +1854,8 @@ export function DashboardPage() {
         updatedBy: currentProfile.uid,
       })
       showToast(targetEnabled ? `Bloqueo activado (${count} jornadas marcadas).` : `Bloqueo desactivado (${count} jornadas liberadas).`)
+      // Refrescar el lock localmente (ya no hay listener en tiempo real).
+      void loadAuditLock()
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Error al cambiar el bloqueo.', 'error')
       console.error(err)
@@ -1838,6 +1886,62 @@ export function DashboardPage() {
       setNoReportLoading(false)
     }
   }
+
+  // One-shot: cargar TODOS los recordatorios del proyecto en una sola consulta
+  // cuando cambia la lista "Usuarios sin informar". Antes manteníamos N
+  // listeners (uno por uid); ahora es 1 lectura sin tiempo real.
+  useEffect(() => {
+    if (!activeProjectId || noReportRows.length === 0) {
+      setUserReminders({})
+      return
+    }
+    const projectId = activeProjectId
+    let cancelled = false
+    void (async () => {
+      try {
+        const all = await listRemindersForProject(projectId)
+        if (cancelled) return
+        const byUid: Record<string, typeof all> = {}
+        for (const r of all) {
+          if (!byUid[r.userId]) byUid[r.userId] = []
+          byUid[r.userId].push(r)
+        }
+        setUserReminders(byUid)
+      } catch (err) {
+        if (!cancelled) console.error('[loadRemindersForProject] error:', err)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [activeProjectId, noReportRows])
+
+  // One-shot: recordatorios del usuario actual al montar + cuando la pestaña
+  // vuelve a estar visible (visibilitychange). Sin listener permanente.
+  useEffect(() => {
+    if (!activeProjectId || !profile?.uid) {
+      setMyReminders([])
+      return
+    }
+    const projectId = activeProjectId
+    const uid = profile.uid
+    let cancelled = false
+    const fetchOnce = async () => {
+      try {
+        const reminders = await listRemindersForUser(projectId, uid)
+        if (cancelled) return
+        const sorted = [...reminders].sort((a, b) => a.workDate.localeCompare(b.workDate))
+        setMyReminders(sorted)
+      } catch (err) {
+        if (!cancelled) console.error('[loadMyReminders] error:', err)
+      }
+    }
+    void fetchOnce()
+    const onVisible = () => { if (document.visibilityState === 'visible') void fetchOnce() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      cancelled = true
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [activeProjectId, profile?.uid])
 
   async function handleSetUserAuditColor(uid: string, color: string) {
     setNoReportRows((prev) =>
@@ -1891,6 +1995,38 @@ export function DashboardPage() {
           </div>
         </div>
       </header>
+
+      {myReminders.length > 0 && (
+        <section
+          className="card"
+          role="alert"
+          aria-live="polite"
+          style={{
+            background: '#fff7ed',
+            border: '1px solid #fdba74',
+            color: '#7c2d12',
+            padding: '12px 16px',
+            marginBottom: '1rem',
+          }}
+        >
+          <strong style={{ display: 'block', marginBottom: 4 }}>
+            {myReminders.length === 1
+              ? 'Tenés una jornada pendiente de informar'
+              : `Tenés ${myReminders.length} jornadas pendientes de informar`}
+          </strong>
+          <p style={{ margin: '0 0 6px' }}>
+            Por favor cargá la jornada para {myReminders.length === 1 ? 'la fecha' : 'las fechas'}:
+          </p>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {myReminders.map((r) => (
+              <li key={r.workDate}><strong>{r.workDate}</strong></li>
+            ))}
+          </ul>
+          <p className="muted" style={{ margin: '6px 0 0', fontSize: '0.85em' }}>
+            Este aviso desaparecerá automáticamente cuando informes la jornada.
+          </p>
+        </section>
+      )}
 
       <section className="project-switcher card">
         <label>
@@ -2672,7 +2808,13 @@ export function DashboardPage() {
                 </div>
               </div>
               {entries.length === 0 ? (
-                <p className="muted">No hay registros para este proyecto.</p>
+                !entriesLoadedOnce ? (
+                  <p className="muted">
+                    Tocá <strong>Refrescar</strong> para consultar los horarios. (Para reducir lecturas a la base, ya no se cargan automáticamente al abrir.)
+                  </p>
+                ) : (
+                  <p className="muted">No hay registros para este proyecto.</p>
+                )
               ) : (
                 <>
                 {(() => {
@@ -2895,6 +3037,7 @@ export function DashboardPage() {
                           <th>Email</th>
                           <th>Área</th>
                           <th>Días sin informar</th>
+                          <th>Acción</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -2919,6 +3062,34 @@ export function DashboardPage() {
                               <td>{row.user.email ?? '—'}</td>
                               <td>{areaName}</td>
                               <td><strong>{row.totalDaysInRange}</strong></td>
+                              <td style={{ whiteSpace: 'nowrap' }}>
+                                <button
+                                  className="btn btn-outline"
+                                  style={{ fontSize: '0.85em', padding: '2px 10px' }}
+                                  disabled={!!(userReminders[row.user.uid]?.length) || !activeProjectId}
+                                  onClick={async () => {
+                                    if (!activeProjectId) return
+                                    try {
+                                      await createReminder(activeProjectId, row.user.uid, noReportFilters.dateFrom, currentProfile.uid)
+                                      // Actualización optimista local (ya no hay listener en tiempo real).
+                                      setUserReminders((prev) => ({
+                                        ...prev,
+                                        [row.user.uid]: [
+                                          ...(prev[row.user.uid] ?? []),
+                                          { projectId: activeProjectId, userId: row.user.uid, workDate: noReportFilters.dateFrom, createdBy: currentProfile.uid, createdAt: null },
+                                        ],
+                                      }))
+                                      showToast(`Recordatorio enviado a ${row.user.displayName ?? 'usuario'}.`)
+                                    } catch (err) {
+                                      showToast('Error al enviar el recordatorio.', 'error')
+                                      console.error(err)
+                                    }
+                                  }}
+                                  title={userReminders[row.user.uid]?.length ? 'Ya se envió recordatorio' : 'Enviar recordatorio'}
+                                >
+                                  {userReminders[row.user.uid]?.length ? 'Recordado' : 'Recordar'}
+                                </button>
+                              </td>
                             </tr>
                           )
                         })}
@@ -3521,7 +3692,7 @@ export function DashboardPage() {
               className="btn-sm btn-outline"
               disabled={repairBusy}
               onClick={() => { void handleRepairMerged() }}
-              title="Reconcilia usuarios duplicados por email: copia campos faltantes, reasigna entries y marca el duplicado como fusionado"
+              title="Reconciliar usuarios duplicados por email: copia campos faltantes, reasigna entries y marca el duplicado como fusionado"
             >
               {repairBusy ? 'Reconciliando…' : 'Reconciliar duplicados'}
             </button>
@@ -3775,15 +3946,14 @@ export function DashboardPage() {
           <section className="card">
             <h2>Soporte</h2>
             {activeProjectId ? (
-              <SupportChatPanel
+              <SupportTicketsPanel
                 viewer={currentProfile}
                 projectId={activeProjectId}
                 projectName={activeProjectName}
-                areas={areas}
                 showToast={showToast}
               />
             ) : (
-              <p className="muted">Seleccioná un proyecto para usar el chat de soporte.</p>
+              <p className="muted">Seleccioná un proyecto para enviar una consulta de soporte.</p>
             )}
           </section>
 
@@ -3791,7 +3961,7 @@ export function DashboardPage() {
           <h2>Ayuda y guía de uso</h2>
 
           <h3>¿Qué es Cargá tus horas?</h3>
-          <p>Sistema de registro y liquidación de jornadas laborales por proyecto. Cada colaborador carga sus horarios de entrada y salida, el sistema calcula horas regulares, extras y nocturnas según la configuración del proyecto, y los administradores pueden auditar, editar y generar liquidaciones.</p>
+          <p>Sistema de registro y liquidación de jornadas laborales por proyecto. Cada colaborador carga sus propias jornadas, consulta su historial y edita o elimina sus registros mientras no estén bloqueados por un administrador. Puede iniciar conversaciones de soporte.</p>
 
           <hr />
 

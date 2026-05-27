@@ -293,5 +293,70 @@ service cloud.firestore {
           (isApproved() && resource.data.senderUid == request.auth.uid);
       }
     }
+
+    // ─── Recordatorios de jornada ────────────────────────────────────────
+    // Estructura: /reminders/{projectId}/items/{reminderId}
+    // El admin crea recordatorios para que un usuario informe una jornada
+    // pendiente; el banner del usuario los muestra hasta que él (o el admin)
+    // carga la jornada de esa fecha, momento en el cual el cliente borra el
+    // documento.
+    match /reminders/{projectId}/items/{reminderId} {
+      // Read: cualquier usuario aprobado. El doc solo contiene { projectId,
+      // userId, workDate, createdBy, createdAt } — no hay información
+      // sensible. El admin lee todos para mostrar el estado del botón
+      // "Recordar/Recordado"; el usuario destinatario filtra por su propio
+      // userId para mostrar su banner.
+      allow read: if isApproved();
+
+      // Create: solo admins. Campos validados.
+      allow create: if isAdminRole() &&
+        request.resource.data.projectId == projectId &&
+        request.resource.data.userId is string &&
+        request.resource.data.workDate is string &&
+        request.resource.data.createdBy == request.auth.uid;
+
+      // Update: no se permiten ediciones (el flujo solo crea o borra).
+      allow update: if false;
+
+      // Delete: admin (cuando carga la jornada por el usuario o lo quiere
+      // limpiar manualmente) o el propio usuario (al cargar su jornada).
+      allow delete: if isAdminRole() ||
+        (isApproved() && resource.data.userId == request.auth.uid);
+    }
+
+    // ─── Tickets de soporte ──────────────────────────────────────────────
+    // Estructura: /support_tickets/{projectId}/items/{ticketId}
+    // Reemplaza al chat de soporte: el usuario envía un ticket (1 escritura)
+    // y los admins lo listan bajo demanda. Sin listeners permanentes.
+    match /support_tickets/{projectId}/items/{ticketId} {
+      // Read: solo admins del proyecto correspondiente (o SUPERUSER).
+      // Members NO listan tickets (UX: el usuario solo envía y recibe
+      // respuesta por email/whatsapp del admin).
+      allow read: if isSuperUser() ||
+        (isApproved() &&
+          requester().data.role == 'PROJECT_ADMIN' &&
+          requester().data.projectId == projectId);
+
+      // Create: cualquier usuario aprobado puede crear su propio ticket.
+      allow create: if isApproved() &&
+        request.resource.data.projectId == projectId &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.subject is string &&
+        request.resource.data.subject.size() > 0 &&
+        request.resource.data.subject.size() <= 200 &&
+        request.resource.data.body is string &&
+        request.resource.data.body.size() > 0 &&
+        request.resource.data.body.size() <= 4000 &&
+        request.resource.data.status == 'open';
+
+      // Update: solo admins del proyecto (cerrar/reabrir).
+      allow update: if isSuperUser() ||
+        (isApproved() &&
+          requester().data.role == 'PROJECT_ADMIN' &&
+          requester().data.projectId == projectId);
+
+      // Delete: solo SUPERUSER.
+      allow delete: if isSuperUser();
+    }
   }
 }
