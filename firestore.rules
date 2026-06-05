@@ -39,7 +39,13 @@ service cloud.firestore {
         request.auth.uid == uid &&
         request.resource.data.role == resource.data.role &&
         request.resource.data.approvalStatus == resource.data.approvalStatus &&
-        request.resource.data.get('cycleMode', 'CYCLE') == resource.data.get('cycleMode', 'CYCLE')
+        request.resource.data.get('cycleMode', 'CYCLE') == resource.data.get('cycleMode', 'CYCLE') &&
+        // El propio usuario solo puede SETEAR el idNumber si aún no tiene uno;
+        // no puede modificarlo después (esto lo hace solo un admin).
+        (
+          resource.data.get('idNumber', '') == '' ||
+          request.resource.data.get('idNumber', '') == resource.data.get('idNumber', '')
+        )
       ) || (
         isAdminRole() &&
         // Defensa en profundidad: si se cambia el rol, debe ser un valor válido.
@@ -111,6 +117,13 @@ service cloud.firestore {
     }
 
     match /time_entries/{entryId} {
+      // Read: aprobados. Decisión funcional: los MEMBER deben ver las
+      // jornadas de su área (no solo las suyas), por lo que no se restringe
+      // por dueño. La UI filtra por projectId + areaId para los MEMBER.
+      // Trade-off: un MEMBER puede listar time_entries desde la consola y
+      // consumir cuota; mitigaciones: ventana 90 días en el cliente y guard
+      // por `isApproved()`. Para hardening fuerte hay que mover lecturas
+      // pesadas a Cloud Functions con rate limit.
       allow read: if isApproved();
 
       allow create: if (isApproved() &&
@@ -196,6 +209,14 @@ service cloud.firestore {
     }
 
     match /settlements/{settlementId} {
+      // Read: aprobados. Caveat: contiene info salarial agregada (lines[]).
+      // Se mantiene `isApproved()` porque el cliente MEMBER necesita los
+      // rangos `dateFrom`/`dateTo` para no permitir cargar jornadas en un
+      // período ya liquidado.
+      // TODO seguridad: separar a una colección `settlement_ranges/{id}`
+      // con solo `{projectId, dateFrom, dateTo, archived}` y restringir
+      // `settlements` a admin. Mientras tanto, este es el único leak
+      // conocido que un MEMBER puede explotar desde la consola.
       allow read: if isApproved();
       allow create: if isAdminRole();
       // Admins pueden actualizar una liquidación no archivada (para archivarla).
@@ -301,12 +322,17 @@ service cloud.firestore {
     // carga la jornada de esa fecha, momento en el cual el cliente borra el
     // documento.
     match /reminders/{projectId}/items/{reminderId} {
-      // Read: cualquier usuario aprobado. El doc solo contiene { projectId,
-      // userId, workDate, createdBy, createdAt } — no hay información
-      // sensible. El admin lee todos para mostrar el estado del botón
-      // "Recordar/Recordado"; el usuario destinatario filtra por su propio
-      // userId para mostrar su banner.
-      allow read: if isApproved();
+      // Read: admin O dueño del recordatorio.
+      // Antes era `isApproved()`. Aunque el doc no contiene info salarial,
+      // expone qué fechas tiene "sin informar" cada usuario, por lo que se
+      // restringe.
+      // Notas:
+      //  - El usuario destinatario debe filtrar por su propio userId
+      //    (`where('userId','==', uid)`), si no la query falla.
+      //  - El admin lee todos los recordatorios del proyecto para mostrar
+      //    el estado del botón "Recordar/Recordado" en la grilla.
+      allow read: if isAdminRole() ||
+        (isApproved() && resource.data.userId == request.auth.uid);
 
       // Create: solo admins. Campos validados.
       allow create: if isAdminRole() &&
@@ -356,6 +382,48 @@ service cloud.firestore {
           requester().data.projectId == projectId);
 
       // Delete: solo SUPERUSER.
+      allow delete: if isSuperUser();
+    }
+
+    // ─── Logs del sistema ────────────────────────────────────────────────
+    // Escritura: cualquier usuario autenticado (logins, jornadas, etc.)
+    // Lectura: solo SUPERUSER
+    // Update: solo SUPERUSER (necesario para "buscar y reemplazar UID" manual)
+    // Borrado: prohibido (logs son inmutables)
+    match /system_logs/{logId} {
+      allow create: if isSignedIn();
+      allow read: if isSuperUser();
+      allow update: if isSuperUser();
+      allow delete: if false;
+    }
+
+    // ─── Candado de unicidad de Cédula/DNI ──────────────────────────────
+    // El id del documento es el DNI normalizado (solo dígitos).
+    // Create-once: solo el propio usuario puede reclamar un DNI para sí mismo.
+    // No se permite update; para cambiar de DNI hay que delete (admin) + create.
+    // Read: admin, para validaciones cruzadas y panel de recuperación.
+    // Delete: SUPERUSER (cuando libera un candado mal asignado o cambia DNI de un user).
+    match /id_numbers/{idNumber} {
+      allow create: if isSignedIn() &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.keys().hasOnly(['uid', 'createdAt']);
+      allow read: if isAdminRole();
+      allow update: if false;
+      allow delete: if isSuperUser();
+    }
+
+    // ─── Solicitudes "No recuerdo el mail" ──────────────────────────────
+    // Cuando un usuario nuevo encuentra duplicado al completar su DNI,
+    // la pantalla de completar perfil le ofrece crear una solicitud para
+    // que un admin lo asista a recuperar el mail original.
+    // Create: solo el propio usuario, en estado PENDING.
+    // Read/update: admin (resolver, descartar).
+    // Delete: SUPERUSER.
+    match /email_recovery_requests/{requestId} {
+      allow create: if isSignedIn() &&
+        request.resource.data.requestingUid == request.auth.uid &&
+        request.resource.data.status == 'PENDING';
+      allow read, update: if isAdminRole();
       allow delete: if isSuperUser();
     }
   }

@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import * as XLSX from 'xlsx'
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer,
+  PieChart, Pie, Cell, LineChart, Line, CartesianGrid,
+} from 'recharts'
 import { useAuth } from '../auth/useAuth'
+import { useMaintenance } from '../hooks/useMaintenance'
 import { SupportTicketsPanel } from '../components/SupportTicketsPanel'
 import { Pagination, usePagedItems } from '../components/Pagination'
 import { LoadingOverlay, Spinner } from '../components/Spinner'
@@ -45,9 +50,13 @@ import {
   listImportedPlaceholders,
   repairMergedPlaceholders,
   reconcileDuplicateUsers,
-  subscribeToMaintenance,
+  previewUidReplace,
+  executeUidReplace,
+  type UidReplacePreview,
+  auditOrphanEntries,
+  createMinimalUserDoc,
+  type OrphanEntryRow,
   setMaintenanceMode,
-  type MaintenanceState,
   listProjectUsers,
   subscribeToProjects,
   listUsersWithoutEntries,
@@ -66,6 +75,14 @@ import {
   deleteReminder,
   listRemindersForUser,
   listRemindersForProject,
+  querySystemLogs,
+  adminUpdateUserIdNumber,
+  DuplicateIdNumberError,
+  isValidIdNumber,
+  normalizeIdNumber,
+  listEmailRecoveryRequests,
+  resolveEmailRecoveryRequest,
+  dismissEmailRecoveryRequest,
 } from '../services/firestore'
 
 
@@ -75,6 +92,7 @@ import type { Reminder } from '../services/firestore'
 import type {
   AppRole,
   AuditLock,
+  EmailRecoveryRequest,
   Project,
   ProjectArea,
   ProjectConfig,
@@ -83,18 +101,20 @@ import type {
   ProjectRoleInput,
   ProjectTemplate,
   Settlement,
+  SystemLog,
   TimeEntry,
   TimeEntryInput,
   UserProfile,
 } from '../types/domain'
 
-type MainTab = 'PROJECTS' | 'PROJECT_MANAGEMENT' | 'USERS' | 'HELP'
+type MainTab = 'PROJECTS' | 'PROJECT_MANAGEMENT' | 'USERS' | 'HELP' | 'SYSTEM_LOGS'
 type ProjectTab =
   | 'PROJECT_CONFIG'
   | 'TIME_ENTRY_FORM'
   | 'TIME_ENTRY_TABLE'
   | 'TIME_ENTRY_AUDIT'
   | 'SETTLEMENTS'
+  | 'STATS'
 type UserTab = 'PENDING' | 'APPROVED'
 
 interface Toast {
@@ -229,8 +249,8 @@ function readLS<T extends string>(key: string, fallback: T, allowed?: readonly T
 function writeLS(key: string, value: string) {
   try { localStorage.setItem(LS_PREFIX + key, value) } catch { /* noop */ }
 }
-const MAIN_TABS = ['PROJECTS', 'PROJECT_MANAGEMENT', 'USERS', 'HELP'] as const
-const PROJECT_TABS = ['PROJECT_CONFIG', 'TIME_ENTRY_FORM', 'TIME_ENTRY_TABLE', 'TIME_ENTRY_AUDIT', 'SETTLEMENTS'] as const
+const MAIN_TABS = ['PROJECTS', 'PROJECT_MANAGEMENT', 'USERS', 'HELP', 'SYSTEM_LOGS'] as const
+const PROJECT_TABS = ['PROJECT_CONFIG', 'TIME_ENTRY_FORM', 'TIME_ENTRY_TABLE', 'TIME_ENTRY_AUDIT', 'SETTLEMENTS', 'STATS'] as const
 const USER_TABS = ['PENDING', 'APPROVED'] as const
 
 export function DashboardPage() {
@@ -303,6 +323,7 @@ export function DashboardPage() {
   const [auditEntries, setAuditEntries] = useState<TimeEntry[]>([])
   const [auditFilters, setAuditFilters] = useState({ dateFrom: '', dateTo: '', userId: '', areaId: '' })
   const [auditLoading, setAuditLoading] = useState(false)
+  const [auditSort, setAuditSort] = useState<{ col: string; dir: 'asc' | 'desc' }>({ col: 'workDate', dir: 'asc' })
   const [editingAuditEntry, setEditingAuditEntry] = useState<TimeEntry | null>(null)
   const [editAuditForm, setEditAuditForm] = useState<Omit<TimeEntryInput, 'projectId'>>({
     workDate: '',
@@ -320,6 +341,7 @@ export function DashboardPage() {
   const [editableLines, setEditableLines] = useState<Settlement['lines']>([])
   const [isSettlementSaved, setIsSettlementSaved] = useState(false)
   const [pastSettlements, setPastSettlements] = useState<Settlement[]>([])
+  const [settlementsSort, setSettlementsSort] = useState<{ col: string; dir: 'asc' | 'desc' }>({ col: 'dateFrom', dir: 'desc' })
   const [settlementLoading, setSettlementLoading] = useState(false)
 
   // Modal de aprobación de usuario
@@ -439,8 +461,16 @@ export function DashboardPage() {
     try {
       const filters: { dateFrom: string; userId?: string; areaId?: string } = { dateFrom: since }
       if (!canAudit(currentProfile.role)) {
-        if (currentProfile.areaId) filters.areaId = currentProfile.areaId
-        else filters.userId = currentProfile.uid
+        // MEMBER: SIEMPRE debe tener un área asignada (regla del sistema).
+        // Si no la tiene, no se cargan entries y se avisa al usuario para
+        // que un admin le asigne área antes de operar.
+        if (!currentProfile.areaId) {
+          setEntries([])
+          setEntriesLoadedOnce(true)
+          showToast('Tu cuenta no tiene un área asignada. Contactá a un administrador.', 'error')
+          return
+        }
+        filters.areaId = currentProfile.areaId
       }
       const loaded = await listAllTimeEntries(activeProjectId, filters)
       setEntries(loaded)
@@ -561,11 +591,225 @@ export function DashboardPage() {
     }
   }, [profile])
 
+  // Lazy: cargar usuarios solo al entrar a la pestaña USERS por primera vez.
+  // El botón "Refrescar" sigue disponible para recargas manuales.
+  const usersPanelsLoadedRef = useRef(false)
   useEffect(() => {
+    if (mainTab !== 'USERS') return
+    if (usersPanelsLoadedRef.current) return
+    const currentProfile = profile
+    if (!currentProfile || !canAudit(currentProfile.role)) return
+    usersPanelsLoadedRef.current = true
     void loadUsersPanels()
-  }, [loadUsersPanels])
+  }, [mainTab, profile, loadUsersPanels])
 
   const [repairBusy, setRepairBusy] = useState(false)
+  const [uidReconForm, setUidReconForm] = useState({ search: '', replace: '', replaceEmail: '' })
+  const [uidReconPreview, setUidReconPreview] = useState<UidReplacePreview | null>(null)
+  const [uidReconBusy, setUidReconBusy] = useState(false)
+
+  // ── Auditoría de entries huérfanas (UID en time_entries sin user válido) ──
+  const [orphanDays, setOrphanDays] = useState(30)
+  const [orphanRows, setOrphanRows] = useState<OrphanEntryRow[] | null>(null)
+  const [orphanBusy, setOrphanBusy] = useState(false)
+  const [orphanCreatingUid, setOrphanCreatingUid] = useState<string | null>(null)
+  const [orphanEmailOverride, setOrphanEmailOverride] = useState<Record<string, string>>({})
+
+  // ── Edición de DNI por admin desde el modal de editar usuario ─────────────
+  const [editIdNumber, setEditIdNumber] = useState('')
+  const [editIdNumberBusy, setEditIdNumberBusy] = useState(false)
+
+  // ── Solicitudes "No recuerdo el mail" ─────────────────────────────────────
+  const [recoveryRequests, setRecoveryRequests] = useState<EmailRecoveryRequest[] | null>(null)
+  const [recoveryBusy, setRecoveryBusy] = useState(false)
+  const [recoveryActionUid, setRecoveryActionUid] = useState<string | null>(null)
+  const [recoveryFilter, setRecoveryFilter] = useState<'PENDING' | 'ALL'>('PENDING')
+
+  // ── Estadísticas de Horas ─────────────────────────────────────────────────
+  const [statsDateFrom, setStatsDateFrom] = useState('')
+  const [statsDateTo, setStatsDateTo] = useState('')
+  const [statsSelectedAreas, setStatsSelectedAreas] = useState<string[]>([]) // vacío = todas
+  const [statsEntries, setStatsEntries] = useState<TimeEntry[]>([])
+  const [statsLoading, setStatsLoading] = useState(false)
+  const [statsSubTab, setStatsSubTab] = useState<'users' | 'areas' | 'dates'>('users')
+
+  const loadStatsEntries = useCallback(async () => {
+    if (!activeProjectId || statsLoading) return
+    if (!statsDateFrom || !statsDateTo) { showToast('Seleccioná un rango de fechas.', 'error'); return }
+    if (statsDateFrom > statsDateTo) { showToast('La fecha desde debe ser anterior a la fecha hasta.', 'error'); return }
+    setStatsLoading(true)
+    try {
+      const loaded = await listAllTimeEntries(activeProjectId, {
+        dateFrom: statsDateFrom,
+        dateTo: statsDateTo,
+      })
+      // filtrar por áreas seleccionadas (si hay alguna)
+      setStatsEntries(
+        statsSelectedAreas.length > 0
+          ? loaded.filter((e) => e.areaId && statsSelectedAreas.includes(e.areaId))
+          : loaded,
+      )
+    } catch (err) {
+      showToast('Error al cargar estadísticas.', 'error')
+      console.error(err)
+    } finally {
+      setStatsLoading(false)
+    }
+  }, [activeProjectId, statsDateFrom, statsDateTo, statsSelectedAreas, statsLoading])
+
+  // Datos agrupados por usuario
+  const statsByUser = useMemo(() => {
+    const map = new Map<string, {
+      userId: string; userName: string; areaName: string
+      jornadas: number; worked: number; regular: number; overtime: number; night: number; extras: number
+    }>()
+    for (const e of statsEntries) {
+      const key = e.userId
+      const existing = map.get(key)
+      const areaName = e.areaId ? (areas.find((a) => a.id === e.areaId)?.name ?? 'Sin área') : 'Sin área'
+      const overtime = (e.calculation.overtimeHours ?? 0)
+      const extras = overtime + (e.calculation.engancheExtraHours ?? 0) + (e.calculation.reengancheExtraHours ?? 0)
+      if (existing) {
+        existing.jornadas += 1
+        existing.worked = Math.round((existing.worked + e.calculation.workedHours) * 100) / 100
+        existing.regular = Math.round((existing.regular + e.calculation.regularHours) * 100) / 100
+        existing.overtime = Math.round((existing.overtime + overtime) * 100) / 100
+        existing.night = Math.round((existing.night + (e.calculation.nightHours ?? 0)) * 100) / 100
+        existing.extras = Math.round((existing.extras + extras) * 100) / 100
+      } else {
+        map.set(key, {
+          userId: e.userId,
+          userName: e.userName ?? 'Sin nombre',
+          areaName,
+          jornadas: 1,
+          worked: Math.round(e.calculation.workedHours * 100) / 100,
+          regular: Math.round(e.calculation.regularHours * 100) / 100,
+          overtime: Math.round(overtime * 100) / 100,
+          night: Math.round((e.calculation.nightHours ?? 0) * 100) / 100,
+          extras: Math.round(extras * 100) / 100,
+        })
+      }
+    }
+    return [...map.values()].sort((a, b) => b.worked - a.worked)
+  }, [statsEntries, areas])
+
+  // Datos agrupados por área
+  const statsByArea = useMemo(() => {
+    const map = new Map<string, { areaId: string; areaName: string; jornadas: number; worked: number; extras: number }>()
+    const total = statsEntries.reduce((s, e) => s + e.calculation.workedHours, 0)
+    for (const e of statsEntries) {
+      const key = e.areaId ?? '__none__'
+      const areaName = e.areaId ? (areas.find((a) => a.id === e.areaId)?.name ?? 'Sin área') : 'Sin área'
+      const extras = (e.calculation.overtimeHours ?? 0) + (e.calculation.engancheExtraHours ?? 0) + (e.calculation.reengancheExtraHours ?? 0)
+      const existing = map.get(key)
+      if (existing) {
+        existing.jornadas += 1
+        existing.worked = Math.round((existing.worked + e.calculation.workedHours) * 100) / 100
+        existing.extras = Math.round((existing.extras + extras) * 100) / 100
+      } else {
+        map.set(key, { areaId: key, areaName, jornadas: 1, worked: Math.round(e.calculation.workedHours * 100) / 100, extras: Math.round(extras * 100) / 100 })
+      }
+    }
+    return [...map.values()]
+      .sort((a, b) => b.worked - a.worked)
+      .map((r) => ({ ...r, pct: total > 0 ? Math.round((r.worked / total) * 1000) / 10 : 0 }))
+  }, [statsEntries, areas])
+
+  // Datos agrupados por semana (YYYY-WW)
+  const statsByDate = useMemo(() => {
+    const map = new Map<string, { week: string; label: string; worked: number; extras: number }>()
+    for (const e of statsEntries) {
+      const d = new Date(e.workDate + 'T12:00:00')
+      const startOfYear = new Date(d.getFullYear(), 0, 1)
+      const week = Math.ceil(((d.getTime() - startOfYear.getTime()) / 86400000 + startOfYear.getDay() + 1) / 7)
+      const key = `${d.getFullYear()}-W${String(week).padStart(2, '0')}`
+      const label = `Sem ${week} (${d.toLocaleDateString('es-UY', { month: 'short', day: 'numeric' })})`
+      const extras = (e.calculation.overtimeHours ?? 0) + (e.calculation.engancheExtraHours ?? 0) + (e.calculation.reengancheExtraHours ?? 0)
+      const existing = map.get(key)
+      if (existing) {
+        existing.worked = Math.round((existing.worked + e.calculation.workedHours) * 100) / 100
+        existing.extras = Math.round((existing.extras + extras) * 100) / 100
+      } else {
+        map.set(key, { week: key, label, worked: Math.round(e.calculation.workedHours * 100) / 100, extras: Math.round(extras * 100) / 100 })
+      }
+    }
+    return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([, v]) => v)
+  }, [statsEntries])
+
+  function downloadStatsXlsx() {
+    if (statsEntries.length === 0) return
+    const wb = XLSX.utils.book_new()
+    // Hoja por usuario
+    const rowsUser = statsByUser.map((r) => ({
+      Usuario: r.userName, Área: r.areaName, Jornadas: r.jornadas,
+      'Hs. Trabajadas': r.worked, 'Hs. Regulares': r.regular,
+      'Hs. Extras': r.extras, 'Hs. Nocturnas': r.night,
+    }))
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsUser), 'Por usuario')
+    // Hoja por área
+    const rowsArea = statsByArea.map((r) => ({
+      Área: r.areaName, Jornadas: r.jornadas,
+      'Hs. Trabajadas': r.worked, 'Hs. Extras': r.extras, '% del total': r.pct,
+    }))
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsArea), 'Por área')
+    // Hoja por semana
+    const rowsDate = statsByDate.map((r) => ({
+      Semana: r.label, 'Hs. Trabajadas': r.worked, 'Hs. Extras': r.extras,
+    }))
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsDate), 'Por semana')
+    const projectName = projects.find((p) => p.id === activeProjectId)?.name ?? 'proyecto'
+    XLSX.writeFile(wb, `estadisticas_${projectName}_${statsDateFrom}_${statsDateTo}.xlsx`)
+  }
+
+  // ── Registros del sistema ──────────────────────────────────────────────────
+  const todayStr = new Date().toISOString().slice(0, 10)
+  const [sysLogsDateFrom, setSysLogsDateFrom] = useState(todayStr)
+  const [sysLogsDateTo, setSysLogsDateTo] = useState(todayStr)
+  const [sysLogs, setSysLogs] = useState<SystemLog[]>([])
+  const [sysLogsLoading, setSysLogsLoading] = useState(false)
+  const sysLogsPagination = usePagedItems(sysLogs, 50)
+
+  function downloadSysLogsXlsx() {
+    if (sysLogs.length === 0) return
+    const typeLabel: Record<string, string> = {
+      entry_create: 'Carga',
+      entry_edit: 'Edición',
+      entry_delete: 'Eliminación',
+      user_login: 'Ingreso',
+    }
+    const rows = sysLogs.map((log) => {
+      const ts = (log.timestamp as { toDate?: () => Date } | null)?.toDate?.()
+      const tsStr = ts
+        ? ts.toLocaleDateString('es-UY', { day: '2-digit', month: '2-digit', year: 'numeric' }) +
+          ' ' + ts.toLocaleTimeString('es-UY', { hour: '2-digit', minute: '2-digit' })
+        : log.logDate
+      return {
+        'Fecha/Hora': tsStr,
+        Tipo: typeLabel[log.type] ?? log.type,
+        Usuario: log.userName,
+        Email: log.email ?? '',
+        Jornada: log.workDate ?? '',
+        Detalle: log.details ?? '',
+      }
+    })
+    const ws = XLSX.utils.json_to_sheet(rows)
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, 'Logs')
+    XLSX.writeFile(wb, `system_logs_${sysLogsDateFrom}_${sysLogsDateTo}.xlsx`)
+  }
+
+  const loadSysLogs = useCallback(async () => {
+    if (sysLogsLoading) return
+    setSysLogsLoading(true)
+    try {
+      const logs = await querySystemLogs(sysLogsDateFrom, sysLogsDateTo)
+      setSysLogs(logs)
+    } catch (err) {
+      showToast(`Error al cargar registros: ${err instanceof Error ? err.message : 'Desconocido'}`, 'error')
+    } finally {
+      setSysLogsLoading(false)
+    }
+  }, [sysLogsDateFrom, sysLogsDateTo, sysLogsLoading])
   const handleRepairMerged = useCallback(async () => {
     if (repairBusy) return
     if (!window.confirm(
@@ -604,18 +848,16 @@ export function DashboardPage() {
   }, [repairBusy, loadUsersPanels])
 
   // ─── Modo Mantenimiento (solo SUPERUSER) ──────────────────────────────────
-  const [maintenance, setMaintenance] = useState<MaintenanceState>({ enabled: false, message: null, version: 0 })
+  // El estado proviene del MaintenanceContext montado en App; evitamos un
+  // segundo listener a app_config/maintenance.
+  const maintenance = useMaintenance()
   const [maintenanceMessage, setMaintenanceMessage] = useState('')
   const [maintenanceBusy, setMaintenanceBusy] = useState(false)
 
+  // Inicializa el textarea con el mensaje actual la primera vez que llega.
   useEffect(() => {
-    if (!profile || profile.role !== 'SUPERUSER') return
-    const unsub = subscribeToMaintenance((state) => {
-      setMaintenance(state)
-      setMaintenanceMessage((prev) => (prev === '' ? state.message ?? '' : prev))
-    })
-    return () => unsub()
-  }, [profile])
+    setMaintenanceMessage((prev) => (prev === '' ? maintenance.message ?? '' : prev))
+  }, [maintenance.message])
 
   const handleToggleMaintenance = useCallback(async () => {
     if (maintenanceBusy) return
@@ -678,10 +920,13 @@ export function DashboardPage() {
   const filteredApprovedUsers = useMemo(() => {
     if (!userSearch.trim()) return approvedUsers
     const s = userSearch.toLowerCase()
+    const sDigits = s.replace(/\D/g, '')
     return approvedUsers.filter(
       (u) =>
         (u.displayName ?? '').toLowerCase().includes(s) ||
-        (u.email ?? '').toLowerCase().includes(s),
+        (u.email ?? '').toLowerCase().includes(s) ||
+        u.uid.toLowerCase().includes(s) ||
+        (sDigits.length > 0 && (u.idNumber ?? '').includes(sDigits)),
     )
   }, [approvedUsers, userSearch])
 
@@ -721,8 +966,60 @@ export function DashboardPage() {
 
   // ─── Paginación ─────────────────────────────────────────────────────────
   const entriesPagination = usePagedItems(filteredEntries, 25)
-  const auditPagination = usePagedItems(auditEntries, 50)
-  const settlementsPagination = usePagedItems(pastSettlements, 10)
+
+  const sortedAuditEntries = useMemo(() => {
+    const { col, dir } = auditSort
+    return [...auditEntries].sort((a, b) => {
+      let va: number | string = 0
+      let vb: number | string = 0
+      if (col === 'workDate') { va = a.workDate; vb = b.workDate }
+      else if (col === 'userName') { va = a.userName ?? ''; vb = b.userName ?? '' }
+      else if (col === 'area') {
+        va = areas.find((x) => x.id === a.areaId)?.name ?? ''
+        vb = areas.find((x) => x.id === b.areaId)?.name ?? ''
+      } else if (col === 'role') {
+        const ua = projectUsers.find((u) => u.uid === a.userId)
+        const ub = projectUsers.find((u) => u.uid === b.userId)
+        va = ua?.roleId ? (projectRoles.find((r) => r.id === ua.roleId)?.name ?? '') : ''
+        vb = ub?.roleId ? (projectRoles.find((r) => r.id === ub.roleId)?.name ?? '') : ''
+      } else if (col === 'shiftLabel') { va = a.shiftLabel ?? ''; vb = b.shiftLabel ?? '' }
+      else if (col === 'timeIn') { va = a.timeIn; vb = b.timeIn }
+      else if (col === 'timeOut') { va = a.timeOut; vb = b.timeOut }
+      else if (col === 'workedHours') { va = a.calculation.workedHours; vb = b.calculation.workedHours }
+      else if (col === 'overtimeDay') {
+        va = Math.max(0, (a.calculation.overtimeHours ?? 0) - (a.calculation.nightOvertimeHours ?? 0))
+        vb = Math.max(0, (b.calculation.overtimeHours ?? 0) - (b.calculation.nightOvertimeHours ?? 0))
+      } else if (col === 'nightOvertimeHours') { va = a.calculation.nightOvertimeHours ?? 0; vb = b.calculation.nightOvertimeHours ?? 0 }
+      else if (col === 'nightHours') { va = a.calculation.nightHours ?? 0; vb = b.calculation.nightHours ?? 0 }
+      else if (col === 'engancheExtraHours') { va = a.calculation.engancheExtraHours ?? 0; vb = b.calculation.engancheExtraHours ?? 0 }
+      else if (col === 'reengancheExtraHours') { va = a.calculation.reengancheExtraHours ?? 0; vb = b.calculation.reengancheExtraHours ?? 0 }
+      else if (col === 'penaltyHours') { va = a.calculation.penaltyHours ?? 0; vb = b.calculation.penaltyHours ?? 0 }
+      else if (col === 'totalExtras') {
+        va = (a.calculation.overtimeHours ?? 0) + (a.calculation.engancheExtraHours ?? 0) + (a.calculation.reengancheExtraHours ?? 0) + (a.calculation.penaltyHours ?? 0)
+        vb = (b.calculation.overtimeHours ?? 0) + (b.calculation.engancheExtraHours ?? 0) + (b.calculation.reengancheExtraHours ?? 0) + (b.calculation.penaltyHours ?? 0)
+      } else if (col === 'isJornadaAdicional') {
+        va = a.isJornadaAdicional ? 1 : 0
+        vb = b.isJornadaAdicional ? 1 : 0
+      }
+      if (va === vb) return 0
+      const cmp = va < vb ? -1 : 1
+      return dir === 'asc' ? cmp : -cmp
+    })
+  }, [auditEntries, auditSort, areas, projectUsers, projectRoles])
+
+  const sortedPastSettlements = useMemo(() => {
+    const { col, dir } = settlementsSort
+    return [...pastSettlements].sort((a, b) => {
+      const va = col === 'totalPay' ? a.totalPay : col === 'lines' ? a.lines.length : a.dateFrom
+      const vb = col === 'totalPay' ? b.totalPay : col === 'lines' ? b.lines.length : b.dateFrom
+      if (va === vb) return 0
+      const cmp = va < vb ? -1 : 1
+      return dir === 'asc' ? cmp : -cmp
+    })
+  }, [pastSettlements, settlementsSort])
+
+  const auditPagination = usePagedItems(sortedAuditEntries, 50)
+  const settlementsPagination = usePagedItems(sortedPastSettlements, 10)
 
   // Loading global (cualquier proceso en curso) → overlay con spinner
   const anyLoading = auditLoading || settlementLoading || importLoading
@@ -748,8 +1045,8 @@ export function DashboardPage() {
   }
 
   function exportAuditExcel() {
-    if (auditEntries.length === 0) return
-    const rows = auditEntries.map((e) => {
+    if (sortedAuditEntries.length === 0) return
+    const rows = sortedAuditEntries.map((e) => {
       const overtime = e.calculation.overtimeHours ?? 0
       const nightOvertime = e.calculation.nightOvertimeHours ?? 0
       const overtimeDay = Math.max(0, Math.round((overtime - nightOvertime) * 100) / 100)
@@ -882,27 +1179,52 @@ export function DashboardPage() {
   }
 
   function exportSettlementExcel(s: Settlement) {
-    const rows = s.lines.map((l) => ({
-      Colaborador: l.userName,
-      'Hs. Normales': l.regularHours,
-      'Hs. Extras': l.overtimeHours,
-      'Hs. Nocturnas': l.nightHours,
-      'Total Hs.': l.totalHours,
-      'Pago Normal ($)': l.regularPay,
-      'Pago Extra ($)': l.overtimePay,
-      'Pago Nocturno ($)': l.nightPay,
-      'Total ($)': l.totalPay,
-    }))
+    const rows = s.lines.map((l) => {
+      const role = projectRoles.find((r) => r.id === l.roleId)
+      const vSemana = role?.weeklyRate ?? 0
+      const vDia = role
+        ? (role.weeklyRate > 0
+            ? Math.round((role.weeklyRate / (projectConfig?.weeklyWorkDays || 5)) * 100) / 100
+            : role.dailyRate)
+        : 0
+      const totExt = Math.round(((l.overtimeHours ?? 0) + (l.engancheExtraHours ?? 0) + (l.reengancheExtraHours ?? 0) + (l.penaltyHours ?? 0)) * 100) / 100
+      return {
+        Colaborador: l.userName,
+        Rol: l.roleName ?? '',
+        '$/h': l.hourlyRate,
+        'Valor Sem.': vSemana,
+        'Valor Día': vDia,
+        'Hs. Norm.': l.regularHours,
+        'Hs. Ext.': l.overtimeHours,
+        'Hs. Noct.': l.nightHours,
+        'Noct. Ext.': l.nightOvertimeHours ?? 0,
+        Enganches: l.engancheExtraHours ?? 0,
+        Reenganches: l.reengancheExtraHours ?? 0,
+        '6to día': l.jornadaAdicionalCount ?? 0,
+        'Pen.': l.penaltyHours ?? 0,
+        'Tot. Ext.': totExt,
+        'Total Hs.': l.totalHours,
+        'Total $': l.totalPay,
+      }
+    })
+    const sumTotExt = Math.round(s.lines.reduce((a, l) => a + (l.overtimeHours ?? 0) + (l.engancheExtraHours ?? 0) + (l.reengancheExtraHours ?? 0) + (l.penaltyHours ?? 0), 0) * 100) / 100
     rows.push({
       Colaborador: 'TOTAL',
-      'Hs. Normales': s.lines.reduce((a, l) => a + l.regularHours, 0),
-      'Hs. Extras': s.lines.reduce((a, l) => a + l.overtimeHours, 0),
-      'Hs. Nocturnas': s.lines.reduce((a, l) => a + l.nightHours, 0),
-      'Total Hs.': s.lines.reduce((a, l) => a + l.totalHours, 0),
-      'Pago Normal ($)': s.lines.reduce((a, l) => a + l.regularPay, 0),
-      'Pago Extra ($)': s.lines.reduce((a, l) => a + l.overtimePay, 0),
-      'Pago Nocturno ($)': s.lines.reduce((a, l) => a + l.nightPay, 0),
-      'Total ($)': s.totalPay,
+      Rol: '',
+      '$/h': 0,
+      'Valor Sem.': 0,
+      'Valor Día': 0,
+      'Hs. Norm.': s.lines.reduce((a, l) => a + (l.regularHours ?? 0), 0),
+      'Hs. Ext.': s.lines.reduce((a, l) => a + (l.overtimeHours ?? 0), 0),
+      'Hs. Noct.': s.lines.reduce((a, l) => a + (l.nightHours ?? 0), 0),
+      'Noct. Ext.': s.lines.reduce((a, l) => a + (l.nightOvertimeHours ?? 0), 0),
+      Enganches: s.lines.reduce((a, l) => a + (l.engancheExtraHours ?? 0), 0),
+      Reenganches: s.lines.reduce((a, l) => a + (l.reengancheExtraHours ?? 0), 0),
+      '6to día': s.lines.reduce((a, l) => a + (l.jornadaAdicionalCount ?? 0), 0),
+      'Pen.': s.lines.reduce((a, l) => a + (l.penaltyHours ?? 0), 0),
+      'Tot. Ext.': sumTotExt,
+      'Total Hs.': s.lines.reduce((a, l) => a + (l.totalHours ?? 0), 0),
+      'Total $': s.totalPay,
     })
     const ws = XLSX.utils.json_to_sheet(rows)
     const wb = XLSX.utils.book_new()
@@ -912,42 +1234,59 @@ export function DashboardPage() {
 
   /** Construye el Excel de archivado: hoja "Liquidación" + hoja "Detalle" con todas las jornadas del rango. */
   async function buildSettlementArchiveBlob(s: Settlement): Promise<Blob> {
-    // Hoja 1: Liquidación (idéntica a exportSettlementExcel)
-    const liqRows = s.lines.map((l) => ({
-      Colaborador: l.userName,
-      Rol: l.roleName ?? '',
-      'Hs. Normales': l.regularHours,
-      'Hs. Extras': l.overtimeHours,
-      'Hs. Nocturnas': l.nightHours,
-      'Hs. Noct. Extras': l.nightOvertimeHours,
-      'Hs. Enganche': l.engancheExtraHours,
-      'Hs. Reenganche': l.reengancheExtraHours,
-      '6to día': l.jornadaAdicionalCount,
-      Penalties: l.penaltyHours,
-      'Total Hs.': l.totalHours,
-      '$/h': l.hourlyRate,
-      'Pago Normal ($)': l.regularPay,
-      'Pago Extra ($)': l.overtimePay,
-      'Pago Nocturno ($)': l.nightPay,
-      'Total ($)': l.totalPay,
-    }))
+    // Hoja 1: Liquidación (idéntica a la tabla de la app)
+    const liqRows = s.lines.map((l) => {
+      const role = projectRoles.find((r) => r.id === l.roleId)
+      const vSemana = role?.weeklyRate ?? 0
+      const vDia = role
+        ? (role.weeklyRate > 0
+            ? Math.round((role.weeklyRate / (projectConfig?.weeklyWorkDays || 5)) * 100) / 100
+            : role.dailyRate)
+        : 0
+      const totExt = Math.round(((l.overtimeHours ?? 0) + (l.engancheExtraHours ?? 0) + (l.reengancheExtraHours ?? 0) + (l.penaltyHours ?? 0)) * 100) / 100
+      return {
+        Colaborador: l.userName,
+        Rol: l.roleName ?? '',
+        '$/h': l.hourlyRate,
+        'Valor Sem.': vSemana,
+        'Valor Día': vDia,
+        'Hs. Norm.': l.regularHours,
+        'Hs. Ext.': l.overtimeHours,
+        'Hs. Noct.': l.nightHours,
+        'Noct. Ext.': l.nightOvertimeHours ?? 0,
+        Enganches: l.engancheExtraHours ?? 0,
+        Reenganches: l.reengancheExtraHours ?? 0,
+        '6to día': l.jornadaAdicionalCount ?? 0,
+        'Pen.': l.penaltyHours ?? 0,
+        'Tot. Ext.': totExt,
+        'Total Hs.': l.totalHours,
+        'Pago Normal ($)': l.regularPay,
+        'Pago Extra ($)': l.overtimePay,
+        'Pago Nocturno ($)': l.nightPay,
+        'Total $': l.totalPay,
+      }
+    })
+    const archiveSumTotExt = Math.round(s.lines.reduce((a, l) => a + (l.overtimeHours ?? 0) + (l.engancheExtraHours ?? 0) + (l.reengancheExtraHours ?? 0) + (l.penaltyHours ?? 0), 0) * 100) / 100
     liqRows.push({
       Colaborador: 'TOTAL',
       Rol: '',
-      'Hs. Normales': s.lines.reduce((a, l) => a + l.regularHours, 0),
-      'Hs. Extras': s.lines.reduce((a, l) => a + l.overtimeHours, 0),
-      'Hs. Nocturnas': s.lines.reduce((a, l) => a + l.nightHours, 0),
-      'Hs. Noct. Extras': s.lines.reduce((a, l) => a + (l.nightOvertimeHours ?? 0), 0),
-      'Hs. Enganche': s.lines.reduce((a, l) => a + (l.engancheExtraHours ?? 0), 0),
-      'Hs. Reenganche': s.lines.reduce((a, l) => a + (l.reengancheExtraHours ?? 0), 0),
-      '6to día': s.lines.reduce((a, l) => a + (l.jornadaAdicionalCount ?? 0), 0),
-      Penalties: s.lines.reduce((a, l) => a + (l.penaltyHours ?? 0), 0),
-      'Total Hs.': s.lines.reduce((a, l) => a + l.totalHours, 0),
       '$/h': 0,
+      'Valor Sem.': 0,
+      'Valor Día': 0,
+      'Hs. Norm.': s.lines.reduce((a, l) => a + l.regularHours, 0),
+      'Hs. Ext.': s.lines.reduce((a, l) => a + l.overtimeHours, 0),
+      'Hs. Noct.': s.lines.reduce((a, l) => a + l.nightHours, 0),
+      'Noct. Ext.': s.lines.reduce((a, l) => a + (l.nightOvertimeHours ?? 0), 0),
+      Enganches: s.lines.reduce((a, l) => a + (l.engancheExtraHours ?? 0), 0),
+      Reenganches: s.lines.reduce((a, l) => a + (l.reengancheExtraHours ?? 0), 0),
+      '6to día': s.lines.reduce((a, l) => a + (l.jornadaAdicionalCount ?? 0), 0),
+      'Pen.': s.lines.reduce((a, l) => a + (l.penaltyHours ?? 0), 0),
+      'Tot. Ext.': archiveSumTotExt,
+      'Total Hs.': s.lines.reduce((a, l) => a + l.totalHours, 0),
       'Pago Normal ($)': s.lines.reduce((a, l) => a + l.regularPay, 0),
       'Pago Extra ($)': s.lines.reduce((a, l) => a + l.overtimePay, 0),
       'Pago Nocturno ($)': s.lines.reduce((a, l) => a + l.nightPay, 0),
-      'Total ($)': s.totalPay,
+      'Total $': s.totalPay,
     })
     const wsLiq = XLSX.utils.json_to_sheet(liqRows)
 
@@ -1239,7 +1578,7 @@ export function DashboardPage() {
       setSavingEntry(true)
       await saveTimeEntry(
         { ...form, projectId: activeProjectId },
-        { uid: currentProfile.uid, displayName: currentProfile.displayName, areaId: currentProfile.areaId },
+        { uid: currentProfile.uid, displayName: currentProfile.displayName, areaId: currentProfile.areaId, email: user?.email ?? null },
       )
       // Si esta fecha tenía un recordatorio pendiente, lo limpiamos.
       try { await deleteReminder(activeProjectId, currentProfile.uid, form.workDate) } catch { /* noop */ }
@@ -1297,7 +1636,8 @@ export function DashboardPage() {
     }
     try {
       setSavingEditEntry(true)
-      await updateTimeEntry(editingEntry.id, editEntryForm, activeProjectId, editingEntry.userId)
+      await updateTimeEntry(editingEntry.id, editEntryForm, activeProjectId, editingEntry.userId,
+        { userName: currentProfile.displayName || 'Sin nombre', email: user?.email ?? null })
       setEditingEntry(null)
       showToast('Jornada actualizada.')
       void loadEntries()
@@ -1326,7 +1666,8 @@ export function DashboardPage() {
     if (!window.confirm('¿Eliminar esta jornada?')) return
     try {
       setDeletingEntryId(entryId)
-      await deleteTimeEntry(entryId, activeProjectId, userId)
+      await deleteTimeEntry(entryId, activeProjectId, userId,
+        { userName: currentProfile.displayName || 'Sin nombre', email: user?.email ?? null, workDate: target?.workDate })
       showToast('Jornada eliminada.')
       void loadEntries()
     } catch (err) {
@@ -1354,11 +1695,19 @@ export function DashboardPage() {
     event.preventDefault()
     if (!editingAuditEntry) return
     try {
-      await updateTimeEntry(editingAuditEntry.id, editAuditForm, activeProjectId, editingAuditEntry.userId)
+      await updateTimeEntry(editingAuditEntry.id, editAuditForm, activeProjectId, editingAuditEntry.userId,
+        { userName: currentProfile.displayName || 'Sin nombre', email: user?.email ?? null })
       await loadAuditEntries()
       void loadEntries()
       setEditingAuditEntry(null)
-      showToast('Jornada actualizada.')
+      // Si hay una liquidación pendiente (no guardada), invalidarla para forzar recalculo
+      if (currentSettlement && !isSettlementSaved) {
+        setCurrentSettlement(null)
+        setEditableLines([])
+        showToast('Jornada actualizada. Recalculá la liquidación para reflejar los cambios.')
+      } else {
+        showToast('Jornada actualizada.')
+      }
     } catch (err) {
       showToast('Error al actualizar.', 'error')
       console.error(err)
@@ -1368,10 +1717,18 @@ export function DashboardPage() {
   async function handleDeleteAuditEntry(entryId: string, userId: string) {
     if (!window.confirm('¿Eliminar esta jornada?')) return
     try {
-      await deleteTimeEntry(entryId, activeProjectId, userId)
+      await deleteTimeEntry(entryId, activeProjectId, userId,
+        { userName: currentProfile.displayName || 'Sin nombre', email: user?.email ?? null, workDate: entries.find(e => e.id === entryId)?.workDate })
       await loadAuditEntries()
       void loadEntries()
-      showToast('Jornada eliminada.')
+      // Si hay una liquidación pendiente (no guardada), invalidarla para forzar recalculo
+      if (currentSettlement && !isSettlementSaved) {
+        setCurrentSettlement(null)
+        setEditableLines([])
+        showToast('Jornada eliminada. Recalculá la liquidación para reflejar los cambios.')
+      } else {
+        showToast('Jornada eliminada.')
+      }
     } catch (err) {
       showToast('Error al eliminar.', 'error')
       console.error(err)
@@ -1390,6 +1747,7 @@ export function DashboardPage() {
       await saveTimeEntryForUser(
         { ...adminEntryForm, projectId: activeProjectId },
         targetUser,
+        user?.email ?? null,
       )
       // Si esta fecha tenía un recordatorio pendiente para el usuario destino, lo limpiamos.
       try { await deleteReminder(activeProjectId, targetUser.uid, adminEntryForm.workDate) } catch { /* noop */ }
@@ -1680,6 +2038,21 @@ export function DashboardPage() {
       if (op === 'RECALC') {
         const count = await recalculateProjectEntries(activeProjectId, lockedRanges, { dateFrom, dateTo })
         showToast(`${count} registro${count !== 1 ? 's' : ''} recalculado${count !== 1 ? 's' : ''}.`)
+        // Refrescar automáticamente el preview de liquidación si hay uno pendiente
+        if (currentSettlement && !isSettlementSaved) {
+          try {
+            const proj = projects.find((p) => p.id === activeProjectId)
+            const refreshed = await previewSettlement(
+              activeProjectId,
+              proj?.name ?? 'Proyecto',
+              currentSettlement.dateFrom,
+              currentSettlement.dateTo,
+              currentProfile.uid,
+            )
+            setCurrentSettlement(refreshed)
+            setEditableLines(refreshed.lines)
+          } catch (_e) { /* no bloquear si el refresh falla */ }
+        }
       } else {
         const count = await syncUserAreasToEntries(activeProjectId, lockedRanges, { dateFrom, dateTo })
         showToast(count > 0 ? `${count} registro${count !== 1 ? 's' : ''} actualizado${count !== 1 ? 's' : ''} con el área actual.` : 'No hay registros que actualizar.')
@@ -1702,6 +2075,7 @@ export function DashboardPage() {
       projectId: u.projectId ?? '',
       cycleMode: u.cycleMode ?? 'CYCLE',
     })
+    setEditIdNumber(u.idNumber ?? '')
   }
 
   async function handleSaveUserEdit(event: FormEvent<HTMLFormElement>) {
@@ -1743,6 +2117,104 @@ export function DashboardPage() {
     } catch (err) {
       showToast('Error al actualizar usuario.', 'error')
       console.error(err)
+    }
+  }
+
+  async function handleAdminUpdateIdNumber() {
+    if (!editingUser) return
+    const trimmed = normalizeIdNumber(editIdNumber)
+    if (!trimmed) {
+      showToast('Ingresá un Nro de Cédula/DNI.', 'error')
+      return
+    }
+    if (!isValidIdNumber(trimmed)) {
+      showToast('El Nro de Cédula/DNI debe tener entre 6 y 12 dígitos.', 'error')
+      return
+    }
+    if (trimmed === (editingUser.idNumber ?? '')) {
+      showToast('El DNI no cambió.', 'error')
+      return
+    }
+    if (!window.confirm(
+      `Actualizar Cédula/DNI de ${editingUser.displayName ?? editingUser.email ?? editingUser.uid}?\n\n` +
+      `Anterior: ${editingUser.idNumber ?? '—'}\n` +
+      `Nuevo: ${trimmed}\n\n` +
+      `Si el nuevo DNI ya está reclamado por otro usuario, esta operación falla.`
+    )) return
+    setEditIdNumberBusy(true)
+    try {
+      await adminUpdateUserIdNumber(editingUser.uid, trimmed)
+      showToast('Cédula/DNI actualizada.')
+      // Reflejar el cambio en el editingUser en memoria
+      setEditingUser((cur) => cur ? { ...cur, idNumber: trimmed } : cur)
+      // Refrescar listado de aprobados
+      void loadUsersPanels()
+    } catch (err) {
+      if (err instanceof DuplicateIdNumberError) {
+        showToast('Ya existe otro usuario con ese Nro de Cédula/DNI.', 'error')
+      } else {
+        showToast(err instanceof Error ? err.message : 'Error al actualizar DNI.', 'error')
+      }
+      console.error('[handleAdminUpdateIdNumber] error:', err)
+    } finally {
+      setEditIdNumberBusy(false)
+    }
+  }
+
+  async function loadRecoveryRequests(filter: 'PENDING' | 'ALL') {
+    setRecoveryBusy(true)
+    try {
+      const rows = await listEmailRecoveryRequests(filter === 'PENDING' ? 'PENDING' : undefined)
+      setRecoveryRequests(rows)
+    } catch (err) {
+      showToast('Error al cargar solicitudes.', 'error')
+      console.error('[loadRecoveryRequests] error:', err)
+    } finally {
+      setRecoveryBusy(false)
+    }
+  }
+
+  async function handleResolveRecovery(req: EmailRecoveryRequest) {
+    if (!profile) return
+    const notes = window.prompt(
+      `Resolver solicitud de ${req.requestingDisplayName ?? req.requestingEmail ?? req.requestingUid}\n` +
+      `DNI: ${req.idNumber}\n\n` +
+      `Notas (opcional):`,
+      '',
+    )
+    if (notes === null) return
+    setRecoveryActionUid(req.id)
+    try {
+      await resolveEmailRecoveryRequest(req.id, profile.uid, { notes: notes || undefined })
+      showToast('Solicitud marcada como resuelta.')
+      await loadRecoveryRequests(recoveryFilter)
+    } catch (err) {
+      showToast('Error al resolver solicitud.', 'error')
+      console.error(err)
+    } finally {
+      setRecoveryActionUid(null)
+    }
+  }
+
+  async function handleDismissRecovery(req: EmailRecoveryRequest) {
+    if (!profile) return
+    const notes = window.prompt(
+      `Descartar solicitud de ${req.requestingDisplayName ?? req.requestingEmail ?? req.requestingUid}\n` +
+      `DNI: ${req.idNumber}\n\n` +
+      `Notas (opcional):`,
+      '',
+    )
+    if (notes === null) return
+    setRecoveryActionUid(req.id)
+    try {
+      await dismissEmailRecoveryRequest(req.id, profile.uid, notes || undefined)
+      showToast('Solicitud descartada.')
+      await loadRecoveryRequests(recoveryFilter)
+    } catch (err) {
+      showToast('Error al descartar solicitud.', 'error')
+      console.error(err)
+    } finally {
+      setRecoveryActionUid(null)
     }
   }
 
@@ -1962,7 +2434,25 @@ export function DashboardPage() {
     { key: 'TIME_ENTRY_TABLE', label: canAudit(currentProfile.role) ? 'Horarios del proyecto' : currentProfile.areaId ? 'Horarios del área' : 'Mis horarios', visible: true },
     { key: 'TIME_ENTRY_AUDIT', label: 'Auditoría', visible: canAudit(currentProfile.role) },
     { key: 'SETTLEMENTS', label: 'Liquidaciones', visible: canAudit(currentProfile.role) },
+    { key: 'STATS', label: 'Estadísticas', visible: canAudit(currentProfile.role) },
   ]
+
+  const ath = (col: string, label: string, title?: string) => {
+    const active = auditSort.col === col
+    const indicator = active ? (auditSort.dir === 'asc' ? ' ▲' : ' ▼') : ' ↕'
+    return (
+      <th
+        title={title ?? label}
+        onClick={() => {
+          setAuditSort((p) => p.col === col ? { col, dir: p.dir === 'asc' ? 'desc' : 'asc' } : { col, dir: 'asc' })
+          auditPagination.setPage(1)
+        }}
+        style={{ cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}
+      >
+        {label}<span style={{ opacity: active ? 1 : 0.35, fontSize: '0.7em', marginLeft: '2px' }}>{indicator}</span>
+      </th>
+    )
+  }
 
   return (
     <div className="screen dashboard-screen">
@@ -2076,6 +2566,14 @@ export function DashboardPage() {
         >
           Ayuda
         </button>
+        {canSeeProjectAdmin(currentProfile.role) && (
+          <button
+            className={`tab ${mainTab === 'SYSTEM_LOGS' ? 'active' : ''}`}
+            onClick={() => setMainTab('SYSTEM_LOGS')}
+          >
+            Registros del sistema
+          </button>
+        )}
       </nav>
 
       {mainTab === 'PROJECT_MANAGEMENT' && canSeeProjectAdmin(currentProfile.role) && (
@@ -2849,6 +3347,11 @@ export function DashboardPage() {
                           {entry.userId !== currentProfile.uid && (
                             <span className="chip" style={{ marginLeft: '6px', fontSize: '0.75rem' }}>{entry.userName}</span>
                           )}
+                          {canSeeProjectAdmin(currentProfile.role) && (
+                            <p className="muted" style={{ margin: '1px 0', fontSize: '0.72em', fontFamily: 'monospace' }}>
+                              UID: {entry.userId}{' | '}Email: {projectUsers.find((u) => u.uid === entry.userId)?.email ?? '—'}
+                            </p>
+                          )}
                           {/* Chips de ciclo (IN_CYCLE / OUT_OF_CYCLE / REINFORCEMENT) eliminados: el 6to día es manual y se muestra más abajo como info. */}
                           <p style={{ margin: '2px 0' }}>{entry.timeIn} → {entry.timeOut}</p>
                           <p style={{ margin: '2px 0' }}>
@@ -3307,22 +3810,24 @@ export function DashboardPage() {
                     <thead>
                       <tr>
                         <th title="Color de revisión"></th>
-                        <th>Fecha</th>
-                        <th>Usuario</th>
-                        <th>Área</th>
-                        <th>Rol</th>
-                        <th>Jornada</th>
-                        <th>Entrada</th>
-                        <th>Salida</th>
-                        <th>Hs. Trab.</th>
-                        <th title="Horas extras diurnas (extras totales menos extras nocturnas)">Ext. día</th>
-                        <th title="Horas extras nocturnas (parte de las extras que cae en ventana nocturna)">Ext. noche</th>
-                        <th title="Horas trabajadas dentro de la ventana nocturna (no necesariamente extras)">Noct.</th>
-                        <th>Enganche</th>
-                        <th>Reenganche</th>
-                        <th>Pen.</th>
-                        <th title="Ext. día + Ext. noche + Enganche + Reenganche + Penalties">Tot. Ext.</th>
-                        <th>6to día</th>
+                        {ath('workDate', 'Fecha')}
+                        {ath('userName', 'Usuario')}
+                        {canSeeProjectAdmin(currentProfile.role) && <th>UID</th>}
+                        {canSeeProjectAdmin(currentProfile.role) && <th>Email</th>}
+                        {ath('area', 'Área')}
+                        {ath('role', 'Rol')}
+                        {ath('shiftLabel', 'Jornada')}
+                        {ath('timeIn', 'Entrada')}
+                        {ath('timeOut', 'Salida')}
+                        {ath('workedHours', 'Hs. Trab.')}
+                        {ath('overtimeDay', 'Ext. día', 'Horas extras diurnas (extras totales menos extras nocturnas)')}
+                        {ath('nightOvertimeHours', 'Ext. noche', 'Horas extras nocturnas (parte de las extras que cae en ventana nocturna)')}
+                        {ath('nightHours', 'Noct.', 'Horas regulares dentro de la ventana nocturna (excluye las extras nocturnas, que se muestran en Ext. noche)')}
+                        {ath('engancheExtraHours', 'Enganche')}
+                        {ath('reengancheExtraHours', 'Reenganche')}
+                        {ath('penaltyHours', 'Pen.')}
+                        {ath('totalExtras', 'Tot. Ext.', 'Ext. día + Ext. noche + Enganche + Reenganche + Penalties')}
+                        {ath('isJornadaAdicional', '6to día')}
                         <th>Obs.</th>
                         <th>Acciones</th>
                       </tr>
@@ -3359,6 +3864,8 @@ export function DashboardPage() {
                             </td>
                             <td>{formatDate(entry.workDate)}</td>
                             <td>{entry.userName}</td>
+                            {canSeeProjectAdmin(currentProfile.role) && <td style={{ fontFamily: 'monospace', fontSize: '0.75em', whiteSpace: 'nowrap' }}>{entry.userId}</td>}
+                            {canSeeProjectAdmin(currentProfile.role) && <td style={{ fontSize: '0.8em', whiteSpace: 'nowrap' }}>{userOfEntry?.email ?? '—'}</td>}
                             <td>{areaName}</td>
                             <td>{roleName}</td>
                             <td>{entry.shiftLabel}</td>
@@ -3481,7 +3988,11 @@ export function DashboardPage() {
                         <thead>
                           <tr>
                             <th title="Color de revisión"></th>
-                            <th>Colaborador</th><th>Rol</th><th>$/h</th>
+                            <th>Colaborador</th>
+                            {canSeeProjectAdmin(currentProfile.role) && <th>UID</th>}
+                            {canSeeProjectAdmin(currentProfile.role) && <th>Email</th>}
+                            <th>Rol</th><th>$/h</th>
+                            <th>Valor Sem.</th><th>Valor Día</th>
                             <th>Hs. Norm.</th><th>Hs. Ext.</th><th>Hs. Noct.</th>
                             <th title="Horas extra que caen en ventana nocturna">Noct. Ext.</th>
                             <th>Enganches</th><th>Reenganches</th>
@@ -3501,12 +4012,21 @@ export function DashboardPage() {
                               setEditableLines((prev) => prev.map((line, idx) => {
                                 if (idx !== i) return line
                                 const updated = { ...line, [field]: val }
-                                const rp = Math.round(updated.regularHours * updated.hourlyRate * 100) / 100
+                                const hr = updated.hourlyRate
+                                const om = updated.overtimeMultiplier
+                                const nm = updated.nightMultiplier
+                                // Penalty a tarifa regular → suma en regularPay
+                                const rp = Math.round((updated.regularHours + updated.penaltyHours) * hr * 100) / 100
+                                // Overtime diurno = overtimeHours - nightOvertimeHours; + enganche + reenganche
+                                const dayOt = Math.max(0, updated.overtimeHours - (updated.nightOvertimeHours ?? 0))
                                 const op = Math.round(
-                                  (updated.overtimeHours + updated.penaltyHours + updated.engancheExtraHours + updated.reengancheExtraHours)
-                                  * updated.hourlyRate * updated.overtimeMultiplier * 100,
+                                  (dayOt + updated.engancheExtraHours + updated.reengancheExtraHours) * hr * om * 100,
                                 ) / 100
-                                const np = Math.round(updated.nightHours * updated.hourlyRate * updated.nightMultiplier * 100) / 100
+                                // Noche regular × nightMult + noche extra × overtimeMult × nightMult
+                                const noh = updated.nightOvertimeHours ?? 0
+                                const np = Math.round(
+                                  (updated.nightHours * hr * nm + noh * hr * om * nm) * 100,
+                                ) / 100
                                 const totalHours = Math.round((updated.regularHours + updated.overtimeHours) * 100) / 100
                                 return { ...updated, totalHours, regularPay: rp, overtimePay: op, nightPay: np, totalPay: Math.round((rp + op + np) * 100) / 100 }
                               }))
@@ -3547,8 +4067,23 @@ export function DashboardPage() {
                                   </div>
                                 </td>
                                 <td>{l.userName}</td>
+                                {canSeeProjectAdmin(currentProfile.role) && <td style={{ fontFamily: 'monospace', fontSize: '0.75em', whiteSpace: 'nowrap' }}>{l.userId}</td>}
+                                {canSeeProjectAdmin(currentProfile.role) && <td style={{ fontSize: '0.8em', whiteSpace: 'nowrap' }}>{projectUsers.find((u) => u.uid === l.userId)?.email ?? '—'}</td>}
                                 <td>{l.roleName ?? <span className="muted">—</span>}</td>
                                 <td>{l.hourlyRate > 0 ? l.hourlyRate.toFixed(2) : <span className="muted">—</span>}</td>
+                                {(() => {
+                                  const role = projectRoles.find((r) => r.id === l.roleId)
+                                  const vSemana = role?.weeklyRate ?? 0
+                                  const vDia = role
+                                    ? (role.weeklyRate > 0
+                                        ? Math.round((role.weeklyRate / (projectConfig?.weeklyWorkDays || 5)) * 100) / 100
+                                        : role.dailyRate)
+                                    : 0
+                                  return <>
+                                    <td>{vSemana > 0 ? vSemana.toFixed(2) : <span className="muted">—</span>}</td>
+                                    <td>{vDia > 0 ? vDia.toFixed(2) : <span className="muted">—</span>}</td>
+                                  </>
+                                })()}
                                 <td>{editableNum('regularHours', l.regularHours)}</td>
                                 <td>{editableNum('overtimeHours', l.overtimeHours)}</td>
                                 <td>{editableNum('nightHours', l.nightHours)}</td>
@@ -3565,7 +4100,7 @@ export function DashboardPage() {
                           })}
                           <tr style={{ fontWeight: 600, borderTop: '2px solid var(--line)' }}>
                             <td></td>
-                            <td colSpan={3}>TOTAL</td>
+                            <td colSpan={canSeeProjectAdmin(currentProfile.role) ? 7 : 5}>TOTAL</td>
                             <td>{editableLines.reduce((a, l) => a + (l.regularHours ?? 0), 0).toFixed(2)}</td>
                             <td>{editableLines.reduce((a, l) => a + (l.overtimeHours ?? 0), 0).toFixed(2)}</td>
                             <td>{editableLines.reduce((a, l) => a + (l.nightHours ?? 0), 0).toFixed(2)}</td>
@@ -3588,7 +4123,24 @@ export function DashboardPage() {
               {pastSettlements.length > 0 && (
                 <>
                   <hr />
-                  <h3>Historial de Liquidaciones</h3>
+                  <h3 style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                    Historial de Liquidaciones
+                    <span style={{ display: 'flex', gap: '6px', fontSize: '0.8rem', fontWeight: 400 }}>
+                      {([{ col: 'dateFrom', label: 'Fecha' }, { col: 'totalPay', label: 'Total $' }, { col: 'lines', label: 'Colaboradores' }] as { col: string; label: string }[]).map(({ col, label }) => {
+                        const active = settlementsSort.col === col
+                        return (
+                          <button
+                            key={col}
+                            className="btn-sm"
+                            style={{ opacity: active ? 1 : 0.55, padding: '2px 8px' }}
+                            onClick={() => setSettlementsSort((p) => p.col === col ? { col, dir: p.dir === 'asc' ? 'desc' : 'asc' } : { col, dir: 'asc' })}
+                          >
+                            {label}{active ? (settlementsSort.dir === 'asc' ? ' ▲' : ' ▼') : ''}
+                          </button>
+                        )
+                      })}
+                    </span>
+                  </h3>
                   <div className="stack">
                     {settlementsPagination.paged.map((s) => {
                       const isArchived = !!s.archivedAt
@@ -3661,6 +4213,225 @@ export function DashboardPage() {
               )}
             </section>
           )}
+
+          {/* ── ESTADÍSTICAS ── */}
+          {projectTab === 'STATS' && canAudit(currentProfile.role) && (
+            <section className="card">
+              <h2>Estadísticas de Horas</h2>
+              <p className="muted" style={{ marginTop: 0 }}>
+                Resumen de horas por usuario, área y período. Filtrá por fechas y áreas antes de buscar.
+              </p>
+
+              {/* Filtros */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem', alignItems: 'start', marginBottom: '1rem' }}>
+                <label>
+                  Desde
+                  <input type="date" value={statsDateFrom} onChange={(e) => setStatsDateFrom(e.target.value)} style={{ width: '100%' }} />
+                </label>
+                <label>
+                  Hasta
+                  <input type="date" value={statsDateTo} onChange={(e) => setStatsDateTo(e.target.value)} style={{ width: '100%' }} />
+                </label>
+                <div style={{ gridColumn: 'span 2' }}>
+                  <div className="muted" style={{ fontSize: '0.8em', marginBottom: '0.35rem' }}>Áreas (vacío = todas)</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
+                    {areas.length === 0 && <span className="muted" style={{ fontSize: '0.85em' }}>Sin áreas configuradas</span>}
+                    {areas.map((a) => (
+                      <label key={a.id} style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', fontWeight: 'normal', fontSize: '0.88em', whiteSpace: 'nowrap' }}>
+                        <input
+                          type="checkbox"
+                          checked={statsSelectedAreas.includes(a.id)}
+                          onChange={(ev) => setStatsSelectedAreas((prev) =>
+                            ev.target.checked ? [...prev, a.id] : prev.filter((x) => x !== a.id)
+                          )}
+                        />
+                        {a.name}
+                      </label>
+                    ))}
+                    {areas.length > 0 && (
+                      <button
+                        className="btn-sm btn-outline"
+                        style={{ fontSize: '0.78em' }}
+                        onClick={() => setStatsSelectedAreas([])}
+                        title="Ver todas las áreas"
+                      >
+                        Todas
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                  <button className="btn" onClick={() => { void loadStatsEntries() }} disabled={statsLoading}>
+                    {statsLoading ? <Spinner /> : 'Buscar'}
+                  </button>
+                  <button
+                    className="btn btn-outline"
+                    onClick={downloadStatsXlsx}
+                    disabled={statsEntries.length === 0 || statsLoading}
+                    title="Descargar Excel con las 3 hojas: Por usuario, Por área, Por semana"
+                  >
+                    ⬇ Descargar XLS
+                  </button>
+                </div>
+              </div>
+
+              {statsEntries.length === 0 && !statsLoading && (
+                <p className="muted">Seleccioná un rango y presioná Buscar.</p>
+              )}
+
+              {statsEntries.length > 0 && (
+                <>
+                  {/* Resumen total */}
+                  <div className="row" style={{ gap: '1rem', flexWrap: 'wrap', marginBottom: '1.25rem' }}>
+                    {[
+                      { label: 'Jornadas', value: statsEntries.length },
+                      { label: 'Hs. trabajadas', value: statsEntries.reduce((s, e) => Math.round((s + e.calculation.workedHours) * 100) / 100, 0) },
+                      { label: 'Hs. regulares', value: statsEntries.reduce((s, e) => Math.round((s + e.calculation.regularHours) * 100) / 100, 0) },
+                      { label: 'Hs. extras', value: statsEntries.reduce((s, e) => Math.round((s + (e.calculation.overtimeHours ?? 0) + (e.calculation.engancheExtraHours ?? 0) + (e.calculation.reengancheExtraHours ?? 0)) * 100) / 100, 0) },
+                      { label: 'Hs. nocturnas', value: statsEntries.reduce((s, e) => Math.round((s + (e.calculation.nightHours ?? 0)) * 100) / 100, 0) },
+                    ].map((kpi) => (
+                      <div key={kpi.label} style={{ background: 'var(--surface, #f8fafc)', border: '1px solid var(--border, #e2e8f0)', borderRadius: '8px', padding: '0.6rem 1rem', minWidth: '110px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '1.4em', fontWeight: 700 }}>{kpi.value}</div>
+                        <div className="muted" style={{ fontSize: '0.78em' }}>{kpi.label}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Sub-tabs */}
+                  <nav className="subtab-row" style={{ marginBottom: '1rem' }}>
+                    {([['users', 'Por usuario'], ['areas', 'Por área'], ['dates', 'Por semana']] as const).map(([k, lbl]) => (
+                      <button key={k} className={`subtab ${statsSubTab === k ? 'active' : ''}`} onClick={() => setStatsSubTab(k)}>{lbl}</button>
+                    ))}
+                  </nav>
+
+                  {/* ── Por usuario ── */}
+                  {statsSubTab === 'users' && (
+                    <>
+                      <div style={{ overflowX: 'auto', marginBottom: '1.5rem' }}>
+                        <table className="audit-table">
+                          <thead>
+                            <tr>
+                              <th>Usuario</th><th>Área</th><th>Jornadas</th>
+                              <th>Hs. Trabajadas</th><th>Hs. Regulares</th>
+                              <th>Hs. Extras</th><th>Hs. Nocturnas</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {statsByUser.map((r) => (
+                              <tr key={r.userId}>
+                                <td>{r.userName}</td>
+                                <td>{r.areaName}</td>
+                                <td style={{ textAlign: 'center' }}>{r.jornadas}</td>
+                                <td style={{ textAlign: 'right', fontWeight: 600 }}>{r.worked}</td>
+                                <td style={{ textAlign: 'right' }}>{r.regular}</td>
+                                <td style={{ textAlign: 'right', color: r.extras > 0 ? '#f97316' : undefined }}>{r.extras}</td>
+                                <td style={{ textAlign: 'right' }}>{r.night}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div style={{ marginBottom: '0.5rem', fontSize: '0.82em' }} className="muted">Horas trabajadas por usuario</div>
+                      <ResponsiveContainer width="100%" height={Math.max(200, statsByUser.length * 42)}>
+                        <BarChart data={statsByUser} layout="vertical" margin={{ top: 4, right: 32, left: 0, bottom: 4 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis type="number" tick={{ fontSize: 11 }} />
+                          <YAxis type="category" dataKey="userName" width={130} tick={{ fontSize: 11 }} />
+                          <Tooltip formatter={(v) => [`${v} hs`, '']} />
+                          <Legend wrapperStyle={{ fontSize: 12 }} />
+                          <Bar dataKey="regular" name="Regulares" stackId="a" fill="#3b82f6" />
+                          <Bar dataKey="extras" name="Extras" stackId="a" fill="#f97316" />
+                          <Bar dataKey="night" name="Nocturnas" stackId="a" fill="#8b5cf6" />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </>
+                  )}
+
+                  {/* ── Por área ── */}
+                  {statsSubTab === 'areas' && (
+                    <>
+                      <div style={{ overflowX: 'auto', marginBottom: '1.5rem' }}>
+                        <table className="audit-table">
+                          <thead>
+                            <tr>
+                              <th>Área</th><th>Jornadas</th><th>Hs. Trabajadas</th><th>Hs. Extras</th><th>% del total</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {statsByArea.map((r) => (
+                              <tr key={r.areaId}>
+                                <td>{r.areaName}</td>
+                                <td style={{ textAlign: 'center' }}>{r.jornadas}</td>
+                                <td style={{ textAlign: 'right', fontWeight: 600 }}>{r.worked}</td>
+                                <td style={{ textAlign: 'right', color: r.extras > 0 ? '#f97316' : undefined }}>{r.extras}</td>
+                                <td style={{ textAlign: 'right' }}>{r.pct}%</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div style={{ marginBottom: '0.5rem', fontSize: '0.82em' }} className="muted">Distribución de horas trabajadas por área</div>
+                      <ResponsiveContainer width="100%" height={320}>
+                        <PieChart>
+                          <Pie
+                            data={statsByArea}
+                            dataKey="worked"
+                            nameKey="areaName"
+                            cx="50%"
+                            cy="50%"
+                            outerRadius={120}
+                            label={({ name, percent }: { name?: string; percent?: number }) =>
+                              name ? `${name} ${Math.round((percent ?? 0) * 100)}%` : ''
+                            }
+                            labelLine={true}
+                          >
+                            {statsByArea.map((_, i) => (
+                              <Cell key={i} fill={['#3b82f6','#f97316','#22c55e','#8b5cf6','#eab308','#ef4444','#06b6d4','#ec4899'][i % 8]} />
+                            ))}
+                          </Pie>
+                          <Tooltip formatter={(v) => [`${v} hs`, 'Trabajadas']} />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    </>
+                  )}
+
+                  {/* ── Por semana ── */}
+                  {statsSubTab === 'dates' && (
+                    <>
+                      <div style={{ overflowX: 'auto', marginBottom: '1.5rem' }}>
+                        <table className="audit-table">
+                          <thead>
+                            <tr><th>Semana</th><th>Hs. Trabajadas</th><th>Hs. Extras</th></tr>
+                          </thead>
+                          <tbody>
+                            {statsByDate.map((r) => (
+                              <tr key={r.week}>
+                                <td>{r.label}</td>
+                                <td style={{ textAlign: 'right', fontWeight: 600 }}>{r.worked}</td>
+                                <td style={{ textAlign: 'right', color: r.extras > 0 ? '#f97316' : undefined }}>{r.extras}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <div style={{ marginBottom: '0.5rem', fontSize: '0.82em' }} className="muted">Evolución semanal de horas</div>
+                      <ResponsiveContainer width="100%" height={280}>
+                        <LineChart data={statsByDate} margin={{ top: 4, right: 32, left: 0, bottom: 4 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="label" tick={{ fontSize: 10 }} />
+                          <YAxis tick={{ fontSize: 11 }} />
+                          <Tooltip formatter={(v) => [`${v} hs`, '']} />
+                          <Legend wrapperStyle={{ fontSize: 12 }} />
+                          <Line type="monotone" dataKey="worked" name="Trabajadas" stroke="#3b82f6" strokeWidth={2} dot={{ r: 3 }} />
+                          <Line type="monotone" dataKey="extras" name="Extras" stroke="#f97316" strokeWidth={2} dot={{ r: 3 }} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </>
+                  )}
+                </>
+              )}
+            </section>
+          )}
         </>
       )}
 
@@ -3697,6 +4468,413 @@ export function DashboardPage() {
               {repairBusy ? 'Reconciliando…' : 'Reconciliar duplicados'}
             </button>
           </nav>
+          {canAudit(currentProfile.role) && (
+            <details
+              style={{ margin: '0.5rem 0 1rem' }}
+              onToggle={(e) => {
+                if ((e.target as HTMLDetailsElement).open && recoveryRequests === null) {
+                  void loadRecoveryRequests('PENDING')
+                }
+              }}
+            >
+              <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none', padding: '6px 0' }}>
+                ✉️ Solicitudes de recuperación de email (No recuerdo el mail)
+              </summary>
+              <div style={{ padding: '0.75rem 0 0' }}>
+                <p className="muted" style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+                  Lista de usuarios que intentaron registrar un Cédula/DNI que ya estaba reclamado y no recuerdan con qué mail se registraron originalmente. Resolvé cada caso comunicándote con el usuario por fuera de la app.
+                </p>
+                <div className="row" style={{ gap: 8, marginBottom: '0.75rem', alignItems: 'center' }}>
+                  <select
+                    value={recoveryFilter}
+                    onChange={(e) => {
+                      const v = e.target.value as 'PENDING' | 'ALL'
+                      setRecoveryFilter(v)
+                      void loadRecoveryRequests(v)
+                    }}
+                  >
+                    <option value="PENDING">Solo pendientes</option>
+                    <option value="ALL">Todas</option>
+                  </select>
+                  <button
+                    className="btn-sm btn-outline"
+                    disabled={recoveryBusy}
+                    onClick={() => { void loadRecoveryRequests(recoveryFilter) }}
+                  >
+                    {recoveryBusy ? <><Spinner size={12} inline /> Cargando…</> : 'Refrescar'}
+                  </button>
+                </div>
+                {recoveryRequests === null ? (
+                  <p className="muted" style={{ fontSize: '0.85rem' }}>Tocá "Refrescar" para cargar las solicitudes.</p>
+                ) : recoveryRequests.length === 0 ? (
+                  <p className="muted" style={{ fontSize: '0.85rem' }}>Sin solicitudes {recoveryFilter === 'PENDING' ? 'pendientes' : ''}.</p>
+                ) : (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table className="audit-table">
+                      <thead>
+                        <tr>
+                          <th>Estado</th>
+                          <th>Solicitante</th>
+                          <th>Email actual</th>
+                          <th>Cédula/DNI</th>
+                          <th>UID solicitante</th>
+                          <th>Notas</th>
+                          <th>Acción</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {recoveryRequests.map((req) => (
+                          <tr key={req.id}>
+                            <td>
+                              {req.status === 'PENDING' && <span style={{ color: '#b45309', fontWeight: 600 }}>Pendiente</span>}
+                              {req.status === 'RESOLVED' && <span style={{ color: '#16a34a' }}>Resuelta</span>}
+                              {req.status === 'DISMISSED' && <span style={{ color: '#6b7280' }}>Descartada</span>}
+                            </td>
+                            <td>{req.requestingDisplayName ?? <span className="muted">—</span>}</td>
+                            <td>{req.requestingEmail ?? <span className="muted">—</span>}</td>
+                            <td style={{ fontFamily: 'monospace' }}>{req.idNumber}</td>
+                            <td style={{ fontFamily: 'monospace', fontSize: '0.75em', whiteSpace: 'nowrap' }}>{req.requestingUid}</td>
+                            <td style={{ fontSize: '0.78rem' }}>{req.notes ?? <span className="muted">—</span>}</td>
+                            <td>
+                              {req.status === 'PENDING' ? (
+                                <div className="row" style={{ gap: 4, flexWrap: 'wrap' }}>
+                                  <button
+                                    className="btn-sm"
+                                    disabled={recoveryActionUid === req.id}
+                                    onClick={() => { void handleResolveRecovery(req) }}
+                                  >
+                                    {recoveryActionUid === req.id ? <Spinner size={10} inline /> : 'Resolver'}
+                                  </button>
+                                  <button
+                                    className="btn-sm btn-outline"
+                                    disabled={recoveryActionUid === req.id}
+                                    onClick={() => { void handleDismissRecovery(req) }}
+                                  >
+                                    Descartar
+                                  </button>
+                                </div>
+                              ) : (
+                                <span className="muted" style={{ fontSize: '0.78rem' }}>—</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </details>
+          )}
+          {canSeeProjectAdmin(currentProfile.role) && (
+            <details style={{ margin: '0.5rem 0 1rem' }}>
+              <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none', padding: '6px 0' }}>
+                🔗 Buscar y reemplazar UID (manual)
+              </summary>
+              <div style={{ padding: '0.75rem 0 0' }}>
+                <p className="muted" style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+                  Reemplaza el <strong>userId</strong> en todas las jornadas (<code>time_entries</code>) y registros de actividad (<code>system_logs</code>) que coincidan con el primer UID por el segundo, y marca <code>users/{'{UID buscado}'}</code> como fusionado al UID de reemplazo (<code>mergedToUid</code>). Si completás <strong>Reemplazar email con</strong>, ese email también se propaga a entries y logs (no se modifica el documento del UID de reemplazo).
+                </p>
+                <div className="row" style={{ gap: '8px', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
+                  <input
+                    type="text"
+                    placeholder="Buscar UID"
+                    value={uidReconForm.search}
+                    onChange={(e) => { setUidReconForm((p) => ({ ...p, search: e.target.value.trim() })); setUidReconPreview(null) }}
+                    style={{ fontFamily: 'monospace', flex: '1 1 220px' }}
+                  />
+                  <input
+                    type="text"
+                    placeholder="Reemplazar con UID"
+                    value={uidReconForm.replace}
+                    onChange={(e) => { setUidReconForm((p) => ({ ...p, replace: e.target.value.trim() })); setUidReconPreview(null) }}
+                    style={{ fontFamily: 'monospace', flex: '1 1 220px' }}
+                  />
+                  <input
+                    type="email"
+                    placeholder="Reemplazar email con (opcional)"
+                    value={uidReconForm.replaceEmail}
+                    onChange={(e) => { setUidReconForm((p) => ({ ...p, replaceEmail: e.target.value.trim() })) }}
+                    style={{ flex: '1 1 220px' }}
+                  />
+                  <button
+                    className="btn btn-outline"
+                    disabled={uidReconBusy || !uidReconForm.search || !uidReconForm.replace || uidReconForm.search === uidReconForm.replace}
+                    onClick={async () => {
+                      setUidReconBusy(true)
+                      setUidReconPreview(null)
+                      try {
+                        const preview = await previewUidReplace(uidReconForm.search, uidReconForm.replace)
+                        setUidReconPreview(preview)
+                      } catch (err) {
+                        showToast('Error al analizar UIDs.', 'error')
+                        console.error(err)
+                      } finally {
+                        setUidReconBusy(false)
+                      }
+                    }}
+                  >
+                    {uidReconBusy ? <><Spinner size={14} inline /> Buscando…</> : 'Buscar'}
+                  </button>
+                </div>
+                {uidReconPreview && (
+                  <div style={{ overflowX: 'auto', marginTop: '0.75rem' }}>
+                    <table className="audit-table" style={{ marginBottom: '0.75rem' }}>
+                      <thead>
+                        <tr>
+                          <th>Rol</th>
+                          <th>UID</th>
+                          <th>Nombre</th>
+                          <th>Email</th>
+                          <th>Estado</th>
+                          <th>Entries</th>
+                          <th>Logs</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {([
+                          { label: 'Buscar', uid: uidReconPreview.searchUid, profile: uidReconPreview.searchProfile, entries: uidReconPreview.searchEntries, logs: uidReconPreview.searchLogs },
+                          { label: 'Reemplazar con', uid: uidReconPreview.replaceUid, profile: uidReconPreview.replaceProfile, entries: uidReconPreview.replaceEntries, logs: null as number | null },
+                        ]).map(({ label, uid, profile, entries, logs }) => (
+                          <tr key={label}>
+                            <td><strong>{label}</strong></td>
+                            <td style={{ fontFamily: 'monospace', fontSize: '0.75em', whiteSpace: 'nowrap' }}>{uid}</td>
+                            <td>{profile?.displayName ?? <span className="muted">—</span>}</td>
+                            <td>{profile?.email ?? <span className="muted">—</span>}</td>
+                            <td>{profile ? (profile.approvalStatus ?? '—') : <span style={{ color: '#ef4444' }}>sin perfil</span>}</td>
+                            <td><strong>{entries}</strong></td>
+                            <td>{logs === null ? <span className="muted">—</span> : <strong>{logs}</strong>}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                      <p style={{ margin: 0, fontSize: '0.85rem' }}>
+                        Se actualizarán <strong>{uidReconPreview.searchEntries}</strong> jornada(s) y <strong>{uidReconPreview.searchLogs}</strong> log(s); <code>users/{uidReconPreview.searchUid}</code> quedará marcado como <code>mergedToUid: {uidReconPreview.replaceUid}</code>.
+                        {uidReconForm.replaceEmail && (
+                          <> Email a propagar: <strong>{uidReconForm.replaceEmail}</strong>.</>
+                        )}
+                      </p>
+                      <button
+                        className="btn"
+                        style={{ background: '#ef4444', color: 'white', borderColor: '#ef4444' }}
+                        disabled={uidReconBusy || (uidReconPreview.searchEntries === 0 && uidReconPreview.searchLogs === 0 && !uidReconPreview.searchProfile)}
+                        onClick={async () => {
+                          if (!window.confirm(
+                            `¿Ejecutar buscar y reemplazar?\n\n` +
+                            `BUSCAR userId: ${uidReconPreview.searchUid}\n` +
+                            `REEMPLAZAR con: ${uidReconPreview.replaceUid}\n` +
+                            (uidReconForm.replaceEmail ? `EMAIL a propagar: ${uidReconForm.replaceEmail}\n` : '') +
+                            `\n` +
+                            `• ${uidReconPreview.searchEntries} jornada(s) actualizada(s)\n` +
+                            `• ${uidReconPreview.searchLogs} log(s) actualizado(s)\n` +
+                            (uidReconPreview.searchProfile ? `• users/${uidReconPreview.searchUid} marcado como mergedToUid\n` : '') +
+                            `\nEsta operación no es fácil de deshacer. ¿Continuar?`
+                          )) return
+                          setUidReconBusy(true)
+                          try {
+                            const result = await executeUidReplace(
+                              uidReconPreview.searchUid,
+                              uidReconPreview.replaceUid,
+                              uidReconForm.replaceEmail || null,
+                            )
+                            showToast(
+                              `Listo. ${result.entriesUpdated} jornada(s), ${result.logsUpdated} log(s)` +
+                                (result.userMerged ? ' y 1 usuario fusionado.' : ' actualizado(s).'),
+                            )
+                            setUidReconPreview(null)
+                            setUidReconForm({ search: '', replace: '', replaceEmail: '' })
+                          } catch (err) {
+                            showToast(err instanceof Error ? err.message : 'Error al ejecutar el reemplazo.', 'error')
+                            console.error(err)
+                          } finally {
+                            setUidReconBusy(false)
+                          }
+                        }}
+                      >
+                        {uidReconBusy ? <><Spinner size={14} inline /> Ejecutando…</> : 'Reemplazar'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </details>
+          )}
+          {canSeeProjectAdmin(currentProfile.role) && (
+            <details style={{ margin: '0.5rem 0 1rem' }}>
+              <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none', padding: '6px 0' }}>
+                🩺 Auditar entries huérfanas (UID sin user válido)
+              </summary>
+              <div style={{ padding: '0.75rem 0 0' }}>
+                <p className="muted" style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+                  Recorre las jornadas (<code>time_entries</code>) de los últimos N días y reporta los <code>userId</code> cuyo documento <code>users/{'{uid}'}</code> <strong>no existe</strong> o está marcado como <strong>fusionado</strong> (<code>mergedToUid</code> presente). Para cada UID podés crear un <code>users/{'{uid}'}</code> mínimo (rol MEMBER, PENDING) que después podés aprobar, asignar o fusionar manualmente.
+                </p>
+                <p className="muted" style={{ fontSize: '0.78rem', marginBottom: '0.75rem' }}>
+                  ⚠️ Costo: 1 lectura por jornada en el rango + 1 lectura por UID único. Empezá con 30 días.
+                </p>
+                <div className="row" style={{ gap: '8px', flexWrap: 'wrap', marginBottom: '0.5rem', alignItems: 'center' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.85rem' }}>
+                    Días a auditar:
+                    <input
+                      type="number"
+                      min={1}
+                      max={365}
+                      value={orphanDays}
+                      onChange={(e) => setOrphanDays(Math.max(1, Math.min(365, Number(e.target.value) || 30)))}
+                      style={{ width: 80 }}
+                    />
+                  </label>
+                  <button
+                    className="btn btn-outline"
+                    disabled={orphanBusy}
+                    onClick={async () => {
+                      setOrphanBusy(true)
+                      try {
+                        const rows = await auditOrphanEntries({ daysBack: orphanDays })
+                        setOrphanRows(rows)
+                        if (rows.length === 0) showToast('Sin huérfanas en el rango. ✅')
+                        else showToast(`${rows.length} UID huérfano(s) encontrado(s).`)
+                      } catch (err) {
+                        showToast('Error al auditar entries.', 'error')
+                        console.error(err)
+                      } finally {
+                        setOrphanBusy(false)
+                      }
+                    }}
+                  >
+                    {orphanBusy ? <><Spinner size={14} inline /> Auditando…</> : 'Ejecutar auditoría'}
+                  </button>
+                </div>
+                {orphanRows && orphanRows.length > 0 && (
+                  <div style={{ overflowX: 'auto', marginTop: '0.75rem' }}>
+                    <table className="audit-table">
+                      <thead>
+                        <tr>
+                          <th>UID (en entries)</th>
+                          <th>Nombre</th>
+                          <th>Email actual</th>
+                          <th>Entries</th>
+                          <th>Última fecha</th>
+                          <th>Estado del doc</th>
+                          <th>Email a propagar (opcional)</th>
+                          <th>Acción</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {orphanRows.map((row) => {
+                          const overrideEmail = orphanEmailOverride[row.userId] ?? ''
+                          const effectiveEmail = (overrideEmail.trim() || row.userEmail || '').trim() || null
+                          return (
+                          <tr key={row.userId}>
+                            <td style={{ fontFamily: 'monospace', fontSize: '0.75em', whiteSpace: 'nowrap' }}>{row.userId}</td>
+                            <td>{row.userName ?? <span className="muted">—</span>}</td>
+                            <td>{row.userEmail ?? <span className="muted">—</span>}</td>
+                            <td><strong>{row.entriesCount}</strong></td>
+                            <td>{row.lastWorkDate ?? <span className="muted">—</span>}</td>
+                            <td>
+                              {!row.userExists && <span style={{ color: '#ef4444', fontWeight: 600 }}>No existe</span>}
+                              {row.userExists && row.mergedToUid && (
+                                <span style={{ color: '#b45309' }}>
+                                  Fusionado → <code style={{ fontSize: '0.85em' }}>{row.mergedToUid}</code>
+                                </span>
+                              )}
+                            </td>
+                            <td>
+                              <input
+                                type="email"
+                                value={overrideEmail}
+                                placeholder={row.userEmail ?? 'email@dominio'}
+                                onChange={(e) => setOrphanEmailOverride((prev) => ({ ...prev, [row.userId]: e.target.value }))}
+                                style={{ width: 180, fontSize: '0.78rem' }}
+                              />
+                            </td>
+                            <td>
+                              {!row.userExists ? (
+                                <button
+                                  className="btn-sm"
+                                  disabled={orphanCreatingUid === row.userId}
+                                  onClick={async () => {
+                                    if (!window.confirm(
+                                      `Crear documento users/${row.userId}?\n\n` +
+                                      `Nombre: ${row.userName ?? '—'}\n` +
+                                      `Email: ${effectiveEmail ?? '—'}\n\n` +
+                                      `Se creará con rol MEMBER y estado PENDING. Después podrás aprobarlo o fusionarlo.`
+                                    )) return
+                                    setOrphanCreatingUid(row.userId)
+                                    try {
+                                      await createMinimalUserDoc(row.userId, {
+                                        displayName: row.userName,
+                                        email: effectiveEmail,
+                                      })
+                                      showToast(`User creado: ${row.userId}`)
+                                      // Refrescar listas y la propia auditoría
+                                      setOrphanRows((prev) => prev?.filter((r) => r.userId !== row.userId) ?? null)
+                                      void loadUsersPanels()
+                                    } catch (err) {
+                                      showToast(err instanceof Error ? err.message : 'Error al crear user.', 'error')
+                                      console.error(err)
+                                    } finally {
+                                      setOrphanCreatingUid(null)
+                                    }
+                                  }}
+                                >
+                                  {orphanCreatingUid === row.userId ? <><Spinner size={12} inline /> Creando…</> : 'Crear user'}
+                                </button>
+                              ) : row.mergedToUid ? (
+                                <button
+                                  className="btn-sm"
+                                  disabled={orphanCreatingUid === row.userId}
+                                  title={`Reasigna las ${row.entriesCount} entries de ${row.userId} al UID destino ${row.mergedToUid}, y propaga el email indicado si existe.`}
+                                  onClick={async () => {
+                                    const targetUid = row.mergedToUid!
+                                    if (!window.confirm(
+                                      `Reasignar entries del UID fusionado al UID destino?\n\n` +
+                                      `Origen (huérfano): ${row.userId}\n` +
+                                      `Destino (mergedToUid): ${targetUid}\n` +
+                                      (effectiveEmail ? `Email a propagar: ${effectiveEmail}\n` : '') +
+                                      `\n• ${row.entriesCount} jornada(s) cambiarán su userId al destino.\n` +
+                                      `• También se actualizan los system_logs.\n` +
+                                      `• El doc users/${row.userId} ya estaba fusionado y se reafirma.\n\n` +
+                                      `¿Continuar?`
+                                    )) return
+                                    setOrphanCreatingUid(row.userId)
+                                    try {
+                                      const result = await executeUidReplace(row.userId, targetUid, effectiveEmail)
+                                      showToast(
+                                        `Reasignado. ${result.entriesUpdated} jornada(s), ${result.logsUpdated} log(s)` +
+                                          (result.userMerged ? ' (user marcado).' : ' (user no actualizado).'),
+                                      )
+                                      setOrphanRows((prev) => prev?.filter((r) => r.userId !== row.userId) ?? null)
+                                      void loadUsersPanels()
+                                    } catch (err) {
+                                      showToast(err instanceof Error ? err.message : 'Error al reasignar.', 'error')
+                                      console.error(err)
+                                    } finally {
+                                      setOrphanCreatingUid(null)
+                                    }
+                                  }}
+                                >
+                                  {orphanCreatingUid === row.userId
+                                    ? <><Spinner size={12} inline /> Reasignando…</>
+                                    : `Reasignar → ${row.mergedToUid.slice(0, 6)}…`}
+                                </button>
+                              ) : (
+                                <span className="muted" style={{ fontSize: '0.78rem' }}>—</span>
+                              )}
+                            </td>
+                          </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {orphanRows && orphanRows.length === 0 && (
+                  <p className="muted" style={{ fontSize: '0.85rem' }}>Sin huérfanas en los últimos {orphanDays} día(s).</p>
+                )}
+              </div>
+            </details>
+          )}
           {(() => {
             const lu = formatLastUpdate([...approvedUsers, ...pendingUsers])
             return lu ? (
@@ -3811,6 +4989,11 @@ export function DashboardPage() {
                         <div>
                           <strong>{pendingUser.displayName ?? 'Sin nombre'}</strong>
                           <p className="muted" style={{ margin: 0 }}>{pendingUser.email}</p>
+                          <p className="muted" style={{ margin: '2px 0 0', fontSize: '0.78rem' }}>
+                            Cédula/DNI: {pendingUser.idNumber
+                              ? <strong style={{ fontFamily: 'monospace' }}>{pendingUser.idNumber}</strong>
+                              : <span style={{ color: '#ef4444' }}>sin DNI</span>}
+                          </p>
                         </div>
                         <button className="btn" onClick={() => openApproveModal(pendingUser)}>
                           Aprobar...
@@ -3855,7 +5038,7 @@ export function DashboardPage() {
               )}
               <input
                 type="search"
-                placeholder="Buscar por nombre o email..."
+                placeholder="Buscar por nombre, email, UID o DNI..."
                 value={userSearch}
                 onChange={(e) => setUserSearch(e.target.value)}
                 style={{ marginBottom: '0.75rem' }}
@@ -3869,6 +5052,14 @@ export function DashboardPage() {
                       <div>
                         <strong>{u.displayName ?? '—'}</strong>
                         <p className="muted" style={{ margin: '2px 0' }}>{u.email}</p>
+                        {canSeeProjectAdmin(currentProfile.role) && (
+                          <p className="muted" style={{ margin: '2px 0', fontFamily: 'monospace', fontSize: '0.78em' }}>UID: {u.uid}</p>
+                        )}
+                        <p className="muted" style={{ margin: '2px 0', fontSize: '0.82em' }}>
+                          Cédula/DNI: {u.idNumber
+                            ? <strong style={{ fontFamily: 'monospace' }}>{u.idNumber}</strong>
+                            : <span style={{ color: '#ef4444' }}>sin DNI</span>}
+                        </p>
                         <div className="row" style={{ gap: '6px', flexWrap: 'wrap', marginTop: '4px' }}>
                           {u.isPlaceholder && (
                             <span className="chip" style={{ background: '#f97316', color: '#fff', fontSize: '0.72rem' }}>Sin primer acceso</span>
@@ -4287,6 +5478,40 @@ export function DashboardPage() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>Editar usuario</h3>
             <p className="muted" style={{ marginTop: 0 }}>{editingUser.email}</p>
+            <div
+              style={{
+                background: 'var(--bg-accent)',
+                border: '1px solid var(--line)',
+                padding: '0.6rem 0.75rem',
+                borderRadius: 6,
+                margin: '0 0 0.85rem',
+              }}
+            >
+              <strong style={{ fontSize: '0.85rem' }}>Cédula/DNI</strong>
+              <div className="row" style={{ gap: '6px', marginTop: 6, flexWrap: 'wrap' }}>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={editIdNumber}
+                  onChange={(e) => setEditIdNumber(e.target.value)}
+                  onBlur={() => setEditIdNumber(normalizeIdNumber(editIdNumber))}
+                  placeholder="6 a 12 dígitos"
+                  style={{ flex: '1 1 160px', fontFamily: 'monospace' }}
+                />
+                <button
+                  type="button"
+                  className="btn-sm"
+                  disabled={editIdNumberBusy || !isValidIdNumber(editIdNumber) || normalizeIdNumber(editIdNumber) === (editingUser.idNumber ?? '')}
+                  onClick={() => { void handleAdminUpdateIdNumber() }}
+                >
+                  {editIdNumberBusy ? <><Spinner size={12} inline /> Guardando…</> : (editingUser.idNumber ? 'Actualizar DNI' : 'Asignar DNI')}
+                </button>
+              </div>
+              <p className="muted" style={{ fontSize: '0.75rem', margin: '4px 0 0' }}>
+                Cambia el documento <code>users/{'{uid}'}.idNumber</code> y mueve el candado de unicidad <code>id_numbers/{'{dni}'}</code>. Si el nuevo DNI ya está reclamado por otro usuario, falla.
+              </p>
+            </div>
             <form className="stack" onSubmit={(e) => { void handleSaveUserEdit(e) }}>
               <label>
                 Nombre y apellido
@@ -4353,6 +5578,115 @@ export function DashboardPage() {
             </form>
           </div>
         </div>
+      )}
+
+      {/* === REGISTROS DEL SISTEMA === */}
+      {mainTab === 'SYSTEM_LOGS' && canSeeProjectAdmin(currentProfile.role) && (
+        <section className="card">
+          <h2>Registros del sistema</h2>
+          <p className="muted" style={{ marginTop: 0 }}>
+            Actividad de todos los usuarios: cargas, ediciones, eliminaciones e ingresos al sistema.
+          </p>
+
+          {/* Filtros */}
+          <div className="row" style={{ flexWrap: 'wrap', gap: '0.75rem', alignItems: 'flex-end', marginBottom: '1rem' }}>
+            <label style={{ flex: '0 0 auto' }}>
+              Desde
+              <input
+                type="date"
+                value={sysLogsDateFrom}
+                onChange={(e) => setSysLogsDateFrom(e.target.value)}
+              />
+            </label>
+            <label style={{ flex: '0 0 auto' }}>
+              Hasta
+              <input
+                type="date"
+                value={sysLogsDateTo}
+                onChange={(e) => setSysLogsDateTo(e.target.value)}
+              />
+            </label>
+            <button
+              className="btn"
+              onClick={() => { void loadSysLogs() }}
+              disabled={sysLogsLoading}
+            >
+              {sysLogsLoading ? <Spinner /> : 'Buscar'}
+            </button>
+            <button
+              className="btn btn-outline"
+              onClick={() => { void loadSysLogs() }}
+              disabled={sysLogsLoading}
+              title="Refrescar"
+            >
+              ↺ Refrescar
+            </button>
+            <button
+              className="btn btn-outline"
+              onClick={downloadSysLogsXlsx}
+              disabled={sysLogs.length === 0 || sysLogsLoading}
+              title="Descargar Excel"
+            >
+              ⬇ Descargar XLS
+            </button>
+          </div>
+
+          {/* Tabla */}
+          {sysLogs.length === 0 && !sysLogsLoading && (
+            <p className="muted">Seleccioná un rango y presioná Buscar.</p>
+          )}
+
+          {sysLogs.length > 0 && (
+            <>
+              <div style={{ overflowX: 'auto' }}>
+                <table className="audit-table">
+                  <thead>
+                    <tr>
+                      <th>Fecha/Hora</th>
+                      <th>Tipo</th>
+                      <th>Usuario</th>
+                      <th>Email</th>
+                      <th>Jornada</th>
+                      <th>Detalle</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sysLogsPagination.paged.map((log) => {
+                      const ts = (log.timestamp as { toDate?: () => Date } | null)?.toDate?.()
+                      const tsStr = ts
+                        ? ts.toLocaleDateString('es-UY', { day: '2-digit', month: '2-digit', year: 'numeric' }) +
+                          ' ' + ts.toLocaleTimeString('es-UY', { hour: '2-digit', minute: '2-digit' })
+                        : log.logDate
+                      const typeLabel: Record<string, string> = {
+                        entry_create: '➕ Carga',
+                        entry_edit: '✏️ Edición',
+                        entry_delete: '🗑 Eliminación',
+                        user_login: '🔑 Ingreso',
+                      }
+                      return (
+                        <tr key={log.id}>
+                          <td style={{ whiteSpace: 'nowrap', fontFamily: 'monospace', fontSize: '0.8em' }}>{tsStr}</td>
+                          <td>{typeLabel[log.type] ?? log.type}</td>
+                          <td>{log.userName}</td>
+                          <td style={{ fontFamily: 'monospace', fontSize: '0.78em' }}>{log.email ?? '—'}</td>
+                          <td>{log.workDate ?? '—'}</td>
+                          <td className="muted" style={{ fontSize: '0.82em', maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.details}>{log.details ?? '—'}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <Pagination
+                totalItems={sysLogs.length}
+                pageSize={sysLogsPagination.pageSize}
+                page={sysLogsPagination.page}
+                onPageChange={sysLogsPagination.setPage}
+                onPageSizeChange={sysLogsPagination.setPageSize}
+              />
+            </>
+          )}
+        </section>
       )}
 
       {/* === TOASTS === */}

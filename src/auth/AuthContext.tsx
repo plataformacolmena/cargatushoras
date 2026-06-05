@@ -14,7 +14,7 @@ import {
 } from 'firebase/auth'
 import { createContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { auth } from '../firebase'
-import { getUserProfile, upsertUserProfile } from '../services/firestore'
+import { getUserProfile, upsertUserProfile, writeSystemLog } from '../services/firestore'
 import type { UserProfile } from '../types/domain'
 
 interface AuthContextValue {
@@ -59,6 +59,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           displayName: firebaseUser.displayName,
         })
         setProfile(p)
+        // Registrar ingreso al sistema (fire-and-forget)
+        void writeSystemLog({
+          type: 'user_login',
+          userId: firebaseUser.uid,
+          userName: firebaseUser.displayName || p?.displayName || 'Sin nombre',
+          email: firebaseUser.email,
+          details: navigator.userAgent.slice(0, 120),
+        })
       } catch (err) {
         console.error('[AuthContext] upsertUserProfile error:', err)
         // Intentar cargar el perfil si ya fue creado parcialmente

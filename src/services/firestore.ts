@@ -42,13 +42,6 @@ export async function listRemindersForProject(projectId: string): Promise<Remind
   return snap.docs.map((d) => d.data() as Reminder)
 }
 
-/** Suscripción en tiempo real a recordatorios de un usuario. */
-export function subscribeToRemindersForUser(projectId: string, userId: string, cb: (reminders: Reminder[]) => void) {
-  const q = query(collection(db, 'reminders', projectId, 'items'), where('userId', '==', userId))
-  return onSnapshot(q, (snap) => {
-    cb(snap.docs.map((d) => d.data() as Reminder))
-  })
-}
 import {
   addDoc,
   collection,
@@ -75,6 +68,8 @@ import type {
   AppRole,
   AuditLock,
   CycleMode,
+  EmailRecoveryRequest,
+  EmailRecoveryStatus,
   Project,
   ProjectArea,
   ProjectConfig,
@@ -84,6 +79,7 @@ import type {
   ProjectTemplate,
   ProjectUpdateInput,
   Settlement,
+  SystemLog,
   TimeEntry,
   TimeEntryInput,
   UserProfile,
@@ -91,6 +87,19 @@ import type {
 } from '../types/domain'
 
 const CALCULATION_VERSION = 'v1-client'
+
+// ─── Utilidad: elimina campos undefined (Firestore los rechaza) ──────────────
+function stripUndefined<T>(obj: T): T {
+  if (Array.isArray(obj)) return obj.map(stripUndefined) as unknown as T
+  if (obj !== null && typeof obj === 'object') {
+    return Object.fromEntries(
+      Object.entries(obj as object)
+        .filter(([, v]) => v !== undefined)
+        .map(([k, v]) => [k, stripUndefined(v)]),
+    ) as T
+  }
+  return obj
+}
 
 // ─── Debounce de recalculateUserEntries ───────────────────────────────────
 // Agrupa ediciones consecutivas del mismo usuario en un único recálculo,
@@ -494,7 +503,7 @@ export async function saveProjectConfig(
 
 export async function saveTimeEntry(
   input: TimeEntryInput,
-  user: Pick<UserProfile, 'uid' | 'displayName' | 'areaId'>,
+  user: Pick<UserProfile, 'uid' | 'displayName' | 'email'> & { areaId?: string | null },
 ): Promise<void> {
   assertTimeEntryInput(input)
   const config = await getProjectConfig(input.projectId)
@@ -507,6 +516,7 @@ export async function saveTimeEntry(
     ...input,
     userId: user.uid,
     userName: user.displayName || 'Sin nombre',
+    userEmail: user.email ?? null,
     areaId: user.areaId ?? null,
     calculation,
     calculationSource: 'client',
@@ -516,13 +526,23 @@ export async function saveTimeEntry(
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
+  void writeSystemLog({
+    type: 'entry_create',
+    userId: user.uid,
+    userName: user.displayName || 'Sin nombre',
+    email: (user as { email?: string | null }).email ?? null,
+    projectId: input.projectId,
+    workDate: input.workDate,
+    details: `${input.timeIn}→${input.timeOut}`,
+  })
   // Recalcular enganche/reenganche (debounced para agrupar ediciones consecutivas)
   scheduleRecalculateUserEntries(input.projectId, user.uid)
 }
 
 export async function saveTimeEntryForUser(
   input: TimeEntryInput,
-  targetUser: Pick<UserProfile, 'uid' | 'displayName' | 'areaId'>,
+  targetUser: Pick<UserProfile, 'uid' | 'displayName' | 'areaId' | 'email'>,
+  actorEmail?: string | null,
 ): Promise<void> {
   assertTimeEntryInput(input)
   const config = await getProjectConfig(input.projectId)
@@ -535,6 +555,7 @@ export async function saveTimeEntryForUser(
     ...input,
     userId: targetUser.uid,
     userName: targetUser.displayName || 'Sin nombre',
+    userEmail: targetUser.email ?? null,
     areaId: targetUser.areaId ?? null,
     calculation,
     calculationSource: 'client',
@@ -544,17 +565,29 @@ export async function saveTimeEntryForUser(
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   })
+  void writeSystemLog({
+    type: 'entry_create',
+    userId: targetUser.uid,
+    userName: targetUser.displayName || 'Sin nombre',
+    email: actorEmail ?? null,
+    projectId: input.projectId,
+    workDate: input.workDate,
+    details: `${input.timeIn}→${input.timeOut} (cargado por admin)`,
+  })
   scheduleRecalculateUserEntries(input.projectId, targetUser.uid)
 }
 
-export async function listMyTimeEntries(userId: string, projectId: string): Promise<TimeEntry[]> {
-  const q = query(
-    collection(db, 'time_entries'),
+export async function listMyTimeEntries(
+  userId: string,
+  projectId: string,
+  opts?: { since?: string },
+): Promise<TimeEntry[]> {
+  const conditions = [
     where('userId', '==', userId),
     where('projectId', '==', projectId),
-    orderBy('workDate', 'desc'),
-  )
-
+  ]
+  if (opts?.since) conditions.push(where('workDate', '>=', opts.since))
+  const q = query(collection(db, 'time_entries'), ...conditions, orderBy('workDate', 'desc'))
   const snapshot = await getDocs(q)
   return snapshot.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<TimeEntry, 'id'>) }))
 }
@@ -769,8 +802,15 @@ export async function listApprovedUsers(): Promise<UserProfile[]> {
  * Se llama automáticamente tras guardar, editar o eliminar.
  */
 export async function recalculateUserEntries(projectId: string, userId: string): Promise<void> {
+  // Limitar a 90 días: la lógica de streak solo necesita días consecutivos recientes.
+  // Reduce lecturas drásticamente en usuarios con historial largo.
+  const since90 = (() => {
+    const d = new Date()
+    d.setDate(d.getDate() - 90)
+    return d.toISOString().slice(0, 10)
+  })()
   const [entries, config, userSnap] = await Promise.all([
-    listMyTimeEntries(userId, projectId),
+    listMyTimeEntries(userId, projectId, { since: since90 }),
     getProjectConfig(projectId),
     getDoc(doc(db, 'users', userId)),
   ])
@@ -779,7 +819,10 @@ export async function recalculateUserEntries(projectId: string, userId: string):
 
   const toUpdate = entries.filter((e) => !e.lockedByAdmin)
 
-  const entriesForExtras = toUpdate.map((e) => ({
+  // Se usan TODAS las entries (incluyendo bloqueadas) para el cálculo de racha,
+  // de modo que entradas previas bloqueadas contribuyen a detectar N días consecutivos.
+  // Solo se actualizan las de toUpdate.
+  const entriesForExtras = entries.map((e) => ({
     id: e.id,
     userId: e.userId,
     workDate: e.workDate,
@@ -817,8 +860,24 @@ export async function recalculateUserEntries(projectId: string, userId: string):
   }
 }
 
-export async function deleteTimeEntry(entryId: string, projectId: string, userId: string): Promise<void> {
+export async function deleteTimeEntry(
+  entryId: string,
+  projectId: string,
+  userId: string,
+  actor?: { userName: string; email?: string | null; workDate?: string },
+): Promise<void> {
   await deleteDoc(doc(db, 'time_entries', entryId))
+  if (actor) {
+    void writeSystemLog({
+      type: 'entry_delete',
+      userId,
+      userName: actor.userName,
+      email: actor.email ?? null,
+      projectId,
+      entryId,
+      workDate: actor.workDate,
+    })
+  }
   scheduleRecalculateUserEntries(projectId, userId)
 }
 
@@ -827,6 +886,7 @@ export async function updateTimeEntry(
   input: Omit<TimeEntryInput, 'projectId'>,
   projectId: string,
   userId: string,
+  actor?: { userName: string; email?: string | null },
 ): Promise<void> {
   assertTimeEntryInput({ ...input, projectId })
   const config = await getProjectConfig(projectId)
@@ -846,6 +906,18 @@ export async function updateTimeEntry(
     calculation,
     updatedAt: serverTimestamp(),
   })
+  if (actor) {
+    void writeSystemLog({
+      type: 'entry_edit',
+      userId,
+      userName: actor.userName,
+      email: actor.email ?? null,
+      projectId,
+      entryId,
+      workDate: input.workDate,
+      details: `${input.timeIn}→${input.timeOut}`,
+    })
+  }
   scheduleRecalculateUserEntries(projectId, userId)
 }
 
@@ -937,9 +1009,11 @@ export async function recalculateProjectEntries(
   ])
 
   const userCycleModes = new Map<string, 'CYCLE' | 'REINFORCEMENT'>()
+  const userNameMap = new Map<string, string>()
   for (const d of usersSnap.docs) {
     const u = d.data() as UserProfile
     userCycleModes.set(u.uid, u.cycleMode ?? 'CYCLE')
+    if (u.displayName) userNameMap.set(u.uid, u.displayName)
   }
 
   const toUpdate = entries.filter(
@@ -948,7 +1022,10 @@ export async function recalculateProjectEntries(
       !lockedRanges.some((r) => e.workDate >= r.dateFrom && e.workDate <= r.dateTo),
   )
 
-  const entriesForExtras = toUpdate.map((e) => ({
+  // Se usan TODAS las entries (incluyendo bloqueadas/fuera de rango) para el cálculo
+  // de racha de días consecutivos, de modo que semanas previas contribuyan al streak.
+  // Solo se actualizan las de toUpdate.
+  const entriesForExtras = entries.map((e) => ({
     id: e.id,
     userId: e.userId,
     workDate: e.workDate,
@@ -970,9 +1047,14 @@ export async function recalculateProjectEntries(
         engancheExtraHours: extras?.enganche ?? 0,
         reengancheExtraHours: extras?.reenganche ?? 0,
       })
+      const currentUserName = userNameMap.get(entry.userId)
+      const userNamePatch = currentUserName && currentUserName !== entry.userName
+        ? { userName: currentUserName }
+        : {}
       // Borrar campos derivados del ciclo (legado): ya no se usan.
       batch.update(doc(db, 'time_entries', entry.id), {
         calculation,
+        ...userNamePatch,
         updatedAt: serverTimestamp(),
         cycleScope: deleteField(),
         cycleDayInWeek: deleteField(),
@@ -1068,11 +1150,19 @@ export async function previewSettlement(
     listProjectRoles(projectId),
   ])
 
-  // Tarifa por hora = dailyRate del rol del usuario / regularDailyHours
+  // Tarifa por hora:
+  // 1) Si el rol tiene weeklyRate > 0 → Valor Jornada = weeklyRate / weeklyWorkDays
+  // 2) Si no → Valor Jornada = dailyRate
+  // Valor Hora = Valor Jornada / regularDailyHours
   const userRates = new Map<string, { hourlyRate: number; roleId?: string; roleName?: string }>()
   for (const user of projectUsers) {
     const role = user.roleId ? projectRoles.find((r) => r.id === user.roleId) : undefined
-    const hourlyRate = role ? Math.round((role.dailyRate / config.regularDailyHours) * 100) / 100 : 0
+    const valorJornada = role
+      ? (role.weeklyRate > 0
+          ? Math.round((role.weeklyRate / (config.weeklyWorkDays || 5)) * 100) / 100
+          : role.dailyRate)
+      : 0
+    const hourlyRate = role ? Math.round((valorJornada / config.regularDailyHours) * 100) / 100 : 0
     userRates.set(user.uid, { hourlyRate, roleId: role?.id, roleName: role?.name })
   }
 
@@ -1113,7 +1203,7 @@ export async function saveSettlement(settlement: Settlement): Promise<Settlement
       throw new Error('Ya existe una liquidación para este proyecto y rango de fechas.')
     }
     tx.set(newRef, {
-      ...data,
+      ...stripUndefined(data),
       createdAt: serverTimestamp(),
     })
   })
@@ -1300,64 +1390,6 @@ export function subscribeToProjects(callback: (projects: Project[]) => void): ()
   )
 }
 
-export function subscribeToMyEntries(
-  userId: string,
-  projectId: string,
-  callback: (entries: TimeEntry[]) => void,
-  opts?: { since?: string },
-): () => void {
-  const conditions = [
-    where('userId', '==', userId),
-    where('projectId', '==', projectId),
-  ]
-  if (opts?.since) {
-    conditions.push(where('workDate', '>=', opts.since))
-  }
-  const q = query(collection(db, 'time_entries'), ...conditions, orderBy('workDate', 'desc'))
-  return onSnapshot(q, (snap) => {
-    callback(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<TimeEntry, 'id'>) })))
-  })
-}
-
-export function subscribeToProjectEntries(
-  projectId: string,
-  callback: (entries: TimeEntry[]) => void,
-  opts?: { since?: string },
-): () => void {
-  const conditions = [where('projectId', '==', projectId)]
-  if (opts?.since) {
-    conditions.push(where('workDate', '>=', opts.since))
-  }
-  const q = query(collection(db, 'time_entries'), ...conditions, orderBy('workDate', 'desc'))
-  return onSnapshot(q, (snap) => {
-    callback(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<TimeEntry, 'id'>) })))
-  })
-}
-
-/** Suscripción filtrada por área (server-side). Requiere índice (projectId, areaId, workDate desc). */
-export function subscribeToAreaEntries(
-  projectId: string,
-  areaId: string,
-  callback: (entries: TimeEntry[]) => void,
-  opts?: { since?: string },
-): () => void {
-  const conditions = [where('projectId', '==', projectId), where('areaId', '==', areaId)]
-  if (opts?.since) {
-    conditions.push(where('workDate', '>=', opts.since))
-  }
-  const q = query(collection(db, 'time_entries'), ...conditions, orderBy('workDate', 'desc'))
-  return onSnapshot(q, (snap) => {
-    callback(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<TimeEntry, 'id'>) })))
-  })
-}
-
-export function subscribeToPendingUsers(callback: (users: UserProfile[]) => void): () => void {
-  const q = query(collection(db, 'users'), where('approvalStatus', '==', 'PENDING'))
-  return onSnapshot(q, (snap) => {
-    callback(snap.docs.map((d) => d.data() as UserProfile))
-  })
-}
-
 export async function listImportedPlaceholders(): Promise<UserProfile[]> {
   const q = query(collection(db, 'users'), where('isPlaceholder', '==', true))
   const snap = await getDocs(q)
@@ -1367,79 +1399,7 @@ export async function listImportedPlaceholders(): Promise<UserProfile[]> {
     .sort((a, b) => (a.displayName ?? '').localeCompare(b.displayName ?? ''))
 }
 
-export function subscribeToApprovedUsers(
-  callback: (users: UserProfile[]) => void,
-  onError?: (err: Error) => void,
-): () => void {
-  const q = query(collection(db, 'users'), where('approvalStatus', '==', 'APPROVED'))
-  return onSnapshot(
-    q,
-    (snap) => {
-      const users = snap.docs
-        .map((d) => d.data() as UserProfile)
-        .filter((u) => !u.mergedToUid)
-        .sort((a, b) => (a.displayName ?? '').localeCompare(b.displayName ?? ''))
-      callback(users)
-    },
-    onError,
-  )
-}
-
-export function subscribeToProjectUsers(
-  projectId: string,
-  callback: (users: UserProfile[]) => void,
-): () => void {
-  const q = query(
-    collection(db, 'users'),
-    where('approvalStatus', '==', 'APPROVED'),
-    where('projectId', '==', projectId),
-  )
-  return onSnapshot(q, (snap) => {
-    const all = snap.docs
-      .map((d) => d.data() as UserProfile)
-      .filter((u) => !u.mergedToUid)
-    // Dedupe por email normalizado (en minúsculas, sin espacios). Mantiene el más
-    // recientemente actualizado para evitar nombres repetidos en los selectores.
-    const byEmail = new Map<string, UserProfile>()
-    const noEmail: UserProfile[] = []
-    for (const u of all) {
-      const key = (u.email ?? '').trim().toLowerCase()
-      if (!key) { noEmail.push(u); continue }
-      const existing = byEmail.get(key)
-      if (!existing) {
-        byEmail.set(key, u)
-      } else {
-        const tsA = (u.updatedAt as { toMillis?: () => number } | undefined)?.toMillis?.() ?? 0
-        const tsB = (existing.updatedAt as { toMillis?: () => number } | undefined)?.toMillis?.() ?? 0
-        if (tsA > tsB) byEmail.set(key, u)
-      }
-    }
-    const users = [...byEmail.values(), ...noEmail]
-      .sort((a, b) => (a.displayName ?? '').localeCompare(b.displayName ?? ''))
-    callback(users)
-  })
-}
-
 // ─── Importación masiva de miembros (placeholders en users) ────────────────
-
-/** Suscribe a los placeholders pendientes (miembros importados que aún no han iniciado sesión). */
-export function subscribeToImportedPlaceholders(
-  callback: (users: UserProfile[]) => void,
-  onError?: (err: Error) => void,
-): () => void {
-  const q = query(collection(db, 'users'), where('isPlaceholder', '==', true))
-  return onSnapshot(
-    q,
-    (snap) => {
-      const users = snap.docs
-        .map((d) => d.data() as UserProfile)
-        .filter((u) => !u.mergedToUid && u.approvalStatus === 'PENDING')
-        .sort((a, b) => (a.displayName ?? '').localeCompare(b.displayName ?? ''))
-      callback(users)
-    },
-    onError,
-  )
-}
 
 /** Aprueba un placeholder importado: actualiza approvalStatus y asignaciones. */
 export async function approveImportedPlaceholder(
@@ -1667,6 +1627,265 @@ export async function reconcileDuplicateUsers(): Promise<{
   }
 }
 
+// ─── Buscar y reemplazar UID (manual, estilo Google Sheets) ────────────────
+
+export interface OrphanEntryRow {
+  userId: string
+  /** Último `userName` visto en alguna entry de ese userId. */
+  userName: string | null
+  /** Último `userEmail` visto en alguna entry de ese userId (campo agregado recientemente). */
+  userEmail: string | null
+  entriesCount: number
+  /** Último workDate de alguna entry de ese userId (para contexto). */
+  lastWorkDate: string | null
+  /** true si existe el doc `users/{userId}` (puede aparecer si está mergeado). */
+  userExists: boolean
+  /** Si el doc existe y está fusionado, hacia qué UID. */
+  mergedToUid?: string | null
+  approvalStatus?: string
+}
+
+/**
+ * Audita `time_entries` de los últimos N días y reporta los `userId` cuyo
+ * documento `users/{userId}`:
+ *   - no existe, o
+ *   - existe pero está marcado como fusionado (`mergedToUid` presente).
+ *
+ * Costo: 1 lectura por entry en el rango + 1 lectura por UID único.
+ * Recomendado: empezar con 30 días.
+ */
+export async function auditOrphanEntries(opts?: { daysBack?: number }): Promise<OrphanEntryRow[]> {
+  const days = Math.max(1, opts?.daysBack ?? 30)
+  const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10)
+  const snap = await getDocs(
+    query(collection(db, 'time_entries'), where('workDate', '>=', since)),
+  )
+
+  type Agg = { count: number; userName: string | null; userEmail: string | null; lastWorkDate: string | null }
+  const byUid = new Map<string, Agg>()
+  for (const d of snap.docs) {
+    const data = d.data() as TimeEntry & { userEmail?: string | null }
+    if (!data.userId) continue
+    const cur = byUid.get(data.userId) ?? { count: 0, userName: null, userEmail: null, lastWorkDate: null }
+    cur.count += 1
+    if (!cur.userName && data.userName) cur.userName = data.userName
+    if (!cur.userEmail && data.userEmail) cur.userEmail = data.userEmail
+    if (!cur.lastWorkDate || (data.workDate && data.workDate > cur.lastWorkDate)) {
+      cur.lastWorkDate = data.workDate ?? cur.lastWorkDate
+    }
+    byUid.set(data.userId, cur)
+  }
+
+  const uids = Array.from(byUid.keys())
+  const userDocs = await Promise.all(uids.map((uid) => getDoc(doc(db, 'users', uid))))
+
+  const rows: OrphanEntryRow[] = []
+  uids.forEach((uid, i) => {
+    const info = byUid.get(uid)!
+    const ud = userDocs[i]
+    if (!ud.exists()) {
+      rows.push({
+        userId: uid,
+        userName: info.userName,
+        userEmail: info.userEmail,
+        entriesCount: info.count,
+        lastWorkDate: info.lastWorkDate,
+        userExists: false,
+      })
+    } else {
+      const data = ud.data() as UserProfile
+      if (data.mergedToUid) {
+        rows.push({
+          userId: uid,
+          userName: info.userName ?? data.displayName ?? null,
+          userEmail: info.userEmail ?? data.email ?? null,
+          entriesCount: info.count,
+          lastWorkDate: info.lastWorkDate,
+          userExists: true,
+          mergedToUid: data.mergedToUid,
+          approvalStatus: data.approvalStatus,
+        })
+      }
+    }
+  })
+  rows.sort((a, b) => b.entriesCount - a.entriesCount)
+  return rows
+}
+
+/**
+ * Crea un documento mínimo en `users/{uid}` con los datos provistos.
+ * Pensado para "rescatar" usuarios huérfanos detectados por auditoría:
+ * después de creado, el admin puede aprobarlo, asignarle proyecto/área,
+ * o usar "Buscar y reemplazar UID" para fusionarlo a otro UID real.
+ *
+ * Falla si ya existe un doc en esa ruta (no se sobreescribe).
+ */
+export async function createMinimalUserDoc(
+  uid: string,
+  payload: { displayName?: string | null; email?: string | null },
+): Promise<UserProfile> {
+  if (!uid) throw new Error('UID es obligatorio.')
+  const ref = doc(db, 'users', uid)
+  const existing = await getDoc(ref)
+  if (existing.exists()) throw new Error(`Ya existe un documento users/${uid}.`)
+  const profile: UserProfile = {
+    uid,
+    email: payload.email ? payload.email.toLowerCase().trim() : null,
+    displayName: payload.displayName?.trim() || null,
+    role: 'MEMBER',
+    approvalStatus: 'PENDING',
+    isPlaceholder: false,
+    mergedToUid: null,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  }
+  await setDoc(ref, profile)
+  return profile
+}
+
+export interface UidReplacePreview {
+  searchUid: string
+  replaceUid: string
+  searchProfile: UserProfile | null
+  replaceProfile: UserProfile | null
+  /** Cantidad de `time_entries` cuyo `userId == searchUid`. Lo que se va a reemplazar. */
+  searchEntries: number
+  /** Cantidad de `time_entries` cuyo `userId == replaceUid`. Solo informativo. */
+  replaceEntries: number
+  /** Cantidad de `system_logs` cuyo `userId == searchUid`. */
+  searchLogs: number
+}
+
+/**
+ * Previsualiza una operación de buscar-y-reemplazar de UID en `time_entries`,
+ * `system_logs` y `users/{searchUid}`.
+ * Costo: 2 getDoc + 3 getCountFromServer = 5 lecturas.
+ */
+export async function previewUidReplace(
+  searchUid: string,
+  replaceUid: string,
+): Promise<UidReplacePreview> {
+  const [searchDoc, replaceDoc, searchCnt, replaceCnt, logsCnt] = await Promise.all([
+    getDoc(doc(db, 'users', searchUid)),
+    getDoc(doc(db, 'users', replaceUid)),
+    getCountFromServer(query(collection(db, 'time_entries'), where('userId', '==', searchUid))),
+    getCountFromServer(query(collection(db, 'time_entries'), where('userId', '==', replaceUid))),
+    getCountFromServer(query(collection(db, 'system_logs'), where('userId', '==', searchUid))),
+  ])
+  return {
+    searchUid,
+    replaceUid,
+    searchProfile: searchDoc.exists() ? (searchDoc.data() as UserProfile) : null,
+    replaceProfile: replaceDoc.exists() ? (replaceDoc.data() as UserProfile) : null,
+    searchEntries: searchCnt.data().count,
+    replaceEntries: replaceCnt.data().count,
+    searchLogs: logsCnt.data().count,
+  }
+}
+
+/**
+ * Reemplaza el `userId` de `searchUid` por `replaceUid` en TODAS las
+ * `time_entries` y `system_logs` que coincidan, marca `users/{searchUid}` como
+ * fusionado a `replaceUid` (vía `mergedToUid`) y, si se proporciona
+ * `replaceEmail`, propaga ese email a las entries (`userEmail`) y a los logs
+ * (`email`). NO modifica el documento `users/{replaceUid}`.
+ *
+ * Devuelve la cantidad de documentos efectivamente actualizados.
+ */
+export async function executeUidReplace(
+  searchUid: string,
+  replaceUid: string,
+  replaceEmail?: string | null,
+): Promise<{ entriesUpdated: number; logsUpdated: number; userMerged: boolean }> {
+  if (!searchUid || !replaceUid) throw new Error('Ambos UIDs son obligatorios.')
+  if (searchUid === replaceUid) throw new Error('El UID a buscar y el de reemplazo no pueden ser iguales.')
+
+  const trimmedEmail = replaceEmail?.trim()
+  const emailToWrite = trimmedEmail ? trimmedEmail.toLowerCase() : null
+
+  // Tomamos el displayName del UID de reemplazo (si existe) para mantener
+  // consistencia visual en `userName` de las entries y logs reasignados.
+  const [replaceSnap, searchSnap] = await Promise.all([
+    getDoc(doc(db, 'users', replaceUid)),
+    getDoc(doc(db, 'users', searchUid)),
+  ])
+  const replaceName = replaceSnap.exists()
+    ? ((replaceSnap.data() as UserProfile).displayName ?? null)
+    : null
+
+  // 1) time_entries
+  const entriesSnap = await getDocs(
+    query(collection(db, 'time_entries'), where('userId', '==', searchUid)),
+  )
+  const CHUNK = 440
+  let entriesTotal = 0
+  for (let i = 0; i < entriesSnap.docs.length; i += CHUNK) {
+    const slice = entriesSnap.docs.slice(i, i + CHUNK)
+    const b = writeBatch(db)
+    for (const e of slice) {
+      const patch: Record<string, unknown> = { userId: replaceUid, updatedAt: serverTimestamp() }
+      if (replaceName) patch.userName = replaceName
+      if (emailToWrite !== null) patch.userEmail = emailToWrite
+      b.update(e.ref, patch)
+    }
+    await b.commit()
+    entriesTotal += slice.length
+  }
+
+  // 2) system_logs
+  const logsSnap = await getDocs(
+    query(collection(db, 'system_logs'), where('userId', '==', searchUid)),
+  )
+  let logsTotal = 0
+  for (let i = 0; i < logsSnap.docs.length; i += CHUNK) {
+    const slice = logsSnap.docs.slice(i, i + CHUNK)
+    const b = writeBatch(db)
+    for (const e of slice) {
+      const patch: Record<string, unknown> = { userId: replaceUid }
+      if (replaceName) patch.userName = replaceName
+      if (emailToWrite !== null) patch.email = emailToWrite
+      b.update(e.ref, patch)
+    }
+    await b.commit()
+    logsTotal += slice.length
+  }
+
+  // 3) users/{searchUid} → marcar como fusionado al ganador.
+  // Importante:
+  //   - La regla de update para admin exige que el doc resultante tenga
+  //     `role` ∈ ['SUPERUSER','PROJECT_ADMIN','MEMBER']. Si el doc original
+  //     no tenía `role` (caso común en docs migrados o creados manualmente),
+  //     la actualización falla con permission-denied. Lo defaulteamos a 'MEMBER'.
+  //   - Si la actualización del user igualmente falla, no abortamos toda la
+  //     operación: las entries/logs ya quedaron movidos. Reportamos
+  //     `userMerged: false` para que el admin vea el detalle.
+  let userMerged = false
+  if (searchSnap.exists()) {
+    const searchData = searchSnap.data() as UserProfile
+    const roleNeedsBackfill = !['SUPERUSER', 'PROJECT_ADMIN', 'MEMBER'].includes(
+      String(searchData.role ?? ''),
+    )
+    const userPatch: Record<string, unknown> = {
+      mergedToUid: replaceUid,
+      isPlaceholder: false,
+      updatedAt: serverTimestamp(),
+    }
+    if (roleNeedsBackfill) userPatch.role = 'MEMBER'
+    if (emailToWrite !== null && !searchData.email) userPatch.email = emailToWrite
+    try {
+      await updateDoc(searchSnap.ref, userPatch)
+      userMerged = true
+    } catch (e) {
+      if (import.meta.env.DEV) {
+        console.warn('[executeUidReplace] update users/{searchUid} skipped:', e)
+      }
+      // dejamos userMerged=false; el caller decide cómo informarlo
+    }
+  }
+
+  return { entriesUpdated: entriesTotal, logsUpdated: logsTotal, userMerged }
+}
+
 export async function importMembers(
   rows: { email: string; displayName: string }[],
 ): Promise<{ imported: number; duplicates: string[] }> {
@@ -1832,19 +2051,6 @@ export async function getAuditLock(projectId: string): Promise<AuditLock | null>
   return { projectId, ...(snap.data() as Omit<AuditLock, 'projectId'>) }
 }
 
-export function subscribeToAuditLock(
-  projectId: string,
-  callback: (lock: AuditLock | null) => void,
-): () => void {
-  return onSnapshot(doc(db, 'audit_locks', projectId), (snap) => {
-    if (!snap.exists()) {
-      callback(null)
-    } else {
-      callback({ projectId, ...(snap.data() as Omit<AuditLock, 'projectId'>) })
-    }
-  })
-}
-
 /** Activa o desactiva el bloqueo de ediciones para el proyecto en un rango de fechas.
  *  Cuando se activa: marca lockedByAudit=true en todas las entradas existentes del rango.
  *  Cuando se desactiva: marca lockedByAudit=false en las entradas del rango previamente bloqueadas.
@@ -1919,32 +2125,6 @@ export async function getUserActiveWorkCycle(
     if (!c.closedFromDate) return c
   }
   return null
-}
-
-/** Suscripción en tiempo real a los ciclos del usuario en el proyecto. */
-export function subscribeToUserWorkCycles(
-  projectId: string,
-  userId: string,
-  callback: (cycles: WorkCycle[]) => void,
-  onError?: (err: unknown) => void,
-): () => void {
-  const q = query(
-    collection(db, 'user_work_cycles'),
-    where('projectId', '==', projectId),
-    where('userId', '==', userId),
-  )
-  return onSnapshot(
-    q,
-    (snap) => {
-      const cycles = snap.docs
-        .map((d) => ({ id: d.id, ...(d.data() as Omit<WorkCycle, 'id'>) }))
-        .sort((a, b) => a.anchorDate.localeCompare(b.anchorDate))
-      callback(cycles)
-    },
-    (err) => {
-      onError?.(err)
-    },
-  )
 }
 
 /** Lista los ciclos de todos los usuarios del proyecto (uso ADMIN). */
@@ -2104,4 +2284,266 @@ export async function setUserCycleMode(userId: string, mode: CycleMode): Promise
   // Si pasa a REINFORCEMENT, cerrar ciclos abiertos automáticamente (no se permiten en REINFORCEMENT)
   const userRef = doc(db, 'users', userId)
   await updateDoc(userRef, { cycleMode: mode, updatedAt: serverTimestamp() })
+}
+
+// ─── Registros del sistema ────────────────────────────────────────────────────
+
+/**
+ * Escribe un registro de actividad en la colección system_logs.
+ * Fire-and-forget: los errores se suprimen para no afectar la operación principal.
+ */
+export async function writeSystemLog(
+  log: Omit<SystemLog, 'id' | 'timestamp' | 'logDate'>,
+): Promise<void> {
+  const now = new Date()
+  const logDate = now.toISOString().slice(0, 10) // YYYY-MM-DD
+  await addDoc(collection(db, 'system_logs'), {
+    ...log,
+    logDate,
+    timestamp: serverTimestamp(),
+  })
+}
+
+/**
+ * Consulta registros del sistema en un rango de fechas.
+ * Solo accesible para SUPERUSER (controlado en cliente por la UI).
+ */
+export async function querySystemLogs(
+  dateFrom: string,
+  dateTo: string,
+): Promise<SystemLog[]> {
+  const q = query(
+    collection(db, 'system_logs'),
+    where('logDate', '>=', dateFrom),
+    where('logDate', '<=', dateTo),
+    orderBy('logDate', 'desc'),
+    orderBy('timestamp', 'desc'),
+  )
+  const snap = await getDocs(q)
+  return snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<SystemLog, 'id'>) }))
+}
+
+// ─── Cédula/DNI: candado de unicidad y completar perfil ───────────────────
+
+/** Normaliza un DNI: quita todo lo que no sea dígito. */
+export function normalizeIdNumber(raw: string): string {
+  return String(raw ?? '').replace(/\D/g, '')
+}
+
+/**
+ * Valida formato del DNI: solo dígitos, 6-12 caracteres.
+ */
+export function isValidIdNumber(idNumber: string): boolean {
+  const n = normalizeIdNumber(idNumber)
+  return n.length >= 6 && n.length <= 12
+}
+
+/**
+ * Error específico para DNI duplicado: el doc `id_numbers/{idNumber}` ya
+ * existe (otro usuario ya reclamó ese número). El consumidor lo distingue
+ * para mostrar el flujo de "No recuerdo el mail".
+ */
+export class DuplicateIdNumberError extends Error {
+  idNumber: string
+  constructor(idNumber: string) {
+    super(`El Nro de Cédula/DNI ${idNumber} ya está en uso.`)
+    this.name = 'DuplicateIdNumberError'
+    this.idNumber = idNumber
+  }
+}
+
+/**
+ * Reclama el DNI para el usuario actual creando `id_numbers/{idNumber}`.
+ * - Si ya existe → throw `DuplicateIdNumberError`.
+ * - Si la regla rechaza por permission-denied (porque el doc ya está) → idem.
+ */
+async function claimIdNumber(uid: string, idNumber: string): Promise<void> {
+  const ref = doc(db, 'id_numbers', idNumber)
+  // Pre-check best-effort. Como `read` está restringido a admin, este getDoc
+  // probablemente falle para usuarios regulares; ignoramos el error y dejamos
+  // que el setDoc dispare permission-denied → lo traducimos a duplicate.
+  try {
+    const snap = await getDoc(ref)
+    if (snap.exists()) {
+      const data = snap.data() as { uid?: string }
+      if (data.uid && data.uid === uid) return // ya estaba reclamado por nosotros
+      throw new DuplicateIdNumberError(idNumber)
+    }
+  } catch (e) {
+    if (e instanceof DuplicateIdNumberError) throw e
+    // permission-denied al leer → seguimos al setDoc y manejamos allá.
+  }
+  try {
+    await setDoc(ref, { uid, createdAt: serverTimestamp() })
+  } catch (e) {
+    const code = (e as { code?: string }).code
+    if (code === 'permission-denied' || code === 'already-exists') {
+      throw new DuplicateIdNumberError(idNumber)
+    }
+    throw e
+  }
+}
+
+/**
+ * Libera el candado de DNI (best-effort). Solo SUPERUSER puede borrarlo;
+ * para otros usuarios este call probablemente falle silenciosamente.
+ */
+async function releaseIdNumber(idNumber: string): Promise<void> {
+  try {
+    await deleteDoc(doc(db, 'id_numbers', idNumber))
+  } catch (e) {
+    if (import.meta.env.DEV) console.warn('[releaseIdNumber] skipped:', e)
+  }
+}
+
+/**
+ * Completa el perfil del usuario actual: setea displayName e idNumber.
+ * Pasos:
+ *  1. Normaliza y valida el DNI.
+ *  2. Reclama el candado en `id_numbers/{dni}` (atómico).
+ *  3. Actualiza `users/{uid}` con `{ displayName, idNumber }`.
+ *  4. Si el paso 3 falla, intenta liberar el candado (rollback best-effort).
+ *
+ * Errores:
+ *  - `DuplicateIdNumberError` si el DNI ya está reclamado.
+ *  - `Error` si el formato no cumple.
+ */
+export async function completeUserProfile(
+  uid: string,
+  payload: { displayName: string; idNumber: string },
+): Promise<void> {
+  const displayName = (payload.displayName ?? '').trim()
+  const idNumber = normalizeIdNumber(payload.idNumber)
+  if (!displayName) throw new Error('El nombre completo es obligatorio.')
+  if (!isValidIdNumber(idNumber)) {
+    throw new Error('El Nro de Cédula/DNI debe tener entre 6 y 12 dígitos.')
+  }
+
+  await claimIdNumber(uid, idNumber)
+
+  try {
+    await updateDoc(doc(db, 'users', uid), {
+      displayName,
+      idNumber,
+      updatedAt: serverTimestamp(),
+    })
+  } catch (e) {
+    if (import.meta.env.DEV) {
+      console.warn('[completeUserProfile] update users failed, releasing claim:', e)
+    }
+    void releaseIdNumber(idNumber)
+    throw e
+  }
+}
+
+/**
+ * Permite a un admin actualizar el DNI de otro usuario.
+ * - Si el user ya tenía un DNI viejo, libera el candado viejo.
+ * - Reclama el candado nuevo (a nombre del propio usuario destino).
+ * - Actualiza users/{uid}.
+ */
+export async function adminUpdateUserIdNumber(
+  targetUid: string,
+  newIdNumber: string,
+): Promise<void> {
+  const idNumber = normalizeIdNumber(newIdNumber)
+  if (!isValidIdNumber(idNumber)) {
+    throw new Error('El Nro de Cédula/DNI debe tener entre 6 y 12 dígitos.')
+  }
+  const userRef = doc(db, 'users', targetUid)
+  const userSnap = await getDoc(userRef)
+  if (!userSnap.exists()) throw new Error(`Usuario ${targetUid} no existe.`)
+  const userData = userSnap.data() as UserProfile
+  const oldIdNumber = userData.idNumber ? normalizeIdNumber(userData.idNumber) : ''
+
+  if (oldIdNumber === idNumber) return
+
+  await claimIdNumber(targetUid, idNumber)
+
+  try {
+    await updateDoc(userRef, { idNumber, updatedAt: serverTimestamp() })
+  } catch (e) {
+    void releaseIdNumber(idNumber)
+    throw e
+  }
+
+  if (oldIdNumber) {
+    void releaseIdNumber(oldIdNumber)
+  }
+}
+
+// ─── Solicitudes "No recuerdo el mail" ─────────────────────────────────────
+
+/**
+ * Crea una solicitud de recuperación de mail. Llamada por el usuario nuevo
+ * que se topó con un DNI duplicado al intentar completar su perfil.
+ */
+export async function submitEmailRecoveryRequest(payload: {
+  requestingUid: string
+  requestingEmail: string | null
+  requestingDisplayName: string | null
+  idNumber: string
+}): Promise<string> {
+  const idNumber = normalizeIdNumber(payload.idNumber)
+  if (!isValidIdNumber(idNumber)) {
+    throw new Error('Nro de Cédula/DNI inválido.')
+  }
+  const ref = await addDoc(collection(db, 'email_recovery_requests'), {
+    requestingUid: payload.requestingUid,
+    requestingEmail: payload.requestingEmail ?? null,
+    requestingDisplayName: payload.requestingDisplayName ?? null,
+    idNumber,
+    status: 'PENDING' as EmailRecoveryStatus,
+    createdAt: serverTimestamp(),
+  })
+  return ref.id
+}
+
+/** Lista solicitudes de recuperación filtradas por estado. */
+export async function listEmailRecoveryRequests(
+  status?: EmailRecoveryStatus,
+): Promise<EmailRecoveryRequest[]> {
+  const constraints = status ? [where('status', '==', status)] : []
+  const q = query(collection(db, 'email_recovery_requests'), ...constraints)
+  const snap = await getDocs(q)
+  const rows = snap.docs.map(
+    (d) => ({ id: d.id, ...(d.data() as Omit<EmailRecoveryRequest, 'id'>) }),
+  )
+  rows.sort((a, b) => {
+    const ta = (a.createdAt as { seconds?: number } | undefined)?.seconds ?? 0
+    const tb = (b.createdAt as { seconds?: number } | undefined)?.seconds ?? 0
+    return tb - ta
+  })
+  return rows
+}
+
+/** Marca una solicitud como RESOLVED (admin la atendió). */
+export async function resolveEmailRecoveryRequest(
+  requestId: string,
+  adminUid: string,
+  payload?: { existingUid?: string; notes?: string },
+): Promise<void> {
+  const patch: Record<string, unknown> = {
+    status: 'RESOLVED' as EmailRecoveryStatus,
+    resolvedBy: adminUid,
+    resolvedAt: serverTimestamp(),
+  }
+  if (payload?.existingUid) patch.existingUid = payload.existingUid
+  if (payload?.notes) patch.notes = payload.notes
+  await updateDoc(doc(db, 'email_recovery_requests', requestId), patch)
+}
+
+/** Marca una solicitud como DISMISSED (descartada por admin). */
+export async function dismissEmailRecoveryRequest(
+  requestId: string,
+  adminUid: string,
+  notes?: string,
+): Promise<void> {
+  const patch: Record<string, unknown> = {
+    status: 'DISMISSED' as EmailRecoveryStatus,
+    resolvedBy: adminUid,
+    resolvedAt: serverTimestamp(),
+  }
+  if (notes) patch.notes = notes
+  await updateDoc(doc(db, 'email_recovery_requests', requestId), patch)
 }

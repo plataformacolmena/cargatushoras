@@ -3,9 +3,11 @@ import { useAuth } from './auth/useAuth'
 import { DashboardPage } from './pages/DashboardPage'
 import { LoginPage } from './pages/LoginPage'
 import { PendingApprovalPage } from './pages/PendingApprovalPage'
+import { CompleteProfilePage } from './pages/CompleteProfilePage'
 import { LoadingOverlay } from './components/Spinner'
 import { MaintenanceScreen } from './components/MaintenanceScreen'
 import { subscribeToMaintenance, type MaintenanceState } from './services/firestore'
+import { MaintenanceContext } from './hooks/useMaintenance'
 import './styles/app.css'
 
 function App() {
@@ -68,7 +70,19 @@ function App() {
     )
   }
 
-  return <DashboardPage />
+  // Gate de perfil completo: requerir nombre y Nro de Cédula/DNI antes de operar.
+  // Aplica a SUPERUSER, PROJECT_ADMIN y MEMBER por igual.
+  const needsProfileCompletion =
+    !profile.displayName?.trim() || !profile.idNumber?.trim()
+  if (needsProfileCompletion) {
+    return <CompleteProfilePage />
+  }
+
+  return (
+    <MaintenanceContext.Provider value={maintenance}>
+      <DashboardPage />
+    </MaintenanceContext.Provider>
+  )
 }
 
 export default App

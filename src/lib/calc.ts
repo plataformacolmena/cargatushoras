@@ -84,12 +84,10 @@ export function calculateEntry(
   const overtimeStart = start + config.regularDailyHours * 60
   const nightOvertimeHours = round2(calcNightOverlapHours(Math.max(start, overtimeStart), end, config))
 
-  // Horas nocturnas: TODA la porción nocturna del turno (incluye las que además
-  // son extras). `nightOvertimeHours` es un subconjunto informativo de
-  // `nightHours` (las nocturnas que también son extras). El pago se calcula
-  // sobre `nightHours` para no duplicar; el subset solo se usa para mostrar
-  // y aplicar el recargo adicional en `extraPayUnits` si la política lo pide.
-  const nightHours = round2(calcNightOverlapHours(start, end, config))
+  // Horas nocturnas regulares: porción nocturna del turno que NO es overtime.
+  // `nightOvertimeHours` y `nightHours` son DISJUNTOS: su suma = total nocturno.
+  // El pago en liquidación usa ambos (ver previewSettlement).
+  const nightHours = round2(calcNightOverlapHours(start, end, config) - nightOvertimeHours)
 
   // Penalties
   const penaltyHours = round2((opts?.penalties ?? 0) * (config.penaltyHours || 0))
@@ -203,9 +201,14 @@ function shiftEndTs(workDate: string, timeIn: string, timeOut: string): number {
 /**
  * Calcula extras por enganche/reenganche para cada entrada (por userId, ordenadas).
  *
- * Regla simple: si la jornada `prev` está marcada como 6to día (isJornadaAdicional=true),
- * la siguiente jornada (`curr`) inicia una NUEVA semana laboral → se evalúa REENGANCHE.
- * En caso contrario → ENGANCHE normal.
+ * Reglas:
+ *  - REENGANCHE se dispara EXCLUSIVAMENTE por la racha automática de
+ *    `weeklyWorkDays` días de calendario consecutivos (solo usuarios CYCLE).
+ *    El flag manual `isJornadaAdicional` (6to día) NO dispara reenganche
+ *    en ninguna dirección (ni en la jornada marcada ni en la siguiente).
+ *  - Si la jornada `curr` está marcada como 6to día, esa jornada solo puede
+ *    recibir ENGANCHE, nunca reenganche, aunque haya racha consecutiva.
+ *  - En cualquier otro caso → ENGANCHE normal.
  *
  * El monto se calcula siempre como shortfall respecto al umbral correspondiente
  * (engancheHours o engancheHours + reengancheHours).
@@ -231,6 +234,11 @@ export function calcEngancheExtras(
    */
   userCycleModes?: Map<string, 'CYCLE' | 'REINFORCEMENT'>,
 ): Map<string, { enganche: number; reenganche: number }> {
+  // Nota: el flag manual isJornadaAdicional (6to día) ya no actúa como
+  // disparador de reenganche; el ciclo semanal se cierra automáticamente por
+  // la racha de días consecutivos (weeklyWorkDays). Adicionalmente, una
+  // jornada marcada como 6to día solo puede recibir enganche, nunca
+  // reenganche.
   const result = new Map<string, { enganche: number; reenganche: number }>()
   if (config.engancheHours === 0 && config.reengancheHours === 0) return result
 
@@ -250,6 +258,36 @@ export function calcEngancheExtras(
       return tsA - tsB
     })
 
+    // ── Auto-detección de racha de días consecutivos (solo CYCLE) ──────────
+    // Para cada workDate único calcula cuántos días de calendario consecutivos
+    // la preceden (incluida ella misma). Se usa para detectar automáticamente
+    // cuando un usuario CYCLE trabajó N días seguidos → el siguiente entry activa
+    // reenganche aunque isJornadaAdicional no esté marcado manualmente.
+    const wd = !isReinforcement ? Math.max(1, config.weeklyWorkDays || 5) : Infinity
+    const streakAtDate = new Map<string, number>()
+    if (!isReinforcement) {
+      // Recolectar fechas únicas ordenadas (ya ordenadas por sorteo anterior)
+      const uniqueDates: string[] = []
+      for (const e of userEntries) {
+        if (uniqueDates.length === 0 || uniqueDates[uniqueDates.length - 1] !== e.workDate) {
+          uniqueDates.push(e.workDate)
+        }
+      }
+      for (let j = 0; j < uniqueDates.length; j++) {
+        if (j === 0) {
+          streakAtDate.set(uniqueDates[0], 1)
+        } else {
+          const prevD = uniqueDates[j - 1]
+          const currD = uniqueDates[j]
+          const diffDays = Math.round(
+            (new Date(currD + 'T00:00:00Z').getTime() - new Date(prevD + 'T00:00:00Z').getTime()) / 86400000,
+          )
+          streakAtDate.set(currD, diffDays === 1 ? (streakAtDate.get(prevD) ?? 1) + 1 : 1)
+        }
+      }
+    }
+    // ───────────────────────────────────────────────────────────────────────
+
     for (let i = 1; i < userEntries.length; i++) {
       const prev = userEntries[i - 1]
       const curr = userEntries[i]
@@ -260,8 +298,18 @@ export function calcEngancheExtras(
 
       if (gapHours < 0) continue // solapamiento, ignorar
 
-      // Refuerzo: nunca aplica reenganche aunque la previa esté marcada como 6to día.
-      const reengancheApplies = !isReinforcement && prev.isJornadaAdicional === true
+      // Reenganche aplica si:
+      //  - usuario CYCLE con una racha de ≥ weeklyWorkDays días consecutivos
+      //    terminando en prev.workDate, y curr es un día de calendario posterior, Y
+      //  - la jornada actual NO está marcada como 6to día (en ese caso se calcula
+      //    enganche, no reenganche).
+      // El flag manual isJornadaAdicional ya no es disparador de reenganche.
+      const autoConsecutive = !isReinforcement
+        && curr.workDate > prev.workDate
+        && (streakAtDate.get(prev.workDate) ?? 0) >= wd
+
+      const currIsAdicional = curr.isJornadaAdicional === true
+      const reengancheApplies = !isReinforcement && !currIsAdicional && autoConsecutive
 
       if (reengancheApplies && config.reengancheHours > 0) {
         const reengancheMin = config.reengancheHours + config.engancheHours
@@ -289,7 +337,7 @@ export function calculateSettlement(
     nightOvertime: number; enganche: number; reenganche: number
     jornadaAdicionalCount: number; penalty: number
     // Horas "ponderadas" por jornada adicional, usadas solo para el cálculo de pago.
-    regularPaid: number; overtimePaid: number; nightPaid: number; penaltyPaid: number
+    regularPaid: number; overtimePaid: number; nightPaid: number; nightOvertimePaid: number; penaltyPaid: number
   }>()
 
   const adicMult = config.jornadaAdicionalMultiplier || 1
@@ -300,7 +348,7 @@ export function calculateSettlement(
       regular: 0, overtime: 0, night: 0,
       nightOvertime: 0, enganche: 0, reenganche: 0,
       jornadaAdicionalCount: 0, penalty: 0,
-      regularPaid: 0, overtimePaid: 0, nightPaid: 0, penaltyPaid: 0,
+      regularPaid: 0, overtimePaid: 0, nightPaid: 0, nightOvertimePaid: 0, penaltyPaid: 0,
     }
     const m = e.isJornadaAdicional ? adicMult : 1
     const reg = e.calculation.regularHours ?? 0
@@ -316,13 +364,15 @@ export function calculateSettlement(
     existing.reenganche    += e.calculation.reengancheExtraHours ?? 0
     existing.penalty       += pen
     // Acumulado para pago, aplicando multiplicador de jornada adicional cuando corresponda.
-    existing.regularPaid   += reg * m
-    existing.overtimePaid  += ot * m
-    // `nightPaid` paga TODAS las horas nocturnas (que ya incluyen las extras
-    // nocturnas) con `nightAdditionalMultiplier`. NO se suma `noh` porque
-    // estaría dentro de `nh`.
-    existing.nightPaid     += nh * m
-    existing.penaltyPaid   += pen * m
+    existing.regularPaid       += reg * m
+    // Overtime diurno (excluye la parte nocturna, que tiene tarifa propia)
+    existing.overtimePaid       += (ot - noh) * m
+    // Noche regular (tarifa: hourlyRate × nightMult)
+    existing.nightPaid          += nh * m
+    // Noche extra (tarifa: hourlyRate × overtimeMult × nightMult, multiplicativo)
+    existing.nightOvertimePaid  += noh * m
+    // Penalty a tarifa regular (sin recargo extra)
+    existing.penaltyPaid        += pen * m
     if (e.isJornadaAdicional) existing.jornadaAdicionalCount += 1
     byUser.set(e.userId, existing)
   }
@@ -330,11 +380,18 @@ export function calculateSettlement(
   const lines: SettlementLine[] = Array.from(byUser.entries()).map(([userId, data]) => {
     const rateInfo  = userRates.get(userId)
     const hourlyRate = rateInfo?.hourlyRate ?? 0
-    const regularPay  = round2(data.regularPaid * hourlyRate)
+    // Penalty a tarifa regular (sin multiplicador) → se acumula en regularPay
+    const regularPay  = round2((data.regularPaid + data.penaltyPaid) * hourlyRate)
+    // Overtime diurno + enganche + reenganche (todos al rate de horas extra)
     const overtimePay = round2(
-      (data.overtimePaid + data.penaltyPaid + data.enganche + data.reenganche) * hourlyRate * config.overtimeMultiplier,
+      (data.overtimePaid + data.enganche + data.reenganche) * hourlyRate * config.overtimeMultiplier,
     )
-    const nightPay   = round2(data.nightPaid * hourlyRate * config.nightAdditionalMultiplier)
+    // Noche regular: hourlyRate × nightMult
+    // Noche extra:   hourlyRate × overtimeMult × nightMult (multiplicativo, no aditivo)
+    const nightPay   = round2(
+      data.nightPaid * hourlyRate * config.nightAdditionalMultiplier +
+      data.nightOvertimePaid * hourlyRate * config.overtimeMultiplier * config.nightAdditionalMultiplier,
+    )
     const totalHours  = round2(data.regular + data.overtime)
     return {
       userId,

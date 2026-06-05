@@ -518,6 +518,12 @@ hr {
   white-space: nowrap;
   font-weight: 600;
   color: var(--muted);
+  /* Encabezado fijo al hacer scroll (sea de la página o de un contenedor con overflow). */
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  /* border-collapse:collapse pierde el border en sticky → simulado con box-shadow */
+  box-shadow: inset 0 -1px 0 var(--line);
 }
 .audit-table td {
   padding: 6px 8px;

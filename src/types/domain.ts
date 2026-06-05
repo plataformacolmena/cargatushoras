@@ -10,6 +10,12 @@ export interface UserProfile {
   uid: string
   email: string | null
   displayName: string | null
+  /**
+   * Nro de Cédula/DNI normalizado (solo dígitos, 6-12 caracteres).
+   * Obligatorio para operar; gate de login en CompleteProfilePage.
+   * La unicidad se garantiza vía colección candado `id_numbers/{idNumber}`.
+   */
+  idNumber?: string
   role: AppRole
   approvalStatus: ApprovalStatus
   projectId?: string
@@ -23,6 +29,28 @@ export interface UserProfile {
   disabled?: boolean         // true = inhabilitado por admin; no puede iniciar sesión
   createdAt?: unknown
   updatedAt?: unknown
+}
+
+// ─── Solicitudes "No recuerdo el mail" ─────────────────────────────────────
+// Cuando un usuario nuevo intenta completar su perfil con un DNI que ya está
+// reclamado por otro UID, la pantalla CompleteProfilePage le muestra un botón
+// "No recuerdo el mail" que crea una solicitud para que un admin lo asista.
+
+export type EmailRecoveryStatus = 'PENDING' | 'RESOLVED' | 'DISMISSED'
+
+export interface EmailRecoveryRequest {
+  id: string
+  requestingUid: string
+  requestingEmail: string | null
+  requestingDisplayName: string | null
+  idNumber: string
+  status: EmailRecoveryStatus
+  /** UID del titular original del DNI (lo completa el admin al resolver). */
+  existingUid?: string
+  notes?: string
+  resolvedBy?: string
+  resolvedAt?: unknown
+  createdAt?: unknown
 }
 
 // Ciclo laboral declarado por un usuario en un proyecto.
@@ -143,6 +171,7 @@ export interface TimeEntry extends TimeEntryInput {
   id: string
   userId: string
   userName: string
+  userEmail?: string | null
   areaId?: string
   calculation: TimeEntryCalculation
   calculationVersion: string
@@ -279,4 +308,23 @@ export interface ChatThreadCreateInput {
   scope: ChatScope
   areaId?: string
   title: string
+}
+
+// ─── Registros del sistema ────────────────────────────────────────────────────
+
+export type SystemLogType = 'entry_create' | 'entry_edit' | 'entry_delete' | 'user_login'
+
+export interface SystemLog {
+  id: string
+  type: SystemLogType
+  userId: string
+  userName: string
+  email?: string | null
+  projectId?: string
+  projectName?: string
+  entryId?: string
+  workDate?: string       // fecha de la jornada afectada (YYYY-MM-DD)
+  logDate: string         // YYYY-MM-DD del momento de la acción (para filtrar por rango)
+  details?: string        // descripción adicional del cambio
+  timestamp: unknown      // Firestore Timestamp
 }
