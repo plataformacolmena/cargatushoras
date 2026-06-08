@@ -231,6 +231,13 @@ export interface SettlementLine {
   userName: string
   roleId?: string
   roleName?: string
+  /**
+   * Área del usuario al momento de generar la liquidación. Se persiste para
+   * que el panel "Histórico" pueda agrupar/filtrar por área sin necesidad de
+   * cruzar con `users` (que pueden cambiar de área después).
+   */
+  areaId?: string
+  areaName?: string
   hourlyRate: number
   overtimeMultiplier: number
   nightMultiplier: number
@@ -240,6 +247,11 @@ export interface SettlementLine {
   nightOvertimeHours: number
   engancheExtraHours: number
   reengancheExtraHours: number
+  /**
+   * Cantidad de jornadas distintas (días distintos con al menos una entry)
+   * dentro del rango de la liquidación.
+   */
+  daysWorked: number
   jornadaAdicionalCount: number
   penaltyHours: number
   totalHours: number

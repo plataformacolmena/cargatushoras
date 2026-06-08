@@ -126,14 +126,26 @@ service cloud.firestore {
       // pesadas a Cloud Functions con rate limit.
       allow read: if isApproved();
 
-      allow create: if (isApproved() &&
-        request.resource.data.userId == request.auth.uid &&
-        request.resource.data.calculationSource == 'client' &&
-        request.resource.data.calculationVersion == 'v1-client' &&
-        request.resource.data.lockedByAdmin == false) ||
+      allow create: if (
+        // Defensa en profundidad: el id del doc DEBE ser determinístico
+        // `${userId}_${projectId}_${workDate}`. Esto bloquea duplicados
+        // por (userId, projectId, workDate) a nivel servidor: cualquier
+        // intento de re-crear con la misma key va a fallar porque el doc
+        // ya existe (Firestore rechaza create sobre id existente).
+        request.resource.id ==
+          request.resource.data.userId + '_' +
+          request.resource.data.projectId + '_' +
+          request.resource.data.workDate
+      ) && (
+        (isApproved() &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.calculationSource == 'client' &&
+          request.resource.data.calculationVersion == 'v1-client' &&
+          request.resource.data.lockedByAdmin == false) ||
         (isAdminRole() &&
-        request.resource.data.calculationSource == 'client' &&
-        request.resource.data.calculationVersion == 'v1-client');
+          request.resource.data.calculationSource == 'client' &&
+          request.resource.data.calculationVersion == 'v1-client')
+      );
 
       allow update: if (
         // Bloqueo total: las jornadas archivadas son inmutables (excepto para SUPERUSER).
@@ -157,15 +169,20 @@ service cloud.firestore {
         get(/databases/$(database)/documents/users/$(resource.data.userId)).data.isPlaceholder == true
       ));
 
-      allow delete: if isSuperUser() || ((
-        // Las jornadas archivadas sólo las puede borrar SUPERUSER (cubierto arriba).
-        resource.data.get('archived', false) == false
-      ) && (isAdminRole() || (
-        isApproved() &&
-        resource.data.userId == request.auth.uid &&
-        resource.data.lockedByAdmin == false &&
-        resource.data.get('lockedByAudit', false) == false
-      )));
+      allow delete: if isSuperUser() ||
+        // Admin puede borrar entries archivadas (limpieza tras archivar la
+        // liquidación, para liberar cuota). La inmutabilidad post-archive se
+        // mantiene en update (las archivadas siguen siendo no-editables).
+        (isAdminRole() && resource.data.get('archived', false) == true) ||
+        ((
+          // Las jornadas activas: admin o dueño bajo las condiciones habituales.
+          resource.data.get('archived', false) == false
+        ) && (isAdminRole() || (
+          isApproved() &&
+          resource.data.userId == request.auth.uid &&
+          resource.data.lockedByAdmin == false &&
+          resource.data.get('lockedByAudit', false) == false
+        )));
     }
 
     // ─── Bloqueo de ediciones por auditoría ──────────────────────────────
@@ -219,12 +236,26 @@ service cloud.firestore {
       // conocido que un MEMBER puede explotar desde la consola.
       allow read: if isApproved();
       allow create: if isAdminRole();
-      // Admins pueden actualizar una liquidación no archivada (para archivarla).
-      // Una vez archivada (archivedAt presente), sólo SUPERUSER puede modificar.
-      allow update: if isSuperUser() || (
-        isAdminRole() && resource.data.get('archivedAt', null) == null
+      // Update:
+      //  - SUPERUSER puede actualizar siempre, EXCEPTO desarchivar
+      //    (transición archived → no archived está prohibida para todos).
+      //  - Admin puede actualizar mientras no esté archivada.
+      //  - Una vez archivada, ningún rol puede borrar `archivedAt` o
+      //    convertirla en no-archivada.
+      allow update: if (
+        // Defensa en profundidad: nadie (incluido SUPERUSER) puede desarchivar.
+        // Si la liquidación ya estaba archivada, el resultado debe seguir teniendo archivedAt.
+        resource.data.get('archivedAt', null) == null ||
+        request.resource.data.get('archivedAt', null) != null
+      ) && (
+        isSuperUser() ||
+        (isAdminRole() && resource.data.get('archivedAt', null) == null)
       );
-      allow delete: if isSuperUser();
+      // Delete: admin solo si NO está archivada (caso "Liberar fechas").
+      // SUPERUSER puede borrar archivadas también si fuera necesario para
+      // limpieza, pero el flujo normal es que las archivadas sean inmutables.
+      allow delete: if isSuperUser() ||
+        (isAdminRole() && resource.data.get('archivedAt', null) == null);
     }
 
     // ─── Chat / Soporte ────────────────────────────────────────────────────

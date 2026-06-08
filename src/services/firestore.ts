@@ -88,6 +88,31 @@ import type {
 
 const CALCULATION_VERSION = 'v1-client'
 
+/**
+ * Id determin\u00edstico para `time_entries`: garantiza unicidad por
+ * (userId, projectId, workDate). El cliente preverifica con `getDoc` y las
+ * reglas de Firestore tambi\u00e9n bloquean `create` si el doc existe.
+ *
+ * Nota: las entries antiguas (anteriores al deploy de unicidad) tienen ids
+ * random; siguen funcionando pero no participan del bloqueo. La herramienta
+ * de auditor\u00eda de duplicados las detecta y permite limpiarlas.
+ */
+function buildTimeEntryId(userId: string, projectId: string, workDate: string): string {
+  return `${userId}_${projectId}_${workDate}`
+}
+
+/** Error tipado para "ya existe una jornada en esa fecha". */
+export class DuplicateTimeEntryError extends Error {
+  workDate: string
+  userId: string
+  constructor(workDate: string, userId: string) {
+    super(`Ya existe una jornada para ${userId} el ${workDate} en este proyecto.`)
+    this.name = 'DuplicateTimeEntryError'
+    this.workDate = workDate
+    this.userId = userId
+  }
+}
+
 // ─── Utilidad: elimina campos undefined (Firestore los rechaza) ──────────────
 function stripUndefined<T>(obj: T): T {
   if (Array.isArray(obj)) return obj.map(stripUndefined) as unknown as T
@@ -512,20 +537,38 @@ export async function saveTimeEntry(
     isJornadaAdicional: input.isJornadaAdicional,
   })
 
-  await addDoc(collection(db, 'time_entries'), {
-    ...input,
-    userId: user.uid,
-    userName: user.displayName || 'Sin nombre',
-    userEmail: user.email ?? null,
-    areaId: user.areaId ?? null,
-    calculation,
-    calculationSource: 'client',
-    calculationVersion: CALCULATION_VERSION,
-    lockedByAdmin: false,
-    lockedByAudit: false,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  })
+  // Id determinístico para garantizar unicidad por (userId, projectId, workDate).
+  // El cliente preverifica con getDoc; las reglas Firestore también bloquean
+  // create si el doc ya existe (defensa en profundidad).
+  const entryId = buildTimeEntryId(user.uid, input.projectId, input.workDate)
+  const ref = doc(db, 'time_entries', entryId)
+  const existing = await getDoc(ref)
+  if (existing.exists()) {
+    throw new DuplicateTimeEntryError(input.workDate, user.uid)
+  }
+
+  try {
+    await setDoc(ref, {
+      ...input,
+      userId: user.uid,
+      userName: user.displayName || 'Sin nombre',
+      userEmail: user.email ?? null,
+      areaId: user.areaId ?? null,
+      calculation,
+      calculationSource: 'client',
+      calculationVersion: CALCULATION_VERSION,
+      lockedByAdmin: false,
+      lockedByAudit: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    })
+  } catch (e) {
+    const code = (e as { code?: string }).code
+    if (code === 'permission-denied' || code === 'already-exists') {
+      throw new DuplicateTimeEntryError(input.workDate, user.uid)
+    }
+    throw e
+  }
   void writeSystemLog({
     type: 'entry_create',
     userId: user.uid,
@@ -551,20 +594,37 @@ export async function saveTimeEntryForUser(
     isJornadaAdicional: input.isJornadaAdicional,
   })
 
-  await addDoc(collection(db, 'time_entries'), {
-    ...input,
-    userId: targetUser.uid,
-    userName: targetUser.displayName || 'Sin nombre',
-    userEmail: targetUser.email ?? null,
-    areaId: targetUser.areaId ?? null,
-    calculation,
-    calculationSource: 'client',
-    calculationVersion: CALCULATION_VERSION,
-    lockedByAdmin: false,
-    lockedByAudit: false,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  })
+  // Mismo id determinístico que `saveTimeEntry`. Si ya existe una jornada
+  // del mismo (userId, projectId, workDate), bloquear duplicado.
+  const entryId = buildTimeEntryId(targetUser.uid, input.projectId, input.workDate)
+  const ref = doc(db, 'time_entries', entryId)
+  const existing = await getDoc(ref)
+  if (existing.exists()) {
+    throw new DuplicateTimeEntryError(input.workDate, targetUser.uid)
+  }
+
+  try {
+    await setDoc(ref, {
+      ...input,
+      userId: targetUser.uid,
+      userName: targetUser.displayName || 'Sin nombre',
+      userEmail: targetUser.email ?? null,
+      areaId: targetUser.areaId ?? null,
+      calculation,
+      calculationSource: 'client',
+      calculationVersion: CALCULATION_VERSION,
+      lockedByAdmin: false,
+      lockedByAudit: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    })
+  } catch (e) {
+    const code = (e as { code?: string }).code
+    if (code === 'permission-denied' || code === 'already-exists') {
+      throw new DuplicateTimeEntryError(input.workDate, targetUser.uid)
+    }
+    throw e
+  }
   void writeSystemLog({
     type: 'entry_create',
     userId: targetUser.uid,
@@ -1143,18 +1203,19 @@ export async function previewSettlement(
   dateTo: string,
   createdBy: string,
 ): Promise<Settlement> {
-  const [entries, config, projectUsers, projectRoles] = await Promise.all([
+  const [entries, config, projectUsers, projectRoles, projectAreas] = await Promise.all([
     listAllTimeEntries(projectId, { dateFrom, dateTo }),
     getProjectConfig(projectId),
     listProjectUsers(projectId),
     listProjectRoles(projectId),
+    listProjectAreas(projectId),
   ])
 
   // Tarifa por hora:
   // 1) Si el rol tiene weeklyRate > 0 → Valor Jornada = weeklyRate / weeklyWorkDays
   // 2) Si no → Valor Jornada = dailyRate
   // Valor Hora = Valor Jornada / regularDailyHours
-  const userRates = new Map<string, { hourlyRate: number; roleId?: string; roleName?: string }>()
+  const userRates = new Map<string, { hourlyRate: number; roleId?: string; roleName?: string; areaId?: string; areaName?: string }>()
   for (const user of projectUsers) {
     const role = user.roleId ? projectRoles.find((r) => r.id === user.roleId) : undefined
     const valorJornada = role
@@ -1163,7 +1224,14 @@ export async function previewSettlement(
           : role.dailyRate)
       : 0
     const hourlyRate = role ? Math.round((valorJornada / config.regularDailyHours) * 100) / 100 : 0
-    userRates.set(user.uid, { hourlyRate, roleId: role?.id, roleName: role?.name })
+    const area = user.areaId ? projectAreas.find((a) => a.id === user.areaId) : undefined
+    userRates.set(user.uid, {
+      hourlyRate,
+      roleId: role?.id,
+      roleName: role?.name,
+      areaId: user.areaId,
+      areaName: area?.name,
+    })
   }
 
   return calculateSettlement(entries, userRates, config, {
@@ -1217,9 +1285,13 @@ export async function deleteSettlement(settlementId: string): Promise<void> {
 /**
  * Archiva permanentemente una liquidación:
  *  1) Sube el Excel (generado por el caller) a Storage en archives/{projectId}/{settlementId}.xlsx
- *  2) Marca todas las jornadas del rango como archived=true, en batches de 400.
+ *  2) Marca todas las jornadas del rango como archived=true (ventana de gracia).
  *  3) Actualiza el doc settlement con archivedAt, archivedBy, archiveFileUrl, archiveFilePath, archiveEntriesCount.
- * Una vez archivada, las reglas Firestore impiden editar/eliminar las jornadas y el settlement (excepto SUPERUSER).
+ *  4) BORRA las jornadas del rango para liberar cuota. Los datos agregados
+ *     quedan en `settlement.lines[]` (con daysWorked, areaId/Name) y el
+ *     detalle por jornada queda en el Excel archivado.
+ * Una vez archivada, las reglas Firestore impiden editar el settlement
+ * (excepto SUPERUSER) y nadie puede desarchivar.
  */
 export async function archiveSettlement(
   settlementId: string,
@@ -1281,7 +1353,40 @@ export async function archiveSettlement(
   }
   await updateDoc(settlementRef, archiveMeta)
 
+  // 5) Borrar las entries archivadas para liberar cuota. Best-effort: si
+  //    falla algún batch, las entries quedan archived=true y un admin puede
+  //    reintentar la limpieza manualmente. La liquidación ya quedó archivada
+  //    correctamente con su agregado en `lines[]`.
+  await deleteArchivedEntriesOfSettlement(settlement.projectId, settlement.id ?? '', entries)
+
   return { ...settlement, ...archiveMeta, archivedAt: new Date() }
+}
+
+/**
+ * Borra en batch las jornadas que pertenecen a una liquidación archivada.
+ * Best-effort: si una sub-batch falla (permisos, red), loguea y continúa.
+ */
+async function deleteArchivedEntriesOfSettlement(
+  _projectId: string,
+  settlementId: string,
+  entries: TimeEntry[],
+): Promise<void> {
+  if (!settlementId || entries.length === 0) return
+  for (let i = 0; i < entries.length; i += 400) {
+    const chunk = entries.slice(i, i + 400)
+    const batch = writeBatch(db)
+    for (const e of chunk) {
+      batch.delete(doc(db, 'time_entries', e.id))
+    }
+    try {
+      await batch.commit()
+    } catch (err) {
+      if (import.meta.env.DEV) {
+        console.warn('[archiveSettlement] delete batch skipped:', err)
+      }
+      // continuar; el admin puede reintentar la limpieza manualmente
+    }
+  }
 }
 
 /**
@@ -1332,6 +1437,9 @@ export async function archiveSettlementWithDriveLink(
     archiveEntriesCount: archivedCount,
   }
   await updateDoc(settlementRef, archiveMeta)
+
+  // Borrar entries archivadas para liberar cuota (best-effort).
+  await deleteArchivedEntriesOfSettlement(settlement.projectId, settlement.id ?? '', entries)
 
   return { ...settlement, ...archiveMeta, archivedAt: new Date() }
 }
@@ -2546,4 +2654,493 @@ export async function dismissEmailRecoveryRequest(
   }
   if (notes) patch.notes = notes
   await updateDoc(doc(db, 'email_recovery_requests', requestId), patch)
+}
+
+// ─── Auditoría profunda de la colección users ────────────────────────────
+
+export interface UserMissingFieldsRow {
+  uid: string
+  displayName: string | null
+  email: string | null
+  role: string | null
+  approvalStatus: string | null
+  idNumber: string | null
+  areaId: string | null
+  projectId: string | null
+  isPlaceholder: boolean
+  mergedToUid: string | null
+  /** Lista de campos críticos que están vacíos/ausentes. */
+  missing: string[]
+}
+
+export interface MergedUserWithEntriesRow {
+  uid: string
+  displayName: string | null
+  email: string | null
+  mergedToUid: string
+  /** Cantidad de time_entries cuyo userId == uid (deberían haber sido movidas al destino). */
+  entriesCount: number
+}
+
+export interface UnclaimedPlaceholderRow {
+  uid: string
+  displayName: string | null
+  email: string | null
+  createdAt?: unknown
+  /** Cantidad de time_entries asociadas a este placeholder. */
+  entriesCount: number
+}
+
+export interface UsersIntegrityReport {
+  totalUsers: number
+  /** Users con uno o más campos críticos vacíos (no incluye placeholders ni mergeados). */
+  usersWithMissingFields: UserMissingFieldsRow[]
+  /** Users con mergedToUid presente que todavía tienen entries asociadas (reasignación pendiente). */
+  mergedUsersWithEntries: MergedUserWithEntriesRow[]
+  /** Placeholders importados que nunca se reclamaron (isPlaceholder=true, mergedToUid=null). */
+  unclaimedPlaceholders: UnclaimedPlaceholderRow[]
+  /** Estimación de lecturas facturadas durante la auditoría. */
+  readsEstimate: number
+}
+
+/**
+ * Auditoría profunda de la colección `users`. Solo lectura.
+ *
+ * Reporta tres tipos de inconsistencias:
+ *  1) users con campos críticos faltantes (email/displayName/role/approvalStatus/idNumber/areaId
+ *     según corresponda al rol).
+ *  2) users mergeados (`mergedToUid` presente) que aún tienen entries asociadas
+ *     (reasignación de entries falló o quedó pendiente).
+ *  3) placeholders no reclamados (`isPlaceholder=true && mergedToUid==null`),
+ *     opcionalmente con cantidad de entries que ya hayan recibido.
+ *
+ * Costo aproximado: 1 lectura por user + 1 por mergedToUid con entries (getCountFromServer).
+ */
+export async function auditUsersIntegrity(): Promise<UsersIntegrityReport> {
+  const usersSnap = await getDocs(collection(db, 'users'))
+  const allUsers = usersSnap.docs.map((d) => ({
+    uid: d.id,
+    data: d.data() as UserProfile,
+  }))
+
+  const usersWithMissingFields: UserMissingFieldsRow[] = []
+  const mergedUidsToCheck: { uid: string; data: UserProfile }[] = []
+  const unclaimedPlaceholdersRaw: { uid: string; data: UserProfile }[] = []
+
+  for (const u of allUsers) {
+    const data = u.data
+    const isMerged = !!data.mergedToUid
+    const isPlaceholder = data.isPlaceholder === true
+
+    if (isPlaceholder && !isMerged) {
+      unclaimedPlaceholdersRaw.push(u)
+    }
+    if (isMerged) {
+      mergedUidsToCheck.push(u)
+      continue
+    }
+    // Solo evaluamos campos faltantes en users activos (no mergeados).
+    const missing: string[] = []
+    if (!data.email) missing.push('email')
+    if (!data.displayName?.trim()) missing.push('displayName')
+    if (!data.role) missing.push('role')
+    if (!data.approvalStatus) missing.push('approvalStatus')
+    if (!data.idNumber?.trim()) missing.push('idNumber')
+    // areaId/projectId son obligatorios solo para MEMBER aprobados.
+    if (data.role === 'MEMBER' && data.approvalStatus === 'APPROVED') {
+      if (!data.projectId) missing.push('projectId')
+      if (!data.areaId) missing.push('areaId')
+    }
+    if (missing.length > 0) {
+      usersWithMissingFields.push({
+        uid: u.uid,
+        displayName: data.displayName ?? null,
+        email: data.email ?? null,
+        role: data.role ?? null,
+        approvalStatus: data.approvalStatus ?? null,
+        idNumber: data.idNumber ?? null,
+        areaId: data.areaId ?? null,
+        projectId: data.projectId ?? null,
+        isPlaceholder,
+        mergedToUid: data.mergedToUid ?? null,
+        missing,
+      })
+    }
+  }
+
+  // Para los mergeados y placeholders, consultar cuántas entries tienen aún asociadas.
+  const mergedUsersWithEntries: MergedUserWithEntriesRow[] = []
+  for (const u of mergedUidsToCheck) {
+    try {
+      const cnt = await getCountFromServer(
+        query(collection(db, 'time_entries'), where('userId', '==', u.uid)),
+      )
+      const n = cnt.data().count
+      if (n > 0) {
+        mergedUsersWithEntries.push({
+          uid: u.uid,
+          displayName: u.data.displayName ?? null,
+          email: u.data.email ?? null,
+          mergedToUid: u.data.mergedToUid as string,
+          entriesCount: n,
+        })
+      }
+    } catch (e) {
+      if (import.meta.env.DEV) console.warn('[auditUsersIntegrity] count merged failed for', u.uid, e)
+    }
+  }
+
+  const unclaimedPlaceholders: UnclaimedPlaceholderRow[] = []
+  for (const u of unclaimedPlaceholdersRaw) {
+    let entriesCount = 0
+    try {
+      const cnt = await getCountFromServer(
+        query(collection(db, 'time_entries'), where('userId', '==', u.uid)),
+      )
+      entriesCount = cnt.data().count
+    } catch (e) {
+      if (import.meta.env.DEV) console.warn('[auditUsersIntegrity] count placeholder failed for', u.uid, e)
+    }
+    unclaimedPlaceholders.push({
+      uid: u.uid,
+      displayName: u.data.displayName ?? null,
+      email: u.data.email ?? null,
+      createdAt: u.data.createdAt,
+      entriesCount,
+    })
+  }
+
+  // Ordenamientos útiles
+  usersWithMissingFields.sort((a, b) => b.missing.length - a.missing.length)
+  mergedUsersWithEntries.sort((a, b) => b.entriesCount - a.entriesCount)
+  unclaimedPlaceholders.sort((a, b) => b.entriesCount - a.entriesCount)
+
+  const readsEstimate =
+    allUsers.length + mergedUidsToCheck.length + unclaimedPlaceholdersRaw.length
+
+  return {
+    totalUsers: allUsers.length,
+    usersWithMissingFields,
+    mergedUsersWithEntries,
+    unclaimedPlaceholders,
+    readsEstimate,
+  }
+}
+
+// ─── Auditoría de duplicados de time_entries ─────────────────────────────
+
+export interface DuplicateGroup {
+  userId: string
+  userName: string | null
+  projectId: string
+  workDate: string
+  /** Entries duplicadas, ordenadas por createdAt asc (la última al final). */
+  entries: Array<{
+    id: string
+    timeIn: string
+    timeOut: string
+    notes: string
+    isJornadaAdicional: boolean
+    archived: boolean
+    createdAt: number | null
+  }>
+}
+
+export interface DuplicateAuditReport {
+  totalGroups: number
+  totalDuplicateEntries: number
+  groups: DuplicateGroup[]
+}
+
+/**
+ * Detecta grupos de jornadas duplicadas: misma combinación de
+ * (userId, projectId, workDate) con más de un documento.
+ *
+ * Ventana parametrizable (default 90 días). Las entries archivadas se
+ * incluyen para visibilidad pero NO son candidatas a borrado automático.
+ *
+ * Costo: 1 lectura por entry en el rango.
+ */
+export async function auditDuplicateTimeEntries(
+  opts?: { daysBack?: number },
+): Promise<DuplicateAuditReport> {
+  const days = Math.max(1, opts?.daysBack ?? 90)
+  const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10)
+  const snap = await getDocs(
+    query(collection(db, 'time_entries'), where('workDate', '>=', since)),
+  )
+
+  type EntryRow = DuplicateGroup['entries'][number] & {
+    userId: string
+    userName: string | null
+    projectId: string
+    workDate: string
+  }
+  const byKey = new Map<string, EntryRow[]>()
+  for (const d of snap.docs) {
+    const data = d.data() as TimeEntry
+    if (!data.userId || !data.projectId || !data.workDate) continue
+    const key = `${data.userId}__${data.projectId}__${data.workDate}`
+    const ts = (data.createdAt as { seconds?: number } | undefined)?.seconds ?? null
+    const row: EntryRow = {
+      id: d.id,
+      userId: data.userId,
+      userName: data.userName ?? null,
+      projectId: data.projectId,
+      workDate: data.workDate,
+      timeIn: data.timeIn,
+      timeOut: data.timeOut,
+      notes: data.notes ?? '',
+      isJornadaAdicional: !!data.isJornadaAdicional,
+      archived: !!data.archived,
+      createdAt: ts,
+    }
+    const arr = byKey.get(key) ?? []
+    arr.push(row)
+    byKey.set(key, arr)
+  }
+
+  const groups: DuplicateGroup[] = []
+  let totalDuplicateEntries = 0
+  for (const [, rows] of byKey) {
+    if (rows.length < 2) continue
+    rows.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+    groups.push({
+      userId: rows[0].userId,
+      userName: rows[0].userName,
+      projectId: rows[0].projectId,
+      workDate: rows[0].workDate,
+      entries: rows.map(({ id, timeIn, timeOut, notes, isJornadaAdicional, archived, createdAt }) => ({
+        id, timeIn, timeOut, notes, isJornadaAdicional, archived, createdAt,
+      })),
+    })
+    totalDuplicateEntries += rows.length - 1
+  }
+
+  groups.sort((a, b) => b.entries.length - a.entries.length || b.workDate.localeCompare(a.workDate))
+
+  return {
+    totalGroups: groups.length,
+    totalDuplicateEntries,
+    groups,
+  }
+}
+
+/**
+ * Aplica política B (auto-limpieza): para cada grupo de duplicados,
+ * conserva la entry MÁS RECIENTE por `createdAt` y borra las demás.
+ *
+ * Saltea entries archivadas (no se tocan). Si TODAS las entries del grupo
+ * están archivadas, el grupo queda como "no resuelto" (admin debe revisar
+ * manualmente desde la consola Firestore).
+ *
+ * Devuelve el detalle de qué se borró y qué quedó pendiente.
+ */
+export async function deduplicateTimeEntries(report: DuplicateAuditReport): Promise<{
+  deletedCount: number
+  groupsResolved: number
+  groupsSkipped: number
+  errors: number
+}> {
+  let deletedCount = 0
+  let groupsResolved = 0
+  let groupsSkipped = 0
+  let errors = 0
+
+  for (const group of report.groups) {
+    const liveEntries = group.entries.filter((e) => !e.archived)
+    if (liveEntries.length < 2) {
+      // Si solo hay 1 o 0 entries no archivadas, no se puede deduplicar
+      // automáticamente sin tocar archivadas. Saltear.
+      groupsSkipped += 1
+      continue
+    }
+    // La última (mayor createdAt) se conserva; el resto se borra.
+    const sortedAsc = [...liveEntries].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+    const toDelete = sortedAsc.slice(0, -1)
+    let groupErrored = false
+    for (const e of toDelete) {
+      try {
+        await deleteDoc(doc(db, 'time_entries', e.id))
+        deletedCount += 1
+      } catch (err) {
+        if (import.meta.env.DEV) console.warn('[deduplicateTimeEntries] delete failed', e.id, err)
+        errors += 1
+        groupErrored = true
+      }
+    }
+    if (groupErrored) groupsSkipped += 1
+    else groupsResolved += 1
+  }
+
+  return { deletedCount, groupsResolved, groupsSkipped, errors }
+}
+
+// ─── Migración a id determinístico de time_entries ───────────────────────
+
+export interface IdMigrationConflict {
+  userId: string
+  projectId: string
+  workDate: string
+  /** IDs de los docs en conflicto (todos viejos con la misma key). */
+  ids: string[]
+}
+
+export interface IdMigrationPreview {
+  /** Total de docs en `time_entries` escaneados. */
+  totalScanned: number
+  /** Docs cuyo id ya es determinístico `userId_projectId_workDate`. Se saltean. */
+  alreadyDeterministic: number
+  /** Docs con id no-determinístico que pueden migrarse limpio (sin conflicto). */
+  needsMigration: number
+  /** Grupos `(userId, projectId, workDate)` con varios docs viejos: requieren dedup primero. */
+  conflicts: IdMigrationConflict[]
+  /** Docs archivados con id viejo: se reportan pero NO se migran (delete archived solo SUPERUSER). */
+  archivedSkipped: number
+  /** Docs con campos faltantes (userId/projectId/workDate vacíos): no se pueden migrar. */
+  invalidSkipped: number
+  /** Estimación de writes que producirá la ejecución (set + delete por entry migrable). */
+  writesEstimate: number
+}
+
+/**
+ * Escanea `time_entries` y reporta cuántos docs tienen id viejo (random) y
+ * pueden migrarse a id determinístico `${userId}_${projectId}_${workDate}`.
+ *
+ * Costo: 1 lectura por doc en `time_entries`. Para ~3000-10000 docs entra
+ * cómodo en el cupo Spark de un día.
+ */
+export async function previewTimeEntryIdMigration(): Promise<IdMigrationPreview> {
+  const snap = await getDocs(collection(db, 'time_entries'))
+  let alreadyDeterministic = 0
+  let archivedSkipped = 0
+  let invalidSkipped = 0
+  // Buscar viejos por key (U_P_D) → lista de docs viejos con esa key
+  const oldByKey = new Map<string, Array<{ id: string; archived: boolean }>>()
+  // Y conjunto de keys que YA tienen un doc con id determinístico
+  const determinKeys = new Set<string>()
+
+  for (const d of snap.docs) {
+    const data = d.data() as TimeEntry
+    if (!data.userId || !data.projectId || !data.workDate) {
+      invalidSkipped += 1
+      continue
+    }
+    const expected = buildTimeEntryId(data.userId, data.projectId, data.workDate)
+    const isArchived = !!data.archived
+    if (d.id === expected) {
+      alreadyDeterministic += 1
+      determinKeys.add(expected)
+      continue
+    }
+    // Id viejo
+    if (isArchived) {
+      archivedSkipped += 1
+      continue
+    }
+    const arr = oldByKey.get(expected) ?? []
+    arr.push({ id: d.id, archived: isArchived })
+    oldByKey.set(expected, arr)
+  }
+
+  const conflicts: IdMigrationConflict[] = []
+  let needsMigration = 0
+  for (const [key, list] of oldByKey) {
+    if (list.length > 1) {
+      // Varios viejos con la misma key → requiere dedup primero
+      const [userId, projectId, workDate] = key.split('_', 3)
+      conflicts.push({ userId, projectId, workDate, ids: list.map((x) => x.id) })
+    } else if (list.length === 1) {
+      // 1 viejo + posible determinístico ya existe → conflicto
+      if (determinKeys.has(key)) {
+        const [userId, projectId, workDate] = key.split('_', 3)
+        conflicts.push({ userId, projectId, workDate, ids: [...list.map((x) => x.id), key] })
+      } else {
+        needsMigration += 1
+      }
+    }
+  }
+
+  // 2 writes por entry migrable (set + delete)
+  const writesEstimate = needsMigration * 2
+
+  return {
+    totalScanned: snap.size,
+    alreadyDeterministic,
+    needsMigration,
+    conflicts,
+    archivedSkipped,
+    invalidSkipped,
+    writesEstimate,
+  }
+}
+
+/**
+ * Ejecuta la migración: para cada entry viable (id viejo, no archivada, sin
+ * conflicto), copia los datos a un nuevo doc con id determinístico y borra
+ * el viejo. Best-effort: si un doc falla, continúa con los demás.
+ *
+ * Procesa en serie para mantener atómicidad por par. No hace batches porque
+ * cada migración es 2 ops cross-doc (set + delete) y el batch máximo es 500.
+ */
+export async function migrateTimeEntryIds(): Promise<{
+  migrated: number
+  errors: number
+  skippedDueToConflict: number
+  skippedArchived: number
+  skippedInvalid: number
+}> {
+  const snap = await getDocs(collection(db, 'time_entries'))
+  let migrated = 0
+  let errors = 0
+  let skippedDueToConflict = 0
+  let skippedArchived = 0
+  let skippedInvalid = 0
+
+  // Pre-calcular grupos para decidir qué se migra
+  const oldByKey = new Map<string, Array<{ id: string; data: TimeEntry; archived: boolean }>>()
+  const determinKeys = new Set<string>()
+  for (const d of snap.docs) {
+    const data = d.data() as TimeEntry
+    if (!data.userId || !data.projectId || !data.workDate) {
+      skippedInvalid += 1
+      continue
+    }
+    const expected = buildTimeEntryId(data.userId, data.projectId, data.workDate)
+    if (d.id === expected) {
+      determinKeys.add(expected)
+      continue
+    }
+    if (data.archived) {
+      skippedArchived += 1
+      continue
+    }
+    const arr = oldByKey.get(expected) ?? []
+    arr.push({ id: d.id, data, archived: !!data.archived })
+    oldByKey.set(expected, arr)
+  }
+
+  for (const [key, list] of oldByKey) {
+    // Saltear si hay conflicto (varios viejos o coexistencia con determinístico)
+    if (list.length > 1 || determinKeys.has(key)) {
+      skippedDueToConflict += list.length
+      continue
+    }
+    const item = list[0]
+    const newRef = doc(db, 'time_entries', key)
+    const oldRef = doc(db, 'time_entries', item.id)
+    try {
+      // Set en el nuevo path con los mismos datos.
+      // Importante: data ya tiene userId/projectId/workDate consistentes con la key.
+      await setDoc(newRef, item.data)
+      // Delete del viejo.
+      await deleteDoc(oldRef)
+      migrated += 1
+    } catch (err) {
+      if (import.meta.env.DEV) console.warn('[migrateTimeEntryIds] failed', item.id, err)
+      errors += 1
+    }
+  }
+
+  return { migrated, errors, skippedDueToConflict, skippedArchived, skippedInvalid }
 }

@@ -56,6 +56,15 @@ import {
   auditOrphanEntries,
   createMinimalUserDoc,
   type OrphanEntryRow,
+  auditUsersIntegrity,
+  type UsersIntegrityReport,
+  auditDuplicateTimeEntries,
+  deduplicateTimeEntries,
+  type DuplicateAuditReport,
+  DuplicateTimeEntryError,
+  previewTimeEntryIdMigration,
+  migrateTimeEntryIds,
+  type IdMigrationPreview,
   setMaintenanceMode,
   listProjectUsers,
   subscribeToProjects,
@@ -115,6 +124,7 @@ type ProjectTab =
   | 'TIME_ENTRY_AUDIT'
   | 'SETTLEMENTS'
   | 'STATS'
+  | 'HISTORICAL'
 type UserTab = 'PENDING' | 'APPROVED'
 
 interface Toast {
@@ -250,7 +260,7 @@ function writeLS(key: string, value: string) {
   try { localStorage.setItem(LS_PREFIX + key, value) } catch { /* noop */ }
 }
 const MAIN_TABS = ['PROJECTS', 'PROJECT_MANAGEMENT', 'USERS', 'HELP', 'SYSTEM_LOGS'] as const
-const PROJECT_TABS = ['PROJECT_CONFIG', 'TIME_ENTRY_FORM', 'TIME_ENTRY_TABLE', 'TIME_ENTRY_AUDIT', 'SETTLEMENTS', 'STATS'] as const
+const PROJECT_TABS = ['PROJECT_CONFIG', 'TIME_ENTRY_FORM', 'TIME_ENTRY_TABLE', 'TIME_ENTRY_AUDIT', 'SETTLEMENTS', 'STATS', 'HISTORICAL'] as const
 const USER_TABS = ['PENDING', 'APPROVED'] as const
 
 export function DashboardPage() {
@@ -615,6 +625,22 @@ export function DashboardPage() {
   const [orphanCreatingUid, setOrphanCreatingUid] = useState<string | null>(null)
   const [orphanEmailOverride, setOrphanEmailOverride] = useState<Record<string, string>>({})
 
+  // ── Auditoría profunda de la colección users ────────────────────────────
+  const [usersAuditReport, setUsersAuditReport] = useState<UsersIntegrityReport | null>(null)
+  const [usersAuditBusy, setUsersAuditBusy] = useState(false)
+  const [usersAuditReassigningUid, setUsersAuditReassigningUid] = useState<string | null>(null)
+
+  // ── Auditoría de duplicados de time_entries ─────────────────────────────
+  const [dupReport, setDupReport] = useState<DuplicateAuditReport | null>(null)
+  const [dupDays, setDupDays] = useState(90)
+  const [dupBusy, setDupBusy] = useState(false)
+  const [dupCleaningBusy, setDupCleaningBusy] = useState(false)
+
+  // ── Migración de IDs determinísticos en time_entries ─────────────────────
+  const [migPreview, setMigPreview] = useState<IdMigrationPreview | null>(null)
+  const [migBusy, setMigBusy] = useState(false)
+  const [migExecBusy, setMigExecBusy] = useState(false)
+
   // ── Edición de DNI por admin desde el modal de editar usuario ─────────────
   const [editIdNumber, setEditIdNumber] = useState('')
   const [editIdNumberBusy, setEditIdNumberBusy] = useState(false)
@@ -632,6 +658,13 @@ export function DashboardPage() {
   const [statsEntries, setStatsEntries] = useState<TimeEntry[]>([])
   const [statsLoading, setStatsLoading] = useState(false)
   const [statsSubTab, setStatsSubTab] = useState<'users' | 'areas' | 'dates'>('users')
+
+  // ── Histórico (consulta liquidaciones archivadas) ─────────────────────────
+  const [historicalDateFrom, setHistoricalDateFrom] = useState('')
+  const [historicalDateTo, setHistoricalDateTo] = useState('')
+  const [historicalSettlements, setHistoricalSettlements] = useState<Settlement[] | null>(null)
+  const [historicalLoading, setHistoricalLoading] = useState(false)
+  const [historicalSubTab, setHistoricalSubTab] = useState<'users' | 'areas' | 'settlements'>('users')
 
   const loadStatsEntries = useCallback(async () => {
     if (!activeProjectId || statsLoading) return
@@ -1588,7 +1621,13 @@ export function DashboardPage() {
       setForm((prev) => ({ ...prev, notes: '' }))
       void loadEntries()
     } catch (err) {
-      showToast('Error al guardar el horario.', 'error')
+      if (err instanceof DuplicateTimeEntryError) {
+        showToast(`Ya existe un registro para el ${form.workDate} en este proyecto. Si necesitás modificarlo, usá el botón Editar en la tabla.`, 'error')
+        // Refrescar entries para que la próxima validación cliente vea el duplicado.
+        void loadEntries()
+      } else {
+        showToast('Error al guardar el horario.', 'error')
+      }
       console.error(err)
     } finally {
       setSavingEntry(false)
@@ -1761,7 +1800,12 @@ export function DashboardPage() {
       setAdminEntryUserId('')
       void loadEntries()
     } catch (err) {
-      showToast('Error al cargar jornada.', 'error')
+      if (err instanceof DuplicateTimeEntryError) {
+        showToast(`${targetUser.displayName ?? 'El usuario'} ya tiene una jornada cargada para el ${adminEntryForm.workDate}. Editala desde la tabla.`, 'error')
+        void loadEntries()
+      } else {
+        showToast('Error al cargar jornada.', 'error')
+      }
       console.error(err)
     }
   }
@@ -2435,6 +2479,7 @@ export function DashboardPage() {
     { key: 'TIME_ENTRY_AUDIT', label: 'Auditoría', visible: canAudit(currentProfile.role) },
     { key: 'SETTLEMENTS', label: 'Liquidaciones', visible: canAudit(currentProfile.role) },
     { key: 'STATS', label: 'Estadísticas', visible: canAudit(currentProfile.role) },
+    { key: 'HISTORICAL', label: 'Histórico', visible: canAudit(currentProfile.role) },
   ]
 
   const ath = (col: string, label: string, title?: string) => {
@@ -4432,6 +4477,260 @@ export function DashboardPage() {
               )}
             </section>
           )}
+
+          {/* ── HISTÓRICO (lecturas de liquidaciones archivadas) ── */}
+          {projectTab === 'HISTORICAL' && canAudit(currentProfile.role) && (
+            <section className="card">
+              <h2>Histórico de liquidaciones</h2>
+              <p className="muted" style={{ marginTop: 0 }}>
+                Consulta acumulados de períodos ya liquidados. Los datos provienen del agregado guardado al archivar cada liquidación
+                (no requiere leer las jornadas individuales). Para detalle por jornada, descargá el Excel desde la lista.
+              </p>
+
+              <div className="row" style={{ gap: '0.5rem', flexWrap: 'wrap', alignItems: 'flex-end', marginTop: '0.75rem' }}>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>Desde</span>
+                  <input
+                    type="date"
+                    value={historicalDateFrom}
+                    onChange={(e) => setHistoricalDateFrom(e.target.value)}
+                  />
+                </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>Hasta</span>
+                  <input
+                    type="date"
+                    value={historicalDateTo}
+                    onChange={(e) => setHistoricalDateTo(e.target.value)}
+                  />
+                </label>
+                <button
+                  className="btn"
+                  disabled={historicalLoading || !historicalDateFrom || !historicalDateTo}
+                  onClick={async () => {
+                    if (!activeProjectId) return
+                    if (historicalDateFrom > historicalDateTo) {
+                      showToast('La fecha desde debe ser anterior a la fecha hasta.', 'error')
+                      return
+                    }
+                    setHistoricalLoading(true)
+                    try {
+                      const all = await listSettlements(activeProjectId)
+                      // Solapamiento con el rango pedido.
+                      const filtered = all.filter(
+                        (s) => s.dateTo >= historicalDateFrom && s.dateFrom <= historicalDateTo,
+                      )
+                      setHistoricalSettlements(filtered)
+                    } catch (err) {
+                      showToast('Error al cargar histórico.', 'error')
+                      console.error(err)
+                    } finally {
+                      setHistoricalLoading(false)
+                    }
+                  }}
+                >
+                  {historicalLoading ? <><Spinner size={14} inline /> Cargando…</> : 'Buscar'}
+                </button>
+              </div>
+
+              {historicalSettlements && historicalSettlements.length === 0 && (
+                <p className="muted" style={{ marginTop: '0.75rem' }}>
+                  Sin liquidaciones que se solapen con el rango.
+                </p>
+              )}
+
+              {historicalSettlements && historicalSettlements.length > 0 && (() => {
+                // Agregados en cliente sobre las `lines[]` de cada liquidación.
+                type Agg = {
+                  regularHours: number; overtimeHours: number; nightHours: number; nightOvertimeHours: number
+                  engancheExtraHours: number; reengancheExtraHours: number; penaltyHours: number
+                  jornadaAdicionalCount: number; daysWorked: number; totalHours: number; totalPay: number
+                }
+                const newAgg = (): Agg => ({
+                  regularHours: 0, overtimeHours: 0, nightHours: 0, nightOvertimeHours: 0,
+                  engancheExtraHours: 0, reengancheExtraHours: 0, penaltyHours: 0,
+                  jornadaAdicionalCount: 0, daysWorked: 0, totalHours: 0, totalPay: 0,
+                })
+                const addInto = (target: Agg, l: import('../types/domain').SettlementLine) => {
+                  target.regularHours += l.regularHours ?? 0
+                  target.overtimeHours += l.overtimeHours ?? 0
+                  target.nightHours += l.nightHours ?? 0
+                  target.nightOvertimeHours += l.nightOvertimeHours ?? 0
+                  target.engancheExtraHours += l.engancheExtraHours ?? 0
+                  target.reengancheExtraHours += l.reengancheExtraHours ?? 0
+                  target.penaltyHours += l.penaltyHours ?? 0
+                  target.jornadaAdicionalCount += l.jornadaAdicionalCount ?? 0
+                  target.daysWorked += l.daysWorked ?? 0
+                  target.totalHours += l.totalHours ?? 0
+                  target.totalPay += l.totalPay ?? 0
+                }
+
+                const byUser = new Map<string, { userName: string; agg: Agg }>()
+                const byArea = new Map<string, { areaName: string; agg: Agg }>()
+                let grandTotalPay = 0
+
+                for (const s of historicalSettlements) {
+                  for (const line of s.lines) {
+                    const uKey = line.userId
+                    if (!byUser.has(uKey)) byUser.set(uKey, { userName: line.userName, agg: newAgg() })
+                    addInto(byUser.get(uKey)!.agg, line)
+
+                    const aKey = line.areaId ?? '__sin_area__'
+                    if (!byArea.has(aKey)) byArea.set(aKey, { areaName: line.areaName ?? '— Sin área —', agg: newAgg() })
+                    addInto(byArea.get(aKey)!.agg, line)
+
+                    grandTotalPay += line.totalPay ?? 0
+                  }
+                }
+
+                const userRows = Array.from(byUser.entries())
+                  .map(([userId, v]) => ({ userId, userName: v.userName, ...v.agg }))
+                  .sort((a, b) => b.totalHours - a.totalHours)
+                const areaRows = Array.from(byArea.entries())
+                  .map(([areaId, v]) => ({ areaId, areaName: v.areaName, ...v.agg }))
+                  .sort((a, b) => b.totalHours - a.totalHours)
+                const sortedSettlements = [...historicalSettlements].sort(
+                  (a, b) => a.dateFrom.localeCompare(b.dateFrom),
+                )
+
+                const fmt = (n: number) => Math.round(n * 100) / 100
+
+                return (
+                  <>
+                    <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginTop: '0.75rem', fontSize: '0.85rem' }}>
+                      <span className="chip"><strong>{historicalSettlements.length}</strong> liquidaciones</span>
+                      <span className="chip"><strong>{userRows.length}</strong> usuarios</span>
+                      <span className="chip"><strong>{areaRows.length}</strong> áreas</span>
+                      <span className="chip">Total liquidado: <strong>{fmt(grandTotalPay)}</strong></span>
+                    </div>
+
+                    <nav className="subtab-row" style={{ marginTop: '0.75rem' }}>
+                      {([
+                        ['users', 'Por usuario'],
+                        ['areas', 'Por área'],
+                        ['settlements', 'Por liquidación'],
+                      ] as const).map(([k, lbl]) => (
+                        <button
+                          key={k}
+                          className={`subtab ${historicalSubTab === k ? 'active' : ''}`}
+                          onClick={() => setHistoricalSubTab(k)}
+                        >
+                          {lbl}
+                        </button>
+                      ))}
+                    </nav>
+
+                    {historicalSubTab === 'users' && (
+                      <div style={{ overflowX: 'auto', marginTop: '0.5rem' }}>
+                        <table className="audit-table">
+                          <thead>
+                            <tr>
+                              <th>Usuario</th>
+                              <th>Días</th>
+                              <th>Regulares</th>
+                              <th>Extras</th>
+                              <th>Noche</th>
+                              <th>Eng.</th>
+                              <th>Reeng.</th>
+                              <th>6to día</th>
+                              <th>Penalty</th>
+                              <th>Total hs</th>
+                              <th>Total $</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {userRows.map((r) => (
+                              <tr key={r.userId}>
+                                <td>{r.userName}</td>
+                                <td style={{ textAlign: 'right' }}>{r.daysWorked}</td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.regularHours)}</td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.overtimeHours)}</td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.nightHours)}</td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.engancheExtraHours)}</td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.reengancheExtraHours)}</td>
+                                <td style={{ textAlign: 'right' }}>{r.jornadaAdicionalCount}</td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.penaltyHours)}</td>
+                                <td style={{ textAlign: 'right' }}><strong>{fmt(r.totalHours)}</strong></td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.totalPay)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {historicalSubTab === 'areas' && (
+                      <div style={{ overflowX: 'auto', marginTop: '0.5rem' }}>
+                        <table className="audit-table">
+                          <thead>
+                            <tr>
+                              <th>Área</th>
+                              <th>Días</th>
+                              <th>Regulares</th>
+                              <th>Extras</th>
+                              <th>Noche</th>
+                              <th>6to día</th>
+                              <th>Total hs</th>
+                              <th>Total $</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {areaRows.map((r) => (
+                              <tr key={r.areaId}>
+                                <td>{r.areaName}</td>
+                                <td style={{ textAlign: 'right' }}>{r.daysWorked}</td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.regularHours)}</td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.overtimeHours)}</td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.nightHours)}</td>
+                                <td style={{ textAlign: 'right' }}>{r.jornadaAdicionalCount}</td>
+                                <td style={{ textAlign: 'right' }}><strong>{fmt(r.totalHours)}</strong></td>
+                                <td style={{ textAlign: 'right' }}>{fmt(r.totalPay)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {historicalSubTab === 'settlements' && (
+                      <div style={{ overflowX: 'auto', marginTop: '0.5rem' }}>
+                        <table className="audit-table">
+                          <thead>
+                            <tr>
+                              <th>Período</th>
+                              <th>Estado</th>
+                              <th>Usuarios</th>
+                              <th>Total $</th>
+                              <th>Excel</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {sortedSettlements.map((s) => (
+                              <tr key={s.id}>
+                                <td>{s.dateFrom} → {s.dateTo}</td>
+                                <td>
+                                  {s.archivedAt
+                                    ? <span style={{ color: '#16a34a', fontWeight: 600 }}>Archivada</span>
+                                    : <span style={{ color: '#b45309' }}>Abierta</span>}
+                                </td>
+                                <td style={{ textAlign: 'right' }}>{s.lines.length}</td>
+                                <td style={{ textAlign: 'right' }}>{fmt(s.totalPay)}</td>
+                                <td>
+                                  {s.archiveFileUrl
+                                    ? <a href={s.archiveFileUrl} target="_blank" rel="noreferrer">Descargar</a>
+                                    : <span className="muted">—</span>}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </>
+                )
+              })()}
+            </section>
+          )}
         </>
       )}
 
@@ -4696,6 +4995,472 @@ export function DashboardPage() {
                       </button>
                     </div>
                   </div>
+                )}
+              </div>
+            </details>
+          )}
+          {canSeeProjectAdmin(currentProfile.role) && (
+            <details style={{ margin: '0.5rem 0 1rem' }}>
+              <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none', padding: '6px 0' }}>
+                🔍 Auditoría profunda de la colección users
+              </summary>
+              <div style={{ padding: '0.75rem 0 0' }}>
+                <p className="muted" style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+                  Reporta inconsistencias en <code>users</code>: campos críticos faltantes, usuarios marcados como fusionados (<code>mergedToUid</code>) que aún tienen <code>time_entries</code> sin reasignar, y placeholders importados que nunca se reclamaron. <strong>Solo lectura</strong>; las acciones se hacen desde las otras herramientas (Editar usuario, Buscar y reemplazar UID, Auditar entries huérfanas).
+                </p>
+                <p className="muted" style={{ fontSize: '0.78rem', marginBottom: '0.75rem' }}>
+                  ⚠️ Costo: ~1 lectura por usuario en <code>users</code> + 1 por cada usuario mergeado/placeholder (getCountFromServer). Para 184 users ≈ 200-400 lecturas por corrida.
+                </p>
+                <div className="row" style={{ gap: 8, marginBottom: '0.75rem', alignItems: 'center' }}>
+                  <button
+                    className="btn btn-outline"
+                    disabled={usersAuditBusy}
+                    onClick={async () => {
+                      setUsersAuditBusy(true)
+                      try {
+                        const report = await auditUsersIntegrity()
+                        setUsersAuditReport(report)
+                        showToast(
+                          `Auditoría completa. Lecturas estimadas: ${report.readsEstimate}.`,
+                        )
+                      } catch (err) {
+                        showToast('Error al auditar users.', 'error')
+                        console.error('[auditUsersIntegrity] error:', err)
+                      } finally {
+                        setUsersAuditBusy(false)
+                      }
+                    }}
+                  >
+                    {usersAuditBusy ? <><Spinner size={14} inline /> Auditando…</> : 'Ejecutar auditoría'}
+                  </button>
+                  {usersAuditReport && (
+                    <span className="muted" style={{ fontSize: '0.82rem' }}>
+                      <strong>{usersAuditReport.totalUsers}</strong> users totales · {usersAuditReport.usersWithMissingFields.length} con campos faltantes · {usersAuditReport.mergedUsersWithEntries.length} mergeados con entries · {usersAuditReport.unclaimedPlaceholders.length} placeholders no reclamados
+                    </span>
+                  )}
+                </div>
+                {usersAuditReport && (
+                  <>
+                    {/* SECCIÓN 1: Users con campos faltantes */}
+                    <h4 style={{ marginTop: '1rem', marginBottom: '0.5rem' }}>
+                      Users con campos faltantes ({usersAuditReport.usersWithMissingFields.length})
+                    </h4>
+                    {usersAuditReport.usersWithMissingFields.length === 0 ? (
+                      <p className="muted" style={{ fontSize: '0.82rem' }}>Sin inconsistencias. ✅</p>
+                    ) : (
+                      <div style={{ overflowX: 'auto' }}>
+                        <table className="audit-table">
+                          <thead>
+                            <tr>
+                              <th>UID</th>
+                              <th>Nombre</th>
+                              <th>Email</th>
+                              <th>Rol</th>
+                              <th>Estado</th>
+                              <th>Faltantes</th>
+                              <th>Acción</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {usersAuditReport.usersWithMissingFields.map((row) => (
+                              <tr key={row.uid}>
+                                <td style={{ fontFamily: 'monospace', fontSize: '0.75em', whiteSpace: 'nowrap' }}>{row.uid}</td>
+                                <td>{row.displayName ?? <span style={{ color: '#ef4444' }}>—</span>}</td>
+                                <td>{row.email ?? <span style={{ color: '#ef4444' }}>—</span>}</td>
+                                <td>{row.role ?? <span style={{ color: '#ef4444' }}>—</span>}</td>
+                                <td>{row.approvalStatus ?? <span style={{ color: '#ef4444' }}>—</span>}</td>
+                                <td>
+                                  {row.missing.map((f) => (
+                                    <span key={f} className="chip" style={{ background: '#fee2e2', color: '#b91c1c', fontSize: '0.72rem', marginRight: 4 }}>
+                                      {f}
+                                    </span>
+                                  ))}
+                                </td>
+                                <td>
+                                  <button
+                                    className="btn-sm btn-outline"
+                                    onClick={() => {
+                                      // Buscar el user en approvedUsers/pendingUsers/importedMembers para abrir el modal
+                                      const all = [...approvedUsers, ...pendingUsers, ...importedMembers]
+                                      const u = all.find((x) => x.uid === row.uid)
+                                      if (u) openEditUser(u)
+                                      else showToast('No encontrado en panel local. Refrescá la lista de usuarios primero.', 'error')
+                                    }}
+                                  >
+                                    Editar
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {/* SECCIÓN 2: Users mergeToUid con entries pendientes */}
+                    <h4 style={{ marginTop: '1.25rem', marginBottom: '0.5rem' }}>
+                      Users fusionados con entries pendientes ({usersAuditReport.mergedUsersWithEntries.length})
+                    </h4>
+                    {usersAuditReport.mergedUsersWithEntries.length === 0 ? (
+                      <p className="muted" style={{ fontSize: '0.82rem' }}>Sin pendientes. ✅</p>
+                    ) : (
+                      <div style={{ overflowX: 'auto' }}>
+                        <table className="audit-table">
+                          <thead>
+                            <tr>
+                              <th>UID origen</th>
+                              <th>Nombre</th>
+                              <th>Email</th>
+                              <th>Destino (mergedToUid)</th>
+                              <th>Entries</th>
+                              <th>Acción</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {usersAuditReport.mergedUsersWithEntries.map((row) => (
+                              <tr key={row.uid}>
+                                <td style={{ fontFamily: 'monospace', fontSize: '0.75em', whiteSpace: 'nowrap' }}>{row.uid}</td>
+                                <td>{row.displayName ?? <span className="muted">—</span>}</td>
+                                <td>{row.email ?? <span className="muted">—</span>}</td>
+                                <td style={{ fontFamily: 'monospace', fontSize: '0.75em', whiteSpace: 'nowrap' }}>{row.mergedToUid}</td>
+                                <td><strong>{row.entriesCount}</strong></td>
+                                <td>
+                                  <button
+                                    className="btn-sm"
+                                    disabled={usersAuditReassigningUid === row.uid}
+                                    title={`Reasigna las ${row.entriesCount} entries de ${row.uid} → ${row.mergedToUid}`}
+                                    onClick={async () => {
+                                      if (!window.confirm(
+                                        `Reasignar entries del UID fusionado al destino?\n\n` +
+                                        `Origen: ${row.uid}\n` +
+                                        `Destino: ${row.mergedToUid}\n` +
+                                        `Entries: ${row.entriesCount}\n\n` +
+                                        `¿Continuar?`
+                                      )) return
+                                      setUsersAuditReassigningUid(row.uid)
+                                      try {
+                                        const result = await executeUidReplace(row.uid, row.mergedToUid, row.email ?? null)
+                                        showToast(
+                                          `Reasignado. ${result.entriesUpdated} jornada(s), ${result.logsUpdated} log(s).`,
+                                        )
+                                        // Quitar la fila del reporte y reauditar al cierre.
+                                        setUsersAuditReport((prev) => prev
+                                          ? { ...prev, mergedUsersWithEntries: prev.mergedUsersWithEntries.filter((r) => r.uid !== row.uid) }
+                                          : prev)
+                                      } catch (err) {
+                                        showToast(err instanceof Error ? err.message : 'Error al reasignar.', 'error')
+                                        console.error(err)
+                                      } finally {
+                                        setUsersAuditReassigningUid(null)
+                                      }
+                                    }}
+                                  >
+                                    {usersAuditReassigningUid === row.uid
+                                      ? <><Spinner size={12} inline /> Reasignando…</>
+                                      : 'Reasignar'}
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {/* SECCIÓN 3: Placeholders no reclamados */}
+                    <h4 style={{ marginTop: '1.25rem', marginBottom: '0.5rem' }}>
+                      Placeholders no reclamados ({usersAuditReport.unclaimedPlaceholders.length})
+                    </h4>
+                    {usersAuditReport.unclaimedPlaceholders.length === 0 ? (
+                      <p className="muted" style={{ fontSize: '0.82rem' }}>Sin placeholders pendientes. ✅</p>
+                    ) : (
+                      <div style={{ overflowX: 'auto' }}>
+                        <table className="audit-table">
+                          <thead>
+                            <tr>
+                              <th>UID</th>
+                              <th>Nombre</th>
+                              <th>Email</th>
+                              <th>Entries</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {usersAuditReport.unclaimedPlaceholders.map((row) => (
+                              <tr key={row.uid}>
+                                <td style={{ fontFamily: 'monospace', fontSize: '0.75em', whiteSpace: 'nowrap' }}>{row.uid}</td>
+                                <td>{row.displayName ?? <span className="muted">—</span>}</td>
+                                <td>{row.email ?? <span className="muted">—</span>}</td>
+                                <td>{row.entriesCount > 0 ? <strong>{row.entriesCount}</strong> : <span className="muted">0</span>}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        <p className="muted" style={{ fontSize: '0.78rem', marginTop: 6 }}>
+                          Los placeholders se reclaman automáticamente cuando el usuario hace su primer login con el email coincidente.
+                        </p>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </details>
+          )}
+          {canSeeProjectAdmin(currentProfile.role) && (
+            <details style={{ margin: '0.5rem 0 1rem' }}>
+              <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none', padding: '6px 0' }}>
+                ♊ Detectar y limpiar jornadas duplicadas
+              </summary>
+              <div style={{ padding: '0.75rem 0 0' }}>
+                <p className="muted" style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+                  Busca grupos de jornadas duplicadas: misma combinación de <code>(userId, projectId, workDate)</code> con más de un documento. La política de auto-limpieza conserva la entry <strong>más reciente</strong> por <code>createdAt</code> y borra las demás. Las entries archivadas se muestran pero NO se tocan.
+                </p>
+                <p className="muted" style={{ fontSize: '0.78rem', marginBottom: '0.75rem' }}>
+                  ⚠️ Costo: 1 lectura por jornada en el rango. Empezá con 90 días.
+                </p>
+                <div className="row" style={{ gap: 8, marginBottom: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.85rem' }}>
+                    Días a auditar:
+                    <input
+                      type="number"
+                      min={1}
+                      max={365}
+                      value={dupDays}
+                      onChange={(e) => setDupDays(Math.max(1, Math.min(365, Number(e.target.value) || 90)))}
+                      style={{ width: 80 }}
+                    />
+                  </label>
+                  <button
+                    className="btn btn-outline"
+                    disabled={dupBusy}
+                    onClick={async () => {
+                      setDupBusy(true)
+                      try {
+                        const r = await auditDuplicateTimeEntries({ daysBack: dupDays })
+                        setDupReport(r)
+                        if (r.totalGroups === 0) showToast('Sin duplicados en el rango. ✅')
+                        else showToast(`${r.totalGroups} grupo(s) duplicado(s) (${r.totalDuplicateEntries} entries de más).`)
+                      } catch (err) {
+                        showToast('Error al auditar duplicados.', 'error')
+                        console.error(err)
+                      } finally {
+                        setDupBusy(false)
+                      }
+                    }}
+                  >
+                    {dupBusy ? <><Spinner size={14} inline /> Auditando…</> : 'Ejecutar auditoría'}
+                  </button>
+                  {dupReport && dupReport.totalGroups > 0 && (
+                    <button
+                      className="btn"
+                      style={{ background: '#ef4444', color: 'white', borderColor: '#ef4444' }}
+                      disabled={dupCleaningBusy}
+                      onClick={async () => {
+                        if (!dupReport) return
+                        if (!window.confirm(
+                          `Auto-limpiar duplicados?\n\n` +
+                          `Grupos: ${dupReport.totalGroups}\n` +
+                          `Entries a borrar: hasta ${dupReport.totalDuplicateEntries}\n\n` +
+                          `Política: conservar la entry MÁS RECIENTE por createdAt, borrar las demás.\n` +
+                          `Las archivadas NO se tocan.\n\n` +
+                          `Esta operación es IRREVERSIBLE. ¿Continuar?`
+                        )) return
+                        setDupCleaningBusy(true)
+                        try {
+                          const r = await deduplicateTimeEntries(dupReport)
+                          showToast(
+                            `Limpieza completa. Borradas: ${r.deletedCount}. Grupos resueltos: ${r.groupsResolved}. Saltados: ${r.groupsSkipped}.${r.errors > 0 ? ` Errores: ${r.errors}.` : ''}`,
+                          )
+                          // Re-auditar para refrescar
+                          const fresh = await auditDuplicateTimeEntries({ daysBack: dupDays })
+                          setDupReport(fresh)
+                        } catch (err) {
+                          showToast(err instanceof Error ? err.message : 'Error al limpiar duplicados.', 'error')
+                          console.error(err)
+                        } finally {
+                          setDupCleaningBusy(false)
+                        }
+                      }}
+                    >
+                      {dupCleaningBusy ? <><Spinner size={14} inline /> Limpiando…</> : `Auto-limpiar (${dupReport.totalDuplicateEntries})`}
+                    </button>
+                  )}
+                </div>
+                {dupReport && dupReport.groups.length > 0 && (
+                  <div style={{ overflowX: 'auto', marginTop: '0.5rem' }}>
+                    <table className="audit-table">
+                      <thead>
+                        <tr>
+                          <th>Usuario</th>
+                          <th>UserId</th>
+                          <th>Fecha</th>
+                          <th>#</th>
+                          <th>Detalles</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {dupReport.groups.map((g) => (
+                          <tr key={`${g.userId}_${g.projectId}_${g.workDate}`}>
+                            <td>{g.userName ?? <span className="muted">—</span>}</td>
+                            <td style={{ fontFamily: 'monospace', fontSize: '0.72em' }}>{g.userId}</td>
+                            <td>{g.workDate}</td>
+                            <td><strong>{g.entries.length}</strong></td>
+                            <td>
+                              <ul style={{ margin: 0, paddingLeft: 18, fontSize: '0.78rem' }}>
+                                {g.entries.map((e, idx) => {
+                                  const isLast = idx === g.entries.length - 1
+                                  const ts = e.createdAt ? new Date(e.createdAt * 1000).toLocaleString() : '—'
+                                  return (
+                                    <li key={e.id} style={{ color: e.archived ? '#6b7280' : isLast ? '#16a34a' : '#ef4444' }}>
+                                      {isLast && !e.archived && <strong>[se conserva] </strong>}
+                                      {e.archived && <em>[archivada] </em>}
+                                      {e.timeIn}→{e.timeOut} ({ts})
+                                      {e.notes && <span className="muted"> · {e.notes}</span>}
+                                    </li>
+                                  )
+                                })}
+                              </ul>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {dupReport && dupReport.groups.length === 0 && (
+                  <p className="muted" style={{ fontSize: '0.85rem' }}>Sin duplicados en los últimos {dupDays} día(s). ✅</p>
+                )}
+              </div>
+            </details>
+          )}
+          {canSeeProjectAdmin(currentProfile.role) && (
+            <details style={{ margin: '0.5rem 0 1rem' }}>
+              <summary style={{ cursor: 'pointer', fontWeight: 600, userSelect: 'none', padding: '6px 0' }}>
+                🆔 Migrar IDs de time_entries a determinísticos
+              </summary>
+              <div style={{ padding: '0.75rem 0 0' }}>
+                <p className="muted" style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+                  Migra las jornadas viejas (id random generado por <code>addDoc</code>) a id determinístico <code>userId_projectId_workDate</code>. Una vez migradas, el bloqueo de duplicados a nivel servidor funciona al 100% (intentar crear con la misma key falla nativamente).
+                </p>
+                <p className="muted" style={{ fontSize: '0.78rem', marginBottom: '0.75rem' }}>
+                  ⚠️ <strong>Antes</strong> de migrar, ejecutá la deduplicación de arriba para resolver conflictos (varias entries viejas con la misma <code>(userId, projectId, workDate)</code>).<br />
+                  ⚠️ Las archivadas se saltean (delete archived solo SUPERUSER, y la migración requiere borrar el doc viejo).<br />
+                  ⚠️ Costo: 1 lectura por entry en la base + 2 writes por entry migrable.
+                </p>
+                <div className="row" style={{ gap: 8, marginBottom: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                  <button
+                    className="btn btn-outline"
+                    disabled={migBusy}
+                    onClick={async () => {
+                      setMigBusy(true)
+                      try {
+                        const p = await previewTimeEntryIdMigration()
+                        setMigPreview(p)
+                        showToast(
+                          `Preview: ${p.needsMigration} migrables, ${p.conflicts.length} conflictos, ${p.archivedSkipped} archivadas.`,
+                        )
+                      } catch (err) {
+                        showToast('Error al ejecutar el preview.', 'error')
+                        console.error(err)
+                      } finally {
+                        setMigBusy(false)
+                      }
+                    }}
+                  >
+                    {migBusy ? <><Spinner size={14} inline /> Analizando…</> : 'Analizar (preview)'}
+                  </button>
+                  {migPreview && migPreview.needsMigration > 0 && (
+                    <button
+                      className="btn"
+                      style={{ background: '#ef4444', color: 'white', borderColor: '#ef4444' }}
+                      disabled={migExecBusy}
+                      onClick={async () => {
+                        if (!migPreview) return
+                        if (!window.confirm(
+                          `Migrar IDs ahora?\n\n` +
+                          `Migrables: ${migPreview.needsMigration} entries\n` +
+                          `Writes estimados: ${migPreview.writesEstimate} (set + delete)\n` +
+                          `Conflictos saltados: ${migPreview.conflicts.length} grupo(s)\n` +
+                          `Archivadas saltadas: ${migPreview.archivedSkipped}\n\n` +
+                          `Esta operación COPIA el doc al nuevo id y BORRA el viejo. Es secuencial y puede tardar varios minutos. ¿Continuar?`
+                        )) return
+                        setMigExecBusy(true)
+                        try {
+                          const r = await migrateTimeEntryIds()
+                          showToast(
+                            `Migración: ${r.migrated} migradas, ${r.errors} errores, ${r.skippedDueToConflict} saltadas por conflicto, ${r.skippedArchived} archivadas, ${r.skippedInvalid} inválidas.`,
+                          )
+                          // Re-correr preview para reflejar el estado actual
+                          const fresh = await previewTimeEntryIdMigration()
+                          setMigPreview(fresh)
+                        } catch (err) {
+                          showToast(err instanceof Error ? err.message : 'Error al migrar IDs.', 'error')
+                          console.error(err)
+                        } finally {
+                          setMigExecBusy(false)
+                        }
+                      }}
+                    >
+                      {migExecBusy ? <><Spinner size={14} inline /> Migrando…</> : `Ejecutar migración (${migPreview.needsMigration})`}
+                    </button>
+                  )}
+                </div>
+                {migPreview && (
+                  <>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: '0.85rem', marginBottom: '0.5rem' }}>
+                      <span className="chip">Total: <strong>{migPreview.totalScanned}</strong></span>
+                      <span className="chip" style={{ background: '#dcfce7', color: '#166534' }}>
+                        Ya determinísticos: <strong>{migPreview.alreadyDeterministic}</strong>
+                      </span>
+                      <span className="chip" style={{ background: '#fef3c7', color: '#92400e' }}>
+                        Migrables: <strong>{migPreview.needsMigration}</strong>
+                      </span>
+                      <span className="chip" style={{ background: '#fee2e2', color: '#b91c1c' }}>
+                        Conflictos: <strong>{migPreview.conflicts.length}</strong>
+                      </span>
+                      <span className="chip" style={{ background: '#e5e7eb', color: '#374151' }}>
+                        Archivadas: <strong>{migPreview.archivedSkipped}</strong>
+                      </span>
+                      {migPreview.invalidSkipped > 0 && (
+                        <span className="chip" style={{ background: '#fef2f2', color: '#991b1b' }}>
+                          Inválidas: <strong>{migPreview.invalidSkipped}</strong>
+                        </span>
+                      )}
+                    </div>
+                    {migPreview.conflicts.length > 0 && (
+                      <div style={{ overflowX: 'auto' }}>
+                        <h4 style={{ margin: '0.5rem 0' }}>Conflictos a resolver primero (ejecutá Auto-limpiar arriba)</h4>
+                        <table className="audit-table">
+                          <thead>
+                            <tr>
+                              <th>UserId</th>
+                              <th>ProjectId</th>
+                              <th>Fecha</th>
+                              <th>IDs</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {migPreview.conflicts.slice(0, 50).map((c) => (
+                              <tr key={`${c.userId}_${c.projectId}_${c.workDate}`}>
+                                <td style={{ fontFamily: 'monospace', fontSize: '0.72em' }}>{c.userId}</td>
+                                <td style={{ fontFamily: 'monospace', fontSize: '0.72em' }}>{c.projectId}</td>
+                                <td>{c.workDate}</td>
+                                <td style={{ fontSize: '0.78rem' }}>
+                                  {c.ids.map((id) => (
+                                    <div key={id} style={{ fontFamily: 'monospace', fontSize: '0.72em' }}>{id}</div>
+                                  ))}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {migPreview.conflicts.length > 50 && (
+                          <p className="muted" style={{ fontSize: '0.78rem' }}>
+                            Mostrando primeros 50 de {migPreview.conflicts.length} grupos en conflicto.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             </details>

@@ -327,7 +327,7 @@ export function calcEngancheExtras(
 
 export function calculateSettlement(
   entries: TimeEntry[],
-  userRates: Map<string, { hourlyRate: number; roleId?: string; roleName?: string }>,
+  userRates: Map<string, { hourlyRate: number; roleId?: string; roleName?: string; areaId?: string; areaName?: string }>,
   config: ProjectConfig,
   meta: { projectId: string; projectName: string; dateFrom: string; dateTo: string; createdBy: string },
 ): Settlement {
@@ -336,6 +336,7 @@ export function calculateSettlement(
     regular: number; overtime: number; night: number
     nightOvertime: number; enganche: number; reenganche: number
     jornadaAdicionalCount: number; penalty: number
+    daysWorked: Set<string>
     // Horas "ponderadas" por jornada adicional, usadas solo para el cálculo de pago.
     regularPaid: number; overtimePaid: number; nightPaid: number; nightOvertimePaid: number; penaltyPaid: number
   }>()
@@ -348,6 +349,7 @@ export function calculateSettlement(
       regular: 0, overtime: 0, night: 0,
       nightOvertime: 0, enganche: 0, reenganche: 0,
       jornadaAdicionalCount: 0, penalty: 0,
+      daysWorked: new Set<string>(),
       regularPaid: 0, overtimePaid: 0, nightPaid: 0, nightOvertimePaid: 0, penaltyPaid: 0,
     }
     const m = e.isJornadaAdicional ? adicMult : 1
@@ -363,6 +365,7 @@ export function calculateSettlement(
     existing.enganche      += e.calculation.engancheExtraHours  ?? 0
     existing.reenganche    += e.calculation.reengancheExtraHours ?? 0
     existing.penalty       += pen
+    if (e.workDate) existing.daysWorked.add(e.workDate)
     // Acumulado para pago, aplicando multiplicador de jornada adicional cuando corresponda.
     existing.regularPaid       += reg * m
     // Overtime diurno (excluye la parte nocturna, que tiene tarifa propia)
@@ -398,6 +401,8 @@ export function calculateSettlement(
       userName: data.userName,
       roleId: rateInfo?.roleId,
       roleName: rateInfo?.roleName,
+      areaId: rateInfo?.areaId,
+      areaName: rateInfo?.areaName,
       hourlyRate,
       overtimeMultiplier: config.overtimeMultiplier,
       nightMultiplier: config.nightAdditionalMultiplier,
@@ -407,6 +412,7 @@ export function calculateSettlement(
       nightOvertimeHours:   round2(data.nightOvertime),
       engancheExtraHours:   round2(data.enganche),
       reengancheExtraHours: round2(data.reenganche),
+      daysWorked:           data.daysWorked.size,
       jornadaAdicionalCount: data.jornadaAdicionalCount,
       penaltyHours:         round2(data.penalty),
       totalHours,
