@@ -85,6 +85,9 @@ import type {
   TimeEntryInput,
   UserProfile,
   WorkCycle,
+  WorkerAssignment,
+  WorkerIntegrityScanReport,
+  WorkerProfile,
 } from '../types/domain'
 
 const CALCULATION_VERSION = 'v1-client'
@@ -3458,3 +3461,246 @@ export async function deleteAllPendingUsers(
 
   return { deletedCount }
 }
+
+// ─── Padrón transversal de Fichas de Trabajadores (Superuser) ────────────────
+
+/**
+ * Lista todos los perfiles de trabajadores (fichas) en el sistema.
+ */
+export async function listWorkers(): Promise<WorkerProfile[]> {
+  const snap = await getDocs(collection(db, 'workers'))
+  const list = snap.docs.map((d) => ({
+    id: d.id,
+    ...(d.data() as Omit<WorkerProfile, 'id'>),
+  }))
+  list.sort((a, b) => (a.displayName || '').localeCompare(b.displayName || '', 'es', { sensitivity: 'base' }))
+  return list
+}
+
+/**
+ * Obtiene la ficha de un trabajador por su ID (ej. 'worker_12345678').
+ */
+export async function getWorker(workerId: string): Promise<WorkerProfile | null> {
+  const snap = await getDoc(doc(db, 'workers', workerId))
+  if (!snap.exists()) return null
+  return { id: snap.id, ...(snap.data() as Omit<WorkerProfile, 'id'>) }
+}
+
+/**
+ * Crea o guarda una ficha de trabajador en /workers/${workerId}.
+ * workerId es determinístico: worker_${normalizedDni}.
+ */
+export async function saveWorker(
+  actor: { uid: string; displayName: string; email?: string | null },
+  data: {
+    idNumber: string
+    displayName: string
+    email?: string | null
+    phone?: string | null
+    authUid?: string | null
+    knownUids?: string[]
+    status?: 'ACTIVE' | 'INACTIVE'
+    currentAssignment?: WorkerAssignment | null
+  },
+): Promise<WorkerProfile> {
+  const normalizedDni = normalizeIdNumber(data.idNumber)
+  if (!isValidIdNumber(normalizedDni)) {
+    throw new Error('El DNI/Cédula ingresado no es válido (debe tener entre 6 y 12 dígitos numéricos).')
+  }
+  const workerId = `worker_${normalizedDni}`
+  const workerRef = doc(db, 'workers', workerId)
+  const existingSnap = await getDoc(workerRef)
+
+  const payload: Omit<WorkerProfile, 'id'> = {
+    idNumber: normalizedDni,
+    displayName: data.displayName.trim(),
+    email: data.email?.trim().toLowerCase() || null,
+    phone: data.phone?.trim() || null,
+    authUid: data.authUid || null,
+    knownUids: Array.from(new Set(data.knownUids || [])),
+    status: data.status || 'ACTIVE',
+    currentAssignment: data.currentAssignment || null,
+    updatedAt: serverTimestamp(),
+  }
+
+  if (!existingSnap.exists()) {
+    payload.createdAt = serverTimestamp()
+  }
+
+  await setDoc(workerRef, stripUndefined(payload), { merge: true })
+
+  void writeSystemLog({
+    type: existingSnap.exists() ? 'worker_edit' : 'worker_create',
+    userId: actor.uid,
+    userName: actor.displayName,
+    email: actor.email ?? null,
+    details: `${existingSnap.exists() ? 'Edición' : 'Creación'} de ficha de trabajador: ${payload.displayName} (DNI ${normalizedDni}).`,
+  })
+
+  return {
+    id: workerId,
+    ...payload,
+  }
+}
+
+/**
+ * Actualiza parcialmente la ficha de un trabajador.
+ */
+export async function updateWorker(
+  actor: { uid: string; displayName: string; email?: string | null },
+  workerId: string,
+  partial: Partial<WorkerProfile>,
+): Promise<void> {
+  const workerRef = doc(db, 'workers', workerId)
+  const cleanData = stripUndefined({
+    ...partial,
+    updatedAt: serverTimestamp(),
+  })
+  delete (cleanData as any).id
+  await updateDoc(workerRef, cleanData)
+
+  void writeSystemLog({
+    type: 'worker_edit',
+    userId: actor.uid,
+    userName: actor.displayName,
+    email: actor.email ?? null,
+    details: `Actualización de ficha ${workerId} (${partial.displayName || ''}).`,
+  })
+}
+
+/**
+ * Escanea la base de datos de usuarios (/users) y genera un diagnóstico para la creación / vinculación de fichas.
+ */
+export function scanUsersForWorkerNormalization(allUsers: UserProfile[]): WorkerIntegrityScanReport {
+  const missingDniUsers: WorkerIntegrityScanReport['missingDniUsers'] = []
+  const dniGroups = new Map<string, UserProfile[]>()
+
+  for (const u of allUsers) {
+    const rawDni = u.idNumber ?? ''
+    const normalized = normalizeIdNumber(rawDni)
+    if (!isValidIdNumber(normalized)) {
+      missingDniUsers.push({
+        uid: u.uid,
+        displayName: u.displayName || null,
+        email: u.email || null,
+        role: u.role || null,
+      })
+    } else {
+      const group = dniGroups.get(normalized) || []
+      group.push(u)
+      dniGroups.set(normalized, group)
+    }
+  }
+
+  const readyForWorkerProfile: WorkerIntegrityScanReport['readyForWorkerProfile'] = []
+  const conflictingDniGroups: WorkerIntegrityScanReport['conflictingDniGroups'] = []
+
+  for (const [dni, group] of dniGroups.entries()) {
+    const distinctNames = Array.from(new Set(group.map((u) => (u.displayName || '').trim().toLowerCase()).filter(Boolean)))
+    if (distinctNames.length > 1) {
+      conflictingDniGroups.push({
+        dni,
+        users: group.map((u) => ({
+          uid: u.uid,
+          displayName: u.displayName || null,
+          email: u.email || null,
+        })),
+      })
+    }
+
+    const nonPlaceholder = group.find((u) => !u.isPlaceholder && (u.displayName || '').trim().length > 0)
+    const bestUser = nonPlaceholder || group.find((u) => (u.displayName || '').trim().length > 0) || group[0]
+    const bestEmail = group.find((u) => u.email && !u.email.includes('placeholder'))?.email || group.find((u) => u.email)?.email || null
+
+    const assignmentUser = group.find((u) => u.projectId) || group[0]
+    const currentAssignment: WorkerAssignment | null = assignmentUser?.projectId
+      ? {
+          projectId: assignmentUser.projectId,
+          areaId: assignmentUser.areaId,
+          roleId: assignmentUser.roleId,
+          cycleMode: assignmentUser.cycleMode,
+        }
+      : null
+
+    readyForWorkerProfile.push({
+      dni,
+      displayName: bestUser?.displayName || `Trabajador DNI ${dni}`,
+      email: bestEmail,
+      uids: group.map((u) => u.uid),
+      currentAssignment,
+    })
+  }
+
+  return {
+    totalUsersScanned: allUsers.length,
+    readyForWorkerProfile,
+    missingDniUsers,
+    conflictingDniGroups,
+  }
+}
+
+/**
+ * Ejecuta la normalización masiva: crea o actualiza las fichas maestras en /workers a partir de la lista consolidada.
+ */
+export async function executeWorkerNormalization(
+  actor: { uid: string; displayName: string; email?: string | null },
+  items: WorkerIntegrityScanReport['readyForWorkerProfile'],
+): Promise<{ createdCount: number; updatedCount: number }> {
+  const BATCH_SIZE = 400
+  let createdCount = 0
+  let updatedCount = 0
+
+  for (let i = 0; i < items.length; i += BATCH_SIZE) {
+    const chunk = items.slice(i, i + BATCH_SIZE)
+    const batch = writeBatch(db)
+
+    const existingChecks = await Promise.all(
+      chunk.map((item) => getDoc(doc(db, 'workers', `worker_${item.dni}`))),
+    )
+
+    for (let j = 0; j < chunk.length; j++) {
+      const item = chunk[j]
+      const existingSnap = existingChecks[j]
+      const workerRef = doc(db, 'workers', `worker_${item.dni}`)
+
+      if (existingSnap.exists()) {
+        const existingData = existingSnap.data() as WorkerProfile
+        const mergedUids = Array.from(new Set([...(existingData.knownUids || []), ...item.uids]))
+        batch.update(workerRef, stripUndefined({
+          displayName: existingData.displayName || item.displayName,
+          email: existingData.email || item.email,
+          knownUids: mergedUids,
+          currentAssignment: existingData.currentAssignment || item.currentAssignment || null,
+          updatedAt: serverTimestamp(),
+        }))
+        updatedCount++
+      } else {
+        const newWorker: Omit<WorkerProfile, 'id'> = {
+          idNumber: item.dni,
+          displayName: item.displayName,
+          email: item.email,
+          knownUids: item.uids,
+          status: 'ACTIVE',
+          currentAssignment: item.currentAssignment || null,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }
+        batch.set(workerRef, stripUndefined(newWorker))
+        createdCount++
+      }
+    }
+
+    await batch.commit()
+  }
+
+  void writeSystemLog({
+    type: 'worker_bulk_normalize',
+    userId: actor.uid,
+    userName: actor.displayName,
+    email: actor.email ?? null,
+    details: `Normalización masiva de trabajadores ejecutada: ${createdCount} fichas creadas, ${updatedCount} actualizadas.`,
+  })
+
+  return { createdCount, updatedCount }
+}
+

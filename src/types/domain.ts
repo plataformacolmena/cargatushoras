@@ -332,6 +332,9 @@ export type SystemLogType =
   | 'admin_bulk_recalc'
   | 'admin_bulk_disable_users'
   | 'admin_bulk_delete_pending'
+  | 'worker_create'
+  | 'worker_edit'
+  | 'worker_bulk_normalize'
 
 export interface SystemLog {
   id: string
@@ -346,4 +349,51 @@ export interface SystemLog {
   logDate: string         // YYYY-MM-DD del momento de la acción (para filtrar por rango)
   details?: string        // descripción adicional del cambio
   timestamp: unknown      // Firestore Timestamp
+}
+
+// ─── Padrón Transversal de Trabajadores / Fichas (Exclusivo Superuser) ────────
+
+export interface WorkerAssignment {
+  projectId: string
+  projectName?: string
+  areaId?: string
+  areaName?: string
+  roleId?: string
+  roleName?: string
+  cycleMode?: CycleMode
+}
+
+export interface WorkerProfile {
+  id: string                     // worker_${normalizedDni}
+  idNumber: string               // Cédula / DNI único y normalizado (clave maestra)
+  displayName: string            // Nombre y apellido oficial
+  email: string | null           // Email principal
+  phone?: string | null          // Teléfono de contacto
+  authUid?: string | null        // UID de Google Auth cuando el usuario inicie sesión
+  knownUids: string[]            // Array de UIDs históricos en /users vinculados a este trabajador
+  status: 'ACTIVE' | 'INACTIVE'  // Estado general de la persona en la empresa
+  currentAssignment?: WorkerAssignment | null
+  createdAt?: unknown
+  updatedAt?: unknown
+}
+
+export interface WorkerIntegrityScanReport {
+  totalUsersScanned: number
+  readyForWorkerProfile: Array<{
+    dni: string
+    displayName: string
+    email: string | null
+    uids: string[]
+    currentAssignment?: WorkerAssignment | null
+  }>
+  missingDniUsers: Array<{
+    uid: string
+    displayName: string | null
+    email: string | null
+    role?: string | null
+  }>
+  conflictingDniGroups: Array<{
+    dni: string
+    users: Array<{ uid: string; displayName: string | null; email: string | null }>
+  }>
 }

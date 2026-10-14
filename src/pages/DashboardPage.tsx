@@ -98,6 +98,11 @@ import {
   listEmailRecoveryRequests,
   resolveEmailRecoveryRequest,
   dismissEmailRecoveryRequest,
+  listWorkers,
+  saveWorker,
+  updateWorker,
+  scanUsersForWorkerNormalization,
+  executeWorkerNormalization,
 } from '../services/firestore'
 import { computeEntryCalculations } from '../lib/calc'
 
@@ -122,6 +127,9 @@ import type {
   TimeEntryCalculation,
   TimeEntryInput,
   UserProfile,
+  WorkerAssignment,
+  WorkerIntegrityScanReport,
+  WorkerProfile,
 } from '../types/domain'
 
 type MainTab = 'PROJECTS' | 'PROJECT_MANAGEMENT' | 'USERS' | 'HELP' | 'SYSTEM_LOGS'
@@ -133,7 +141,7 @@ type ProjectTab =
   | 'SETTLEMENTS'
   | 'STATS'
   | 'HISTORICAL'
-type UserTab = 'PENDING' | 'APPROVED'
+type UserTab = 'PENDING' | 'APPROVED' | 'WORKERS'
 
 interface Toast {
   id: number
@@ -302,7 +310,7 @@ function writeLS(key: string, value: string) {
 }
 const MAIN_TABS = ['PROJECTS', 'PROJECT_MANAGEMENT', 'USERS', 'HELP', 'SYSTEM_LOGS'] as const
 const PROJECT_TABS = ['PROJECT_CONFIG', 'TIME_ENTRY_FORM', 'TIME_ENTRY_TABLE', 'TIME_ENTRY_AUDIT', 'SETTLEMENTS', 'STATS', 'HISTORICAL'] as const
-const USER_TABS = ['PENDING', 'APPROVED'] as const
+const USER_TABS = ['PENDING', 'APPROVED', 'WORKERS'] as const
 
 export function DashboardPage() {
     // Estado para recordatorios de usuarios sin informar (vista admin).
@@ -463,6 +471,33 @@ export function DashboardPage() {
   // Acciones masivas de usuarios (Exclusivo SUPERUSER)
   const [disableAllBusy, setDisableAllBusy] = useState(false)
   const [deleteAllPendingBusy, setDeleteAllPendingBusy] = useState(false)
+
+  // Padrón Transversal de Trabajadores / Fichas (Exclusivo SUPERUSER)
+  const [workers, setWorkers] = useState<WorkerProfile[]>([])
+  const [workersLoading, setWorkersLoading] = useState(false)
+  const [workerSearchTerm, setWorkerSearchTerm] = useState('')
+  const [workerFilterStatus, setWorkerFilterStatus] = useState<'ALL' | 'ACTIVE' | 'INACTIVE'>('ALL')
+
+  // Normalization assistant modal
+  const [showNormalizationModal, setShowNormalizationModal] = useState(false)
+  const [normalizationScanning, setNormalizationScanning] = useState(false)
+  const [normalizationExecuting, setNormalizationExecuting] = useState(false)
+  const [normalizationReport, setNormalizationReport] = useState<WorkerIntegrityScanReport | null>(null)
+
+  // Worker detail/edit/create modal
+  const [editingWorker, setEditingWorker] = useState<WorkerProfile | null>(null)
+  const [isNewWorker, setIsNewWorker] = useState(false)
+  const [workerFormDni, setWorkerFormDni] = useState('')
+  const [workerFormName, setWorkerFormName] = useState('')
+  const [workerFormEmail, setWorkerFormEmail] = useState('')
+  const [workerFormPhone, setWorkerFormPhone] = useState('')
+  const [workerFormStatus, setWorkerFormStatus] = useState<'ACTIVE' | 'INACTIVE'>('ACTIVE')
+  const [workerFormProjectId, setWorkerFormProjectId] = useState('')
+  const [workerFormAreaId, setWorkerFormAreaId] = useState('')
+  const [workerFormRoleId, setWorkerFormRoleId] = useState('')
+  const [workerModalAreas, setWorkerModalAreas] = useState<ProjectArea[]>([])
+  const [workerModalRoles, setWorkerModalRoles] = useState<ProjectRole[]>([])
+  const [workerSaving, setWorkerSaving] = useState(false)
 
   // Auditoría: usuarios sin informar
   const [noReportFilters, setNoReportFilters] = useState<{ dateFrom: string; dateTo: string; areaId: string }>({ dateFrom: '', dateTo: '', areaId: '' })
@@ -998,6 +1033,17 @@ export function DashboardPage() {
     void listProjectAreas(editingUser.projectId).then(setEditUserAreas)
     void listProjectRoles(editingUser.projectId).then(setEditUserRoles)
   }, [editingUser?.projectId])
+
+  // Carga áreas y roles al cambiar de proyecto en el modal de ficha de trabajador
+  useEffect(() => {
+    if (!workerFormProjectId) {
+      setWorkerModalAreas([])
+      setWorkerModalRoles([])
+      return
+    }
+    void listProjectAreas(workerFormProjectId).then(setWorkerModalAreas)
+    void listProjectRoles(workerFormProjectId).then(setWorkerModalRoles)
+  }, [workerFormProjectId])
 
   // Diferido: solo cargar las plantillas cuando el admin entra a la pestaña
   // "Gestión de proyectos" (que es donde se renderizan).
@@ -2529,6 +2575,207 @@ export function DashboardPage() {
       showToast('Error al eliminar usuarios pendientes.', 'error')
     } finally {
       setDeleteAllPendingBusy(false)
+    }
+  }
+
+  // ─── Padrón transversal de Fichas (Superuser) ──────────────────────────────
+  const loadWorkersData = useCallback(async () => {
+    const currentProfile = profile
+    if (!currentProfile || !canSeeProjectAdmin(currentProfile.role)) return
+    try {
+      setWorkersLoading(true)
+      const list = await listWorkers()
+      setWorkers(list)
+    } catch (err) {
+      console.error('[loadWorkersData] error:', err)
+      showToast('Error al cargar padrón de fichas', 'error')
+    } finally {
+      setWorkersLoading(false)
+    }
+  }, [profile, showToast])
+
+  useEffect(() => {
+    if (mainTab === 'USERS' && userTab === 'WORKERS' && profile && canSeeProjectAdmin(profile.role)) {
+      void loadWorkersData()
+    }
+  }, [mainTab, userTab, profile, loadWorkersData])
+
+  const filteredWorkers = useMemo(() => {
+    let result = workers
+    if (workerFilterStatus !== 'ALL') {
+      result = result.filter((w) => w.status === workerFilterStatus)
+    }
+    const q = workerSearchTerm.trim().toLowerCase()
+    if (q) {
+      result = result.filter(
+        (w) =>
+          (w.displayName && w.displayName.toLowerCase().includes(q)) ||
+          (w.idNumber && w.idNumber.includes(q)) ||
+          (w.email && w.email.toLowerCase().includes(q)) ||
+          (w.phone && w.phone.includes(q)) ||
+          (w.currentAssignment?.projectName && w.currentAssignment.projectName.toLowerCase().includes(q)) ||
+          (w.currentAssignment?.areaName && w.currentAssignment.areaName.toLowerCase().includes(q)),
+      )
+    }
+    return result
+  }, [workers, workerFilterStatus, workerSearchTerm])
+
+  const handleOpenNormalizationAssistant = () => {
+    setShowNormalizationModal(true)
+    setNormalizationReport(null)
+  }
+
+  const handleScanNormalization = () => {
+    setNormalizationScanning(true)
+    try {
+      const allKnownUsers = [...approvedUsersList, ...pendingUsers]
+      const report = scanUsersForWorkerNormalization(allKnownUsers)
+      setNormalizationReport(report)
+    } catch (err) {
+      console.error('[handleScanNormalization] error:', err)
+      showToast('Error al escanear usuarios para normalización', 'error')
+    } finally {
+      setNormalizationScanning(false)
+    }
+  }
+
+  const handleExecuteNormalization = async () => {
+    if (!normalizationReport || !profile) return
+    const count = normalizationReport.readyForWorkerProfile.length
+    if (count === 0) {
+      showToast('No hay fichas listas para procesar.', 'info')
+      return
+    }
+    const ok = window.confirm(
+      `¿Deseas normalizar y generar/vincular ${count} fichas en el Padrón Maestro?\n\nEsta acción NO modifica ni borra ningún registro horario ni usuario existente.`
+    )
+    if (!ok) return
+
+    setNormalizationExecuting(true)
+    try {
+      const enrichedItems = normalizationReport.readyForWorkerProfile.map((item) => {
+        if (!item.currentAssignment) return item
+        const p = projects.find((proj) => proj.id === item.currentAssignment?.projectId)
+        return {
+          ...item,
+          currentAssignment: {
+            ...item.currentAssignment,
+            projectName: p?.name,
+          },
+        }
+      })
+
+      const res = await executeWorkerNormalization(
+        { uid: profile.uid, displayName: profile.displayName || profile.email || 'Superuser', email: profile.email },
+        enrichedItems,
+      )
+      showToast(`¡Normalización completada! ${res.createdCount} creadas, ${res.updatedCount} actualizadas.`, 'success')
+      setShowNormalizationModal(false)
+      setNormalizationReport(null)
+      void loadWorkersData()
+    } catch (err) {
+      console.error('[handleExecuteNormalization] error:', err)
+      showToast(`Error al ejecutar normalización: ${err instanceof Error ? err.message : 'Error desconocido'}`, 'error')
+    } finally {
+      setNormalizationExecuting(false)
+    }
+  }
+
+  const handleOpenCreateWorker = () => {
+    setIsNewWorker(true)
+    setEditingWorker(null)
+    setWorkerFormDni('')
+    setWorkerFormName('')
+    setWorkerFormEmail('')
+    setWorkerFormPhone('')
+    setWorkerFormStatus('ACTIVE')
+    setWorkerFormProjectId('')
+    setWorkerFormAreaId('')
+    setWorkerFormRoleId('')
+  }
+
+  const handleOpenEditWorker = (w: WorkerProfile) => {
+    setIsNewWorker(false)
+    setEditingWorker(w)
+    setWorkerFormDni(w.idNumber)
+    setWorkerFormName(w.displayName)
+    setWorkerFormEmail(w.email || '')
+    setWorkerFormPhone(w.phone || '')
+    setWorkerFormStatus(w.status)
+    setWorkerFormProjectId(w.currentAssignment?.projectId || '')
+    setWorkerFormAreaId(w.currentAssignment?.areaId || '')
+    setWorkerFormRoleId(w.currentAssignment?.roleId || '')
+  }
+
+  const handleSaveWorkerModal = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!profile) return
+    const normalizedDni = normalizeIdNumber(workerFormDni)
+    if (!isValidIdNumber(normalizedDni)) {
+      showToast('El DNI/Cédula debe tener entre 6 y 12 dígitos numéricos.', 'error')
+      return
+    }
+    if (!workerFormName.trim()) {
+      showToast('El nombre del trabajador es requerido.', 'error')
+      return
+    }
+
+    setWorkerSaving(true)
+    try {
+      const selectedProj = projects.find((p) => p.id === workerFormProjectId)
+      const selectedArea = workerModalAreas.find((a) => a.id === workerFormAreaId)
+      const selectedRole = workerModalRoles.find((r) => r.id === workerFormRoleId)
+
+      const assignment: WorkerAssignment | null = workerFormProjectId
+        ? {
+            projectId: workerFormProjectId,
+            projectName: selectedProj?.name,
+            areaId: workerFormAreaId || undefined,
+            areaName: selectedArea?.name,
+            roleId: workerFormRoleId || undefined,
+            roleName: selectedRole?.name,
+          }
+        : null
+
+      await saveWorker(
+        { uid: profile.uid, displayName: profile.displayName || profile.email || 'Superuser', email: profile.email },
+        {
+          idNumber: normalizedDni,
+          displayName: workerFormName.trim(),
+          email: workerFormEmail.trim() || null,
+          phone: workerFormPhone.trim() || null,
+          status: workerFormStatus,
+          knownUids: editingWorker?.knownUids || [],
+          currentAssignment: assignment,
+        },
+      )
+
+      showToast(isNewWorker ? 'Ficha creada con éxito' : 'Ficha actualizada con éxito', 'success')
+      setEditingWorker(null)
+      setIsNewWorker(false)
+      void loadWorkersData()
+    } catch (err) {
+      console.error('[handleSaveWorkerModal] error:', err)
+      showToast(`Error al guardar ficha: ${err instanceof Error ? err.message : 'Error desconocido'}`, 'error')
+    } finally {
+      setWorkerSaving(false)
+    }
+  }
+
+  const handleToggleWorkerStatus = async (w: WorkerProfile) => {
+    if (!profile) return
+    const newStatus = w.status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE'
+    try {
+      await updateWorker(
+        { uid: profile.uid, displayName: profile.displayName || profile.email || 'Superuser', email: profile.email },
+        w.id,
+        { status: newStatus },
+      )
+      setWorkers((prev) => prev.map((item) => (item.id === w.id ? { ...item, status: newStatus } : item)))
+      showToast(`Ficha marcada como ${newStatus === 'ACTIVE' ? 'Activa' : 'Inactiva'}`, 'info')
+    } catch (err) {
+      console.error('[handleToggleWorkerStatus] error:', err)
+      showToast('Error al actualizar estado de la ficha', 'error')
     }
   }
 
@@ -4971,11 +5218,24 @@ export function DashboardPage() {
             >
               Aprobados
             </button>
+            {canSeeProjectAdmin(currentProfile.role) && (
+              <button
+                className={`subtab ${userTab === 'WORKERS' ? 'active' : ''}`}
+                onClick={() => setUserTab('WORKERS')}
+              >
+                📇 Padrón de Fichas (Superuser)
+              </button>
+            )}
             <button
               className="btn-sm btn-outline"
               style={{ marginLeft: 'auto' }}
-              onClick={() => { void loadUsersPanels() }}
-              title="Recargar listados de usuarios"
+              onClick={() => {
+                void loadUsersPanels()
+                if (canSeeProjectAdmin(currentProfile.role)) {
+                  void loadWorkersData()
+                }
+              }}
+              title="Recargar listados de usuarios y fichas"
             >
               Refrescar
             </button>
@@ -6139,6 +6399,149 @@ export function DashboardPage() {
               )}
             </section>
           )}
+
+          {userTab === 'WORKERS' && canSeeProjectAdmin(currentProfile.role) && (
+            <section className="card">
+              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '8px' }}>
+                <div>
+                  <h2 style={{ margin: 0 }}>📇 Padrón Transversal de Trabajadores / Fichas</h2>
+                  <p className="muted" style={{ margin: '4px 0 0', fontSize: '0.85rem' }}>
+                    Directorio maestro de personas (independiente de proyectos). Vincula DNI único con cuentas históricas sin alterar liquidaciones ni registros de jornada.
+                  </p>
+                </div>
+                <div className="row" style={{ gap: '8px', flexWrap: 'wrap' }}>
+                  <button
+                    className="btn btn-sm"
+                    style={{ background: 'var(--primary)', color: '#fff' }}
+                    onClick={handleOpenNormalizationAssistant}
+                    title="Analizar usuarios existentes y crear fichas maestras automáticamente"
+                  >
+                    ✨ Asistente de Normalización
+                  </button>
+                  <button
+                    className="btn btn-sm btn-outline"
+                    onClick={handleOpenCreateWorker}
+                  >
+                    + Nueva Ficha
+                  </button>
+                </div>
+              </div>
+
+              {/* Filtros y búsqueda */}
+              <div className="row" style={{ gap: '10px', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap' }}>
+                <input
+                  type="search"
+                  placeholder="Buscar por DNI, nombre, email o proyecto..."
+                  value={workerSearchTerm}
+                  onChange={(e) => setWorkerSearchTerm(e.target.value)}
+                  style={{ flex: '1 1 240px', minWidth: '200px' }}
+                />
+                <select
+                  value={workerFilterStatus}
+                  onChange={(e) => setWorkerFilterStatus(e.target.value as 'ALL' | 'ACTIVE' | 'INACTIVE')}
+                  style={{ flex: '0 0 auto' }}
+                >
+                  <option value="ALL">Todos los estados</option>
+                  <option value="ACTIVE">Solo Activos</option>
+                  <option value="INACTIVE">Solo Inactivos</option>
+                </select>
+                <span className="muted" style={{ fontSize: '0.85rem', marginLeft: 'auto' }}>
+                  Mostrando {filteredWorkers.length} de {workers.length} ficha(s)
+                </span>
+              </div>
+
+              {workersLoading ? (
+                <div style={{ textAlign: 'center', padding: '2rem' }}>
+                  <Spinner size={24} />
+                  <p className="muted" style={{ marginTop: '0.5rem' }}>Cargando padrón de trabajadores…</p>
+                </div>
+              ) : filteredWorkers.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '2rem', border: '1px dashed var(--line)', borderRadius: 8 }}>
+                  <p className="muted" style={{ margin: 0 }}>
+                    {workers.length === 0
+                      ? 'No hay fichas creadas en el padrón todavía. Podés crearlas manualmente o generarlas automáticamente usando el Asistente de Normalización.'
+                      : 'No se encontraron fichas con los filtros aplicados.'}
+                  </p>
+                </div>
+              ) : (
+                <div className="stack" style={{ gap: '10px' }}>
+                  {filteredWorkers.map((w) => (
+                    <div
+                      key={w.id}
+                      className="entry-item"
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        flexWrap: 'wrap',
+                        gap: '12px',
+                        padding: '12px 14px',
+                        borderLeft: `4px solid ${w.status === 'ACTIVE' ? '#10b981' : '#9ca3af'}`,
+                      }}
+                    >
+                      <div style={{ flex: '1 1 300px' }}>
+                        <div className="row" style={{ gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '4px' }}>
+                          <strong style={{ fontSize: '1rem' }}>{w.displayName}</strong>
+                          <span
+                            style={{
+                              fontFamily: 'monospace',
+                              background: 'var(--bg-accent)',
+                              border: '1px solid var(--line)',
+                              padding: '2px 6px',
+                              borderRadius: 4,
+                              fontSize: '0.82rem',
+                            }}
+                          >
+                            DNI {w.idNumber}
+                          </span>
+                          <span
+                            className="chip"
+                            style={{
+                              fontSize: '0.72rem',
+                              background: w.status === 'ACTIVE' ? '#dcfce7' : '#f3f4f6',
+                              color: w.status === 'ACTIVE' ? '#15803d' : '#4b5563',
+                              border: `1px solid ${w.status === 'ACTIVE' ? '#86efac' : '#d1d5db'}`,
+                            }}
+                          >
+                            {w.status === 'ACTIVE' ? 'Activo' : 'Inactivo'}
+                          </span>
+                        </div>
+
+                        <div className="row" style={{ gap: '16px', fontSize: '0.85rem', color: 'var(--text-muted, #64748b)', flexWrap: 'wrap' }}>
+                          {w.email && <span>✉️ {w.email}</span>}
+                          {w.phone && <span>📞 {w.phone}</span>}
+                          <span>🔗 {w.knownUids?.length || 0} cuenta(s) vinculada(s)</span>
+                        </div>
+
+                        {w.currentAssignment?.projectName && (
+                          <div style={{ marginTop: '4px', fontSize: '0.82rem', color: 'var(--primary)' }}>
+                            📌 <strong>{w.currentAssignment.projectName}</strong>
+                            {w.currentAssignment.areaName ? ` > Área: ${w.currentAssignment.areaName}` : ''}
+                            {w.currentAssignment.roleName ? ` (${w.currentAssignment.roleName})` : ''}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="row" style={{ gap: '6px', flexWrap: 'wrap' }}>
+                        <button
+                          className="btn-sm btn-outline"
+                          onClick={() => handleOpenEditWorker(w)}
+                        >
+                          Editar
+                        </button>
+                        <button
+                          className={`btn-sm btn-outline ${w.status === 'ACTIVE' ? 'danger' : ''}`}
+                          onClick={() => { void handleToggleWorkerStatus(w) }}
+                        >
+                          {w.status === 'ACTIVE' ? 'Inactivar' : 'Activar'}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
         </>
       )}
 
@@ -6728,6 +7131,296 @@ export function DashboardPage() {
                   Refrescar jornadas
                 </button>
                 <button className="btn btn-outline" type="button" onClick={() => setEditingUser(null)}>Cancelar</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* === MODAL: Asistente de Normalización de Fichas (Superuser) === */}
+      {showNormalizationModal && (
+        <div className="modal-overlay" onClick={() => !normalizationExecuting && setShowNormalizationModal(false)}>
+          <div className="modal" style={{ maxWidth: '680px' }} onClick={(e) => e.stopPropagation()}>
+            <h3>✨ Asistente de Normalización de Fichas</h3>
+            <p className="muted" style={{ margin: '4px 0 1rem', fontSize: '0.85rem' }}>
+              Este asistente escanea todos los usuarios existentes en el sistema (incluyendo cuentas importadas por Excel/placeholders) y consolida una ficha maestra por cada DNI válido en <code>/workers</code>, sin alterar ni borrar las cuentas originales ni sus registros de jornada.
+            </p>
+
+            {!normalizationReport ? (
+              <div style={{ textAlign: 'center', padding: '1.5rem', background: 'var(--bg-accent)', borderRadius: 8 }}>
+                <p style={{ margin: '0 0 1rem' }}>
+                  Hacé clic en <strong>Escanear base de datos</strong> para diagnosticar cuántas fichas están listas para crearse y detectar posibles faltantes o duplicados.
+                </p>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={handleScanNormalization}
+                  disabled={normalizationScanning}
+                >
+                  {normalizationScanning ? <><Spinner size={14} inline /> Analizando usuarios…</> : '🔍 Escanear base de datos'}
+                </button>
+              </div>
+            ) : (
+              <div className="stack" style={{ gap: '12px' }}>
+                {/* Resumen del diagnóstico */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '8px' }}>
+                  <div style={{ padding: '8px 12px', background: 'var(--bg-card)', border: '1px solid var(--line)', borderRadius: 6, textAlign: 'center' }}>
+                    <div style={{ fontSize: '1.2rem', fontWeight: 'bold' }}>{normalizationReport.totalUsersScanned}</div>
+                    <div className="muted" style={{ fontSize: '0.75rem' }}>Usuarios analizados</div>
+                  </div>
+                  <div style={{ padding: '8px 12px', background: '#ecfdf5', border: '1px solid #a7f3d0', borderRadius: 6, textAlign: 'center', color: '#065f46' }}>
+                    <div style={{ fontSize: '1.2rem', fontWeight: 'bold' }}>{normalizationReport.readyForWorkerProfile.length}</div>
+                    <div style={{ fontSize: '0.75rem' }}>Listos para fichas</div>
+                  </div>
+                  <div style={{ padding: '8px 12px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 6, textAlign: 'center', color: '#92400e' }}>
+                    <div style={{ fontSize: '1.2rem', fontWeight: 'bold' }}>{normalizationReport.missingDniUsers.length}</div>
+                    <div style={{ fontSize: '0.75rem' }}>Sin DNI válido</div>
+                  </div>
+                  <div style={{ padding: '8px 12px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, textAlign: 'center', color: '#991b1b' }}>
+                    <div style={{ fontSize: '1.2rem', fontWeight: 'bold' }}>{normalizationReport.conflictingDniGroups.length}</div>
+                    <div style={{ fontSize: '0.75rem' }}>Conflictos de nombre</div>
+                  </div>
+                </div>
+
+                {/* Conflictos si existen */}
+                {normalizationReport.conflictingDniGroups.length > 0 && (
+                  <div style={{ background: '#fef2f2', border: '1px solid #f87171', padding: '10px', borderRadius: 6, fontSize: '0.85rem', color: '#991b1b' }}>
+                    <strong>⚠️ Nombres distintos detectados con el mismo DNI:</strong>
+                    <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+                      {normalizationReport.conflictingDniGroups.map((g) => (
+                        <li key={g.dni}>
+                          DNI {g.dni}: {g.users.map((u) => u.displayName || u.email || u.uid).join(' vs ')}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* Previsualización de fichas a consolidar */}
+                <div>
+                  <h4 style={{ margin: '8px 0 4px', fontSize: '0.9rem' }}>Vista previa de fichas a generar / vincular ({normalizationReport.readyForWorkerProfile.length}):</h4>
+                  <div style={{ maxHeight: '200px', overflowY: 'auto', border: '1px solid var(--line)', borderRadius: 6, padding: '6px' }}>
+                    {normalizationReport.readyForWorkerProfile.map((item) => (
+                      <div key={item.dni} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 8px', borderBottom: '1px solid var(--line)', fontSize: '0.82rem' }}>
+                        <div>
+                          <strong>{item.displayName}</strong>
+                          <span className="muted" style={{ marginLeft: '6px', fontFamily: 'monospace' }}>DNI: {item.dni}</span>
+                        </div>
+                        <div className="muted">
+                          {item.uids.length > 1 ? `🔗 ${item.uids.length} cuentas vinculadas` : '1 cuenta'}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Usuarios sin DNI */}
+                {normalizationReport.missingDniUsers.length > 0 && (
+                  <div>
+                    <h4 style={{ margin: '8px 0 4px', fontSize: '0.9rem', color: '#b45309' }}>Usuarios que aún no tienen DNI cargado ({normalizationReport.missingDniUsers.length}):</h4>
+                    <p className="muted" style={{ fontSize: '0.8rem', margin: '0 0 4px' }}>
+                      Estos usuarios seguirán operando con normalidad. Para incorporarlos al padrón podés asignarles DNI editando su cuenta en Aprobados o en el padrón de Fichas.
+                    </p>
+                    <div style={{ maxHeight: '100px', overflowY: 'auto', border: '1px solid var(--line)', borderRadius: 6, padding: '4px', fontSize: '0.8rem' }}>
+                      {normalizationReport.missingDniUsers.slice(0, 15).map((u) => (
+                        <div key={u.uid} style={{ padding: '2px 6px' }}>
+                          {u.displayName || u.email || u.uid} <span className="muted">({u.role || 'MEMBER'})</span>
+                        </div>
+                      ))}
+                      {normalizationReport.missingDniUsers.length > 15 && (
+                        <div className="muted" style={{ padding: '2px 6px', fontStyle: 'italic' }}>
+                          ... y {normalizationReport.missingDniUsers.length - 15} más
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div className="row" style={{ justifyContent: 'flex-end', gap: '8px', marginTop: '1rem' }}>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    onClick={() => setNormalizationReport(null)}
+                    disabled={normalizationExecuting}
+                  >
+                    Volver a escanear
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ background: '#10b981', color: '#fff' }}
+                    onClick={() => { void handleExecuteNormalization() }}
+                    disabled={normalizationExecuting || normalizationReport.readyForWorkerProfile.length === 0}
+                  >
+                    {normalizationExecuting ? (
+                      <><Spinner size={14} inline /> Creando y vinculando fichas…</>
+                    ) : (
+                      `🚀 Generar / Vincular ${normalizationReport.readyForWorkerProfile.length} Fichas`
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    onClick={() => setShowNormalizationModal(false)}
+                    disabled={normalizationExecuting}
+                  >
+                    Cerrar
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* === MODAL: Crear / Editar Ficha de Trabajador === */}
+      {(editingWorker || isNewWorker) && (
+        <div className="modal-overlay" onClick={() => !workerSaving && (setEditingWorker(null), setIsNewWorker(false))}>
+          <div className="modal" style={{ maxWidth: '520px' }} onClick={(e) => e.stopPropagation()}>
+            <h3>{isNewWorker ? 'Nueva Ficha de Trabajador' : 'Editar Ficha de Trabajador'}</h3>
+            <p className="muted" style={{ margin: '4px 0 1rem', fontSize: '0.85rem' }}>
+              {isNewWorker
+                ? 'Registrá a una persona en el padrón maestro transversal. Su DNI actuará como clave de identificación unificada.'
+                : `Editando ficha de ${editingWorker?.displayName || ''} (DNI ${editingWorker?.idNumber}).`}
+            </p>
+
+            <form className="stack" onSubmit={(e) => { void handleSaveWorkerModal(e) }}>
+              <label>
+                Cédula / DNI (6 a 12 dígitos) *
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  placeholder="Ej: 12345678"
+                  value={workerFormDni}
+                  onChange={(e) => setWorkerFormDni(e.target.value)}
+                  onBlur={() => setWorkerFormDni(normalizeIdNumber(workerFormDni))}
+                  disabled={!isNewWorker}
+                  required
+                />
+              </label>
+
+              <label>
+                Nombre y apellido oficial *
+                <input
+                  type="text"
+                  placeholder="Ej: Juan Pérez"
+                  value={workerFormName}
+                  onChange={(e) => setWorkerFormName(e.target.value)}
+                  required
+                />
+              </label>
+
+              <div className="row" style={{ gap: '10px' }}>
+                <label style={{ flex: '1 1 180px' }}>
+                  Email principal
+                  <input
+                    type="email"
+                    placeholder="juan@ejemplo.com"
+                    value={workerFormEmail}
+                    onChange={(e) => setWorkerFormEmail(e.target.value)}
+                  />
+                </label>
+                <label style={{ flex: '1 1 140px' }}>
+                  Teléfono
+                  <input
+                    type="tel"
+                    placeholder="099 123 456"
+                    value={workerFormPhone}
+                    onChange={(e) => setWorkerFormPhone(e.target.value)}
+                  />
+                </label>
+              </div>
+
+              <label>
+                Estado en la empresa
+                <select
+                  value={workerFormStatus}
+                  onChange={(e) => setWorkerFormStatus(e.target.value as 'ACTIVE' | 'INACTIVE')}
+                >
+                  <option value="ACTIVE">Activo</option>
+                  <option value="INACTIVE">Inactivo</option>
+                </select>
+              </label>
+
+              <fieldset style={{ border: '1px solid var(--line)', borderRadius: 6, padding: '10px 12px', margin: '4px 0' }}>
+                <legend style={{ fontSize: '0.85rem', fontWeight: 'bold', padding: '0 4px' }}>Asignación actual de proyecto</legend>
+                <div className="stack" style={{ gap: '8px' }}>
+                  <label>
+                    Proyecto
+                    <select
+                      value={workerFormProjectId}
+                      onChange={(e) => {
+                        setWorkerFormProjectId(e.target.value)
+                        setWorkerFormAreaId('')
+                        setWorkerFormRoleId('')
+                      }}
+                    >
+                      <option value="">— Sin asignación —</option>
+                      {projects.map((p) => (
+                        <option key={p.id} value={p.id}>{p.name}</option>
+                      ))}
+                    </select>
+                  </label>
+
+                  {workerFormProjectId && (
+                    <div className="row" style={{ gap: '10px' }}>
+                      <label style={{ flex: '1 1 140px' }}>
+                        Área
+                        <select
+                          value={workerFormAreaId}
+                          onChange={(e) => setWorkerFormAreaId(e.target.value)}
+                        >
+                          <option value="">— Ninguna —</option>
+                          {workerModalAreas.map((a) => (
+                            <option key={a.id} value={a.id}>{a.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label style={{ flex: '1 1 140px' }}>
+                        Rol
+                        <select
+                          value={workerFormRoleId}
+                          onChange={(e) => setWorkerFormRoleId(e.target.value)}
+                        >
+                          <option value="">— Ninguno —</option>
+                          {workerModalRoles.map((r) => (
+                            <option key={r.id} value={r.id}>{r.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                  )}
+                </div>
+              </fieldset>
+
+              {editingWorker && editingWorker.knownUids?.length > 0 && (
+                <div className="muted" style={{ fontSize: '0.8rem', background: 'var(--bg-accent)', padding: '6px 10px', borderRadius: 4 }}>
+                  🔗 <strong>{editingWorker.knownUids.length} cuenta(s) vinculada(s):</strong>
+                  <div style={{ fontFamily: 'monospace', fontSize: '0.75rem', marginTop: '2px' }}>
+                    {editingWorker.knownUids.join(', ')}
+                  </div>
+                </div>
+              )}
+
+              <div className="row" style={{ justifyContent: 'flex-end', gap: '8px', marginTop: '1rem' }}>
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  onClick={() => {
+                    setEditingWorker(null)
+                    setIsNewWorker(false)
+                  }}
+                  disabled={workerSaving}
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="btn"
+                  disabled={workerSaving}
+                >
+                  {workerSaving ? <><Spinner size={14} inline /> Guardando…</> : isNewWorker ? 'Crear Ficha' : 'Guardar Cambios'}
+                </button>
               </div>
             </form>
           </div>

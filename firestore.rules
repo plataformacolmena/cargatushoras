@@ -116,6 +116,14 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // Padrón transversal de Fichas de Trabajadores (Master Directory)
+    // Lectura: usuarios aprobados (para resolver nombres/identidades).
+    // Escritura: exclusiva de SUPERUSER (crear, editar, normalizar).
+    match /workers/{workerId} {
+      allow read: if isApproved();
+      allow create, update, delete: if isSuperUser();
+    }
+
     match /time_entries/{entryId} {
       // Read: aprobados. Decisión funcional: los MEMBER deben ver las
       // jornadas de su área (no solo las suyas), por lo que no se restringe
