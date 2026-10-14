@@ -6896,6 +6896,7 @@ export function DashboardPage() {
                       className="entry-item"
                       style={{
                         display: 'flex',
+                        flexDirection: 'row',
                         justifyContent: 'space-between',
                         alignItems: 'center',
                         flexWrap: 'wrap',
@@ -6904,8 +6905,8 @@ export function DashboardPage() {
                         borderLeft: `4px solid ${w.status === 'ACTIVE' ? '#10b981' : '#9ca3af'}`,
                       }}
                     >
-                      <div style={{ flex: '1 1 300px' }}>
-                        <div className="row" style={{ gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '4px' }}>
+                      <div style={{ flex: '1 1 300px', minWidth: '240px' }}>
+                        <div className="row" style={{ gap: '8px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-start', marginBottom: '4px' }}>
                           <strong style={{ fontSize: '1rem' }}>{w.displayName}</strong>
                           <span
                             style={{
@@ -6932,7 +6933,7 @@ export function DashboardPage() {
                           </span>
                         </div>
 
-                        <div className="row" style={{ gap: '16px', fontSize: '0.85rem', color: 'var(--text-muted, #64748b)', flexWrap: 'wrap' }}>
+                        <div className="row" style={{ gap: '16px', fontSize: '0.85rem', color: 'var(--text-muted, #64748b)', flexWrap: 'wrap', justifyContent: 'flex-start' }}>
                           {w.email && <span>✉️ {w.email}</span>}
                           {w.phone && <span>📞 {w.phone}</span>}
                           <span>🔗 {w.knownUids?.length || 0} cuenta(s) vinculada(s)</span>
@@ -6947,7 +6948,7 @@ export function DashboardPage() {
                         )}
                       </div>
 
-                      <div className="row" style={{ gap: '6px', flexWrap: 'wrap' }}>
+                      <div className="row" style={{ gap: '6px', flexWrap: 'wrap', justifyContent: 'flex-end', flex: '0 0 auto' }}>
                         <button
                           className="btn-sm btn-outline"
                           onClick={() => handleOpenEditWorker(w)}
