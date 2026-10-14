@@ -79,6 +79,8 @@ import {
   updateProjectArea,
   countUserTimeEntriesDeep,
   deleteUserProfileDeep,
+  disableAllApprovedUsers,
+  deleteAllPendingUsers,
   EmailConflictError,
   setUserDisabled,
   updateProjectRole,
@@ -457,6 +459,10 @@ export function DashboardPage() {
   const [bulkRecalcOnlyMissing, setBulkRecalcOnlyMissing] = useState(true)
   const [bulkRecalcProgress, setBulkRecalcProgress] = useState<{ processed: number; total: number; batchCount: number } | null>(null)
   const [bulkRecalcResult, setBulkRecalcResult] = useState<{ updated: number; skipped: number; errors: number } | null>(null)
+
+  // Acciones masivas de usuarios (Exclusivo SUPERUSER)
+  const [disableAllBusy, setDisableAllBusy] = useState(false)
+  const [deleteAllPendingBusy, setDeleteAllPendingBusy] = useState(false)
 
   // Auditoría: usuarios sin informar
   const [noReportFilters, setNoReportFilters] = useState<{ dateFrom: string; dateTo: string; areaId: string }>({ dateFrom: '', dateTo: '', areaId: '' })
@@ -2453,6 +2459,76 @@ export function DashboardPage() {
     } catch (err) {
       console.error(err)
       showToast(`Error al ${verb} el usuario.`, 'error')
+    }
+  }
+
+  async function handleDisableAllApprovedUsers() {
+    if (!profile) return
+    const targets = approvedUsers.filter(
+      (u) => !u.disabled && u.role !== 'SUPERUSER' && u.uid !== profile.uid,
+    )
+    if (targets.length === 0) {
+      showToast('No hay usuarios aprobados activos para inhabilitar.', 'info')
+      return
+    }
+    const confirmed = window.confirm(
+      `¿Inhabilitar a todos los usuarios aprobados activos (${targets.length} usuarios)?\n\n` +
+      `• Los superusuarios y tu propia cuenta no serán inhabilitados.\n` +
+      `• Ningún registro de jornada se perderá ni modificará.\n` +
+      `• Los usuarios inhabilitados no podrán operar hasta que sean rehabilitados.\n\n` +
+      `¿Continuar?`
+    )
+    if (!confirmed) return
+    setDisableAllBusy(true)
+    try {
+      const res = await disableAllApprovedUsers(
+        {
+          uid: profile.uid,
+          displayName: profile.displayName || 'Superuser',
+          email: profile.email,
+        },
+        targets.map((u) => u.uid),
+      )
+      showToast(`${res.disabledCount} usuarios inhabilitados con éxito.`)
+      void loadUsersPanels()
+    } catch (err) {
+      console.error('[handleDisableAllApprovedUsers] error:', err)
+      showToast('Error al inhabilitar usuarios.', 'error')
+    } finally {
+      setDisableAllBusy(false)
+    }
+  }
+
+  async function handleDeleteAllPendingUsers() {
+    if (!profile) return
+    if (pendingUsers.length === 0) {
+      showToast('No hay usuarios pendientes para eliminar.', 'info')
+      return
+    }
+    const count = pendingUsers.length
+    const confirmed = window.confirm(
+      `⚠️ ¿Eliminar permanentemente a todos los usuarios pendientes de aprobación (${count} usuario${count === 1 ? '' : 's'})?\n\n` +
+      `Esta acción borrará sus solicitudes de acceso. No se puede deshacer.\n\n` +
+      `¿Continuar?`
+    )
+    if (!confirmed) return
+    setDeleteAllPendingBusy(true)
+    try {
+      const res = await deleteAllPendingUsers(
+        {
+          uid: profile.uid,
+          displayName: profile.displayName || 'Superuser',
+          email: profile.email,
+        },
+        pendingUsers.map((u) => u.uid),
+      )
+      showToast(`${res.deletedCount} solicitudes pendientes eliminadas.`)
+      void loadUsersPanels()
+    } catch (err) {
+      console.error('[handleDeleteAllPendingUsers] error:', err)
+      showToast('Error al eliminar usuarios pendientes.', 'error')
+    } finally {
+      setDeleteAllPendingBusy(false)
     }
   }
 
@@ -5889,7 +5965,19 @@ export function DashboardPage() {
 
               {/* Usuarios pendientes de aprobación manual */}
               <section className="card">
-                <h2>Usuarios pendientes de aprobación</h2>
+                <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '8px' }}>
+                  <h2 style={{ margin: 0 }}>Usuarios pendientes de aprobación</h2>
+                  {canSeeProjectAdmin(currentProfile.role) && pendingUsers.length > 0 && (
+                    <button
+                      className="btn-sm danger"
+                      onClick={() => { void handleDeleteAllPendingUsers() }}
+                      disabled={deleteAllPendingBusy}
+                      title="Elimina permanentemente todas las solicitudes de usuarios pendientes de aprobación"
+                    >
+                      {deleteAllPendingBusy ? <><Spinner size={12} inline /> Eliminando…</> : `🗑️ Eliminar todos los pendientes (${pendingUsers.length})`}
+                    </button>
+                  )}
+                </div>
                 {pendingUsers.length === 0 ? (
                   <p className="muted">No hay usuarios pendientes.</p>
                 ) : (
@@ -5918,7 +6006,20 @@ export function DashboardPage() {
 
           {userTab === 'APPROVED' && (
             <section className="card">
-              <h2>Usuarios aprobados</h2>
+              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '8px' }}>
+                <h2 style={{ margin: 0 }}>Usuarios aprobados</h2>
+                {canSeeProjectAdmin(currentProfile.role) && (
+                  <button
+                    className="btn-sm btn-outline"
+                    style={{ color: '#ef4444', borderColor: '#ef4444' }}
+                    onClick={() => { void handleDisableAllApprovedUsers() }}
+                    disabled={disableAllBusy}
+                    title="Inhabilita a todos los usuarios activos aprobados (excluye Superusuarios y tu propia cuenta)"
+                  >
+                    {disableAllBusy ? <><Spinner size={12} inline /> Inhabilitando…</> : '🚫 Inhabilitar todos los activos'}
+                  </button>
+                )}
+              </div>
               {memberAreaConflicts.length > 0 && (
                 <div
                   className="alert"

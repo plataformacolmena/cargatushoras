@@ -3387,3 +3387,74 @@ export async function executeBulkRecalculateAllEntries(
 
   return { updated, skipped, errors }
 }
+
+/**
+ * Inhabilita masivamente a un listado de usuarios aprobados activos.
+ * Exclusivo SUPERUSER. No toca jornadas ni configuración de proyectos.
+ */
+export async function disableAllApprovedUsers(
+  actor: { uid: string; displayName: string; email?: string | null },
+  targetUids: string[],
+): Promise<{ disabledCount: number }> {
+  // Excluir al propio actor por seguridad absoluta
+  const uidsToProcess = targetUids.filter((uid) => uid !== actor.uid)
+  const BATCH_SIZE = 400
+  let disabledCount = 0
+
+  for (let i = 0; i < uidsToProcess.length; i += BATCH_SIZE) {
+    const chunk = uidsToProcess.slice(i, i + BATCH_SIZE)
+    const batch = writeBatch(db)
+    for (const uid of chunk) {
+      batch.update(doc(db, 'users', uid), {
+        disabled: true,
+        updatedAt: serverTimestamp(),
+      })
+    }
+    await batch.commit()
+    disabledCount += chunk.length
+  }
+
+  void writeSystemLog({
+    type: 'admin_bulk_disable_users',
+    userId: actor.uid,
+    userName: actor.displayName,
+    email: actor.email ?? null,
+    details: `Inhabilitación masiva ejecutada: ${disabledCount} usuarios inhabilitados.`,
+  })
+
+  return { disabledCount }
+}
+
+/**
+ * Elimina permanentemente en lote los documentos de usuarios en estado PENDING.
+ * Exclusivo SUPERUSER.
+ */
+export async function deleteAllPendingUsers(
+  actor: { uid: string; displayName: string; email?: string | null },
+  pendingUids: string[],
+): Promise<{ deletedCount: number }> {
+  // Excluir al propio actor por seguridad
+  const uidsToProcess = pendingUids.filter((uid) => uid !== actor.uid)
+  const BATCH_SIZE = 400
+  let deletedCount = 0
+
+  for (let i = 0; i < uidsToProcess.length; i += BATCH_SIZE) {
+    const chunk = uidsToProcess.slice(i, i + BATCH_SIZE)
+    const batch = writeBatch(db)
+    for (const uid of chunk) {
+      batch.delete(doc(db, 'users', uid))
+    }
+    await batch.commit()
+    deletedCount += chunk.length
+  }
+
+  void writeSystemLog({
+    type: 'admin_bulk_delete_pending',
+    userId: actor.uid,
+    userName: actor.displayName,
+    email: actor.email ?? null,
+    details: `Eliminación masiva de pendientes ejecutada: ${deletedCount} usuarios eliminados.`,
+  })
+
+  return { deletedCount }
+}
