@@ -515,11 +515,11 @@ export function DashboardPage() {
     isJornadaAdicional: false,
   })
 
-  function showToast(message: string, type: Toast['type'] = 'success') {
+  const showToast = useCallback((message: string, type: Toast['type'] = 'success') => {
     const id = toastIdRef.current++
     setToasts((prev) => [...prev, { id, message, type }])
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4000)
-  }
+  }, [])
 
   useEffect(() => {
     return subscribeToProjects((loadedProjects) => {
@@ -2580,8 +2580,7 @@ export function DashboardPage() {
 
   // ─── Padrón transversal de Fichas (Superuser) ──────────────────────────────
   const loadWorkersData = useCallback(async () => {
-    const currentProfile = profile
-    if (!currentProfile || !canSeeProjectAdmin(currentProfile.role)) return
+    if (!profile || !canSeeProjectAdmin(profile.role)) return
     try {
       setWorkersLoading(true)
       const list = await listWorkers()
@@ -2592,13 +2591,16 @@ export function DashboardPage() {
     } finally {
       setWorkersLoading(false)
     }
-  }, [profile, showToast])
+  }, [profile?.role, showToast])
 
+  const workersLoadedRef = useRef(false)
   useEffect(() => {
-    if (mainTab === 'USERS' && userTab === 'WORKERS' && profile && canSeeProjectAdmin(profile.role)) {
-      void loadWorkersData()
-    }
-  }, [mainTab, userTab, profile, loadWorkersData])
+    if (mainTab !== 'USERS' || userTab !== 'WORKERS') return
+    if (workersLoadedRef.current) return
+    if (!profile || !canSeeProjectAdmin(profile.role)) return
+    workersLoadedRef.current = true
+    void loadWorkersData()
+  }, [mainTab, userTab, profile?.role, loadWorkersData])
 
   const filteredWorkers = useMemo(() => {
     let result = workers
