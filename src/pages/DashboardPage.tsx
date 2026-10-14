@@ -17,6 +17,7 @@ import {
   createProjectArea,
   createProjectRole,
   deleteProject,
+  reactivateProject,
   deleteProjectArea,
   deleteProjectRole,
   deleteTimeEntry,
@@ -320,6 +321,7 @@ export function DashboardPage() {
     // Recordatorios pendientes para el usuario actual (vista usuario).
     const [myReminders, setMyReminders] = useState<Reminder[]>([])
   const { profile, signOutUser, user } = useAuth()
+  const isSuperUser = profile?.role === 'SUPERUSER'
   const toastIdRef = useRef(0)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [mainTab, setMainTab] = useState<MainTab>(() => readLS<MainTab>('mainTab', 'PROJECTS', MAIN_TABS))
@@ -526,19 +528,22 @@ export function DashboardPage() {
   }, [])
 
   useEffect(() => {
-    return subscribeToProjects((loadedProjects) => {
-      setProjects(loadedProjects)
-      setActiveProjectId((prev) => {
-        if (prev) return prev
-        // Restaurar último proyecto activo si existe y sigue disponible
-        const remembered = (() => {
-          try { return localStorage.getItem(LS_PREFIX + 'activeProjectId') ?? '' } catch { return '' }
-        })()
-        if (remembered && loadedProjects.some((p) => p.id === remembered)) return remembered
-        return loadedProjects[0]?.id ?? ''
-      })
-    })
-  }, [])
+    return subscribeToProjects(
+      (loadedProjects) => {
+        setProjects(loadedProjects)
+        setActiveProjectId((prev) => {
+          if (prev && loadedProjects.some((p) => p.id === prev)) return prev
+          // Restaurar último proyecto activo si existe y sigue disponible
+          const remembered = (() => {
+            try { return localStorage.getItem(LS_PREFIX + 'activeProjectId') ?? '' } catch { return '' }
+          })()
+          if (remembered && loadedProjects.some((p) => p.id === remembered)) return remembered
+          return loadedProjects[0]?.id ?? ''
+        })
+      },
+      { includeInactive: isSuperUser },
+    )
+  }, [isSuperUser])
 
   // Persistir proyecto activo
   useEffect(() => {
@@ -1058,9 +1063,13 @@ export function DashboardPage() {
     void listProjectTemplates().then(setTemplates)
   }, [profile, mainTab])
 
-  const activeProjectName = useMemo(() => {
-    return projects.find((p) => p.id === activeProjectId)?.name || 'Sin proyecto'
+  const activeProject = useMemo(() => {
+    return projects.find((p) => p.id === activeProjectId) || null
   }, [activeProjectId, projects])
+
+  const activeProjectName = useMemo(() => {
+    return activeProject?.name || 'Sin proyecto'
+  }, [activeProject])
 
   const activeAreaName = useMemo(() => {
     if (!profile?.areaId) return ''
@@ -1646,6 +1655,18 @@ export function DashboardPage() {
       setAllProjects(loaded)
     } catch (error) {
       showToast(`Error: ${error instanceof Error ? error.message : 'Desconocido'}`, 'error')
+    }
+  }
+
+  async function handleReactivateProject(projectId: string) {
+    if (!window.confirm('¿Reactivar este proyecto? Los miembros podrán volver a acceder.')) return
+    try {
+      await reactivateProject(projectId)
+      showToast('Proyecto reactivado con éxito.')
+      const loaded = await listAllProjects()
+      setAllProjects(loaded)
+    } catch (error) {
+      showToast(`Error al reactivar proyecto: ${error instanceof Error ? error.message : 'Desconocido'}`, 'error')
     }
   }
 
@@ -3101,12 +3122,48 @@ export function DashboardPage() {
           >
             {projects.map((project) => (
               <option key={project.id} value={project.id}>
-                {project.name}
+                {project.name}{!project.active ? ' 🚫 (Inactivo)' : ''}
               </option>
             ))}
           </select>
         </label>
       </section>
+
+      {activeProject && !activeProject.active && (
+        <div
+          className="alert"
+          style={{
+            background: '#fff1f2',
+            border: '1px solid #fecdd3',
+            color: '#9f1239',
+            padding: '10px 14px',
+            borderRadius: 8,
+            marginBottom: '1rem',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: '8px',
+          }}
+        >
+          <div>
+            <strong>🚫 Proyecto deshabilitado (inactivo):</strong>
+            <span style={{ marginLeft: 6, fontSize: '0.9rem' }}>
+              Los miembros regulares no tienen acceso a este proyecto. Como Superusuario podés ingresar, auditar datos y modificar su configuración.
+            </span>
+          </div>
+          {isSuperUser && (
+            <button
+              type="button"
+              className="btn-sm"
+              style={{ background: '#10b981', color: '#fff', border: 'none', cursor: 'pointer' }}
+              onClick={() => { void handleReactivateProject(activeProject.id) }}
+            >
+              Reactivar proyecto
+            </button>
+          )}
+        </div>
+      )}
 
       <nav className="tab-row">
         {canSeeProjectAdmin(currentProfile.role) && (
@@ -3277,10 +3334,43 @@ export function DashboardPage() {
                     <p className="muted" style={{ margin: '2px 0' }}>{proj.code} — {proj.description}</p>
                     <span className="chip">{proj.active ? 'Activo' : 'Inactivo'}</span>
                   </div>
-                  {proj.active && !projectFormMode && (
-                    <div className="row">
-                      <button className="btn btn-outline" onClick={() => startEditProject(proj)}>Editar</button>
-                      <button className="btn btn-outline" onClick={() => { void handleDeleteProject(proj.id) }}>Desactivar</button>
+                  {!projectFormMode && (
+                    <div className="row" style={{ gap: '6px', flexWrap: 'wrap' }}>
+                      {proj.id !== activeProjectId && (
+                        <button
+                          type="button"
+                          className="btn-sm btn-outline"
+                          onClick={() => {
+                            setActiveProjectId(proj.id)
+                            setForm((prev) => ({ ...prev, projectId: proj.id }))
+                            showToast(`Cambiado al proyecto "${proj.name}"`)
+                          }}
+                        >
+                          Entrar al proyecto
+                        </button>
+                      )}
+                      {isSuperUser && (
+                        <button className="btn-sm btn-outline" onClick={() => startEditProject(proj)}>Editar</button>
+                      )}
+                      {isSuperUser && (
+                        proj.active ? (
+                          <button
+                            className="btn-sm btn-outline"
+                            style={{ color: '#ef4444', borderColor: '#ef4444' }}
+                            onClick={() => { void handleDeleteProject(proj.id) }}
+                          >
+                            Desactivar
+                          </button>
+                        ) : (
+                          <button
+                            className="btn-sm btn-outline"
+                            style={{ color: '#10b981', borderColor: '#10b981' }}
+                            onClick={() => { void handleReactivateProject(proj.id) }}
+                          >
+                            Reactivar
+                          </button>
+                        )
+                      )}
                     </div>
                   )}
                 </div>
@@ -7149,7 +7239,7 @@ export function DashboardPage() {
                 >
                   <option value="">— Sin proyecto —</option>
                   {projects.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
+                    <option key={p.id} value={p.id}>{p.name}{!p.active ? ' (Inactivo)' : ''}</option>
                   ))}
                 </select>
               </label>
@@ -7275,7 +7365,7 @@ export function DashboardPage() {
                 <select value={editUserForm.projectId} onChange={(e) => setEditUserForm((f) => ({ ...f, projectId: e.target.value, areaId: '', roleId: '' }))}>
                   <option value="">— Sin proyecto —</option>
                   {projects.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
+                    <option key={p.id} value={p.id}>{p.name}{!p.active ? ' (Inactivo)' : ''}</option>
                   ))}
                 </select>
               </label>
@@ -7539,7 +7629,7 @@ export function DashboardPage() {
                     >
                       <option value="">— Sin asignación —</option>
                       {projects.map((p) => (
-                        <option key={p.id} value={p.id}>{p.name}</option>
+                        <option key={p.id} value={p.id}>{p.name}{!p.active ? ' (Inactivo)' : ''}</option>
                       ))}
                     </select>
                   </label>

@@ -480,6 +480,14 @@ export async function deleteProject(projectId: string): Promise<void> {
   })
 }
 
+export async function reactivateProject(projectId: string): Promise<void> {
+  const projectRef = doc(db, 'projects', projectId)
+  await updateDoc(projectRef, {
+    active: true,
+    updatedAt: serverTimestamp(),
+  })
+}
+
 export async function listAllProjects(): Promise<Project[]> {
   const q = query(collection(db, 'projects'), orderBy('name'))
   const snapshot = await getDocs(q)
@@ -1522,8 +1530,13 @@ export async function listAllTimeEntries(
 
 // ── Suscripciones en tiempo real ────────────────────────────────────────────
 
-export function subscribeToProjects(callback: (projects: Project[]) => void): () => void {
-  const q = query(collection(db, 'projects'), where('active', '==', true), orderBy('name'))
+export function subscribeToProjects(
+  callback: (projects: Project[]) => void,
+  options?: { includeInactive?: boolean },
+): () => void {
+  const q = options?.includeInactive
+    ? query(collection(db, 'projects'), orderBy('name'))
+    : query(collection(db, 'projects'), where('active', '==', true), orderBy('name'))
   return onSnapshot(
     q,
     (snap) => {
