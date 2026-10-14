@@ -83,6 +83,8 @@ import {
   deleteAllPendingUsers,
   EmailConflictError,
   setUserDisabled,
+  setUserProjectDisabled,
+  unlockAllUsersSystemDisabled,
   updateProjectRole,
   updateTimeEntry,
   updateUserProfileAdmin,
@@ -471,6 +473,8 @@ export function DashboardPage() {
   // Acciones masivas de usuarios (Exclusivo SUPERUSER)
   const [disableAllBusy, setDisableAllBusy] = useState(false)
   const [deleteAllPendingBusy, setDeleteAllPendingBusy] = useState(false)
+  const [unlockAllBusy, setUnlockAllBusy] = useState(false)
+  const [userProjectScope, setUserProjectScope] = useState<'CURRENT' | 'ALL'>('CURRENT')
 
   // Padrón Transversal de Trabajadores / Fichas (Exclusivo SUPERUSER)
   const [workers, setWorkers] = useState<WorkerProfile[]>([])
@@ -1063,23 +1067,33 @@ export function DashboardPage() {
     return areas.find((a) => a.id === profile.areaId)?.name ?? ''
   }, [profile?.areaId, areas])
 
+  // Usuarios aprobados según el alcance contextual: solo el proyecto activo (por defecto) o todos (Superuser)
+  const scopedApprovedUsers = useMemo(() => {
+    const isSuper = profile?.role === 'SUPERUSER'
+    if (!isSuper || userProjectScope === 'CURRENT') {
+      if (!activeProjectId) return []
+      return approvedUsers.filter((u) => u.projectId === activeProjectId)
+    }
+    return approvedUsers
+  }, [approvedUsers, userProjectScope, activeProjectId, profile?.role])
+
   const filteredApprovedUsers = useMemo(() => {
-    if (!userSearch.trim()) return approvedUsers
+    if (!userSearch.trim()) return scopedApprovedUsers
     const s = userSearch.toLowerCase()
     const sDigits = s.replace(/\D/g, '')
-    return approvedUsers.filter(
+    return scopedApprovedUsers.filter(
       (u) =>
         (u.displayName ?? '').toLowerCase().includes(s) ||
         (u.email ?? '').toLowerCase().includes(s) ||
         u.uid.toLowerCase().includes(s) ||
         (sDigits.length > 0 && (u.idNumber ?? '').includes(sDigits)),
     )
-  }, [approvedUsers, userSearch])
+  }, [scopedApprovedUsers, userSearch])
 
   // Regla: todo MEMBER aprobado debe tener proyecto Y un área específica.
   // "sin área" y "todas las áreas" se codifican igual (areaId vacío) y están prohibidos para MEMBER.
   const memberAreaConflicts = useMemo(() => {
-    return approvedUsers
+    return scopedApprovedUsers
       .filter((u) => u.role === 'MEMBER' && !u.mergedToUid && (!u.projectId || !u.areaId))
       .map((u) => ({
         uid: u.uid,
@@ -1087,7 +1101,7 @@ export function DashboardPage() {
         email: u.email ?? '',
         reason: !u.projectId ? 'NO_PROJECT' : 'NO_AREA',
       }))
-  }, [approvedUsers])
+  }, [scopedApprovedUsers])
   const memberAreaConflictUids = useMemo(
     () => new Set(memberAreaConflicts.map((c) => c.uid)),
     [memberAreaConflicts],
@@ -1637,6 +1651,10 @@ export function DashboardPage() {
 
   async function submitEntry(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (!canAudit(currentProfile.role) && currentProfile.projectDisabled) {
+      showToast('Tu usuario se encuentra inhabilitado en este proyecto y no puede cargar jornadas.', 'error')
+      return
+    }
     if (isDateLocked(form.workDate)) {
       showToast(`La fecha ${form.workDate} pertenece a un período liquidado y no se puede modificar.`, 'error')
       return
@@ -2491,37 +2509,57 @@ export function DashboardPage() {
     }
   }
 
-  async function handleToggleUserDisabled(u: UserProfile) {
+  async function handleToggleUserProjectDisabled(u: UserProfile) {
     if (u.uid === profile?.uid) {
       showToast('No podés inhabilitar tu propia cuenta.', 'error')
       return
     }
-    const next = !u.disabled
-    const verb = next ? 'inhabilitar' : 'rehabilitar'
+    const next = !u.projectDisabled
+    const verb = next ? 'inhabilitar en este proyecto' : 'rehabilitar en este proyecto'
     if (!window.confirm(`¿Seguro que querés ${verb} a ${u.displayName ?? u.email}?`)) return
     try {
-      await setUserDisabled(u.uid, next)
-      showToast(next ? 'Usuario inhabilitado.' : 'Usuario rehabilitado.')
+      await setUserProjectDisabled(u.uid, next)
+      setApprovedUsers((prev) => prev.map((item) => (item.uid === u.uid ? { ...item, projectDisabled: next } : item)))
+      showToast(next ? 'Usuario inhabilitado en este proyecto.' : 'Usuario rehabilitado en este proyecto.')
     } catch (err) {
       console.error(err)
       showToast(`Error al ${verb} el usuario.`, 'error')
     }
   }
 
-  async function handleDisableAllApprovedUsers() {
-    if (!profile) return
-    const targets = approvedUsers.filter(
-      (u) => !u.disabled && u.role !== 'SUPERUSER' && u.uid !== profile.uid,
-    )
-    if (targets.length === 0) {
-      showToast('No hay usuarios aprobados activos para inhabilitar.', 'info')
+  async function handleToggleUserGlobalDisabled(u: UserProfile) {
+    if (u.uid === profile?.uid) {
+      showToast('No podés inhabilitar tu propia cuenta.', 'error')
       return
     }
+    const next = !u.disabled
+    const verb = next ? 'bloquear la cuenta de sistema de' : 'desbloquear la cuenta de sistema de'
+    if (!window.confirm(`¿Seguro que querés ${verb} ${u.displayName ?? u.email}?`)) return
+    try {
+      await setUserDisabled(u.uid, next)
+      setApprovedUsers((prev) => prev.map((item) => (item.uid === u.uid ? { ...item, disabled: next } : item)))
+      showToast(next ? 'Cuenta bloqueada a nivel sistema.' : 'Cuenta desbloqueada a nivel sistema.')
+    } catch (err) {
+      console.error(err)
+      showToast(`Error al modificar el bloqueo de cuenta.`, 'error')
+    }
+  }
+
+  async function handleDisableAllApprovedUsers() {
+    if (!profile) return
+    const targets = scopedApprovedUsers.filter(
+      (u) => !u.projectDisabled && u.role !== 'SUPERUSER' && u.uid !== profile.uid,
+    )
+    if (targets.length === 0) {
+      showToast('No hay usuarios aprobados activos para inhabilitar en este listado.', 'info')
+      return
+    }
+    const scopeDesc = userProjectScope === 'CURRENT' ? `en el proyecto "${activeProjectName}"` : 'en el listado actual'
     const confirmed = window.confirm(
-      `¿Inhabilitar a todos los usuarios aprobados activos (${targets.length} usuarios)?\n\n` +
-      `• Los superusuarios y tu propia cuenta no serán inhabilitados.\n` +
-      `• Ningún registro de jornada se perderá ni modificará.\n` +
-      `• Los usuarios inhabilitados no podrán operar hasta que sean rehabilitados.\n\n` +
+      `¿Inhabilitar a los ${targets.length} miembros activos ${scopeDesc}?\n\n` +
+      `• Su cuenta de acceso seguirá activa para el sistema y otros proyectos.\n` +
+      `• No podrán cargar ni editar horas en este proyecto hasta ser rehabilitados.\n` +
+      `• Ningún registro de jornada se perderá ni modificará.\n\n` +
       `¿Continuar?`
     )
     if (!confirmed) return
@@ -2534,6 +2572,11 @@ export function DashboardPage() {
           email: profile.email,
         },
         targets.map((u) => u.uid),
+        {
+          projectOnly: userProjectScope === 'CURRENT',
+          projectId: activeProjectId,
+          projectName: activeProjectName,
+        },
       )
       showToast(`${res.disabledCount} usuarios inhabilitados con éxito.`)
       void loadUsersPanels()
@@ -2542,6 +2585,34 @@ export function DashboardPage() {
       showToast('Error al inhabilitar usuarios.', 'error')
     } finally {
       setDisableAllBusy(false)
+    }
+  }
+
+  async function handleUnlockAllSystemDisabled() {
+    if (!profile) return
+    const targets = scopedApprovedUsers.filter((u) => u.disabled && u.uid !== profile.uid)
+    if (targets.length === 0) {
+      showToast('No hay cuentas con bloqueo de sistema en este listado.', 'info')
+      return
+    }
+    const confirmed = window.confirm(
+      `¿Desbloquear el acceso de sistema a ${targets.length} cuenta(s)?\n\n` +
+      `Esto les permitirá volver a iniciar sesión en la aplicación.\n\n¿Continuar?`
+    )
+    if (!confirmed) return
+    setUnlockAllBusy(true)
+    try {
+      const res = await unlockAllUsersSystemDisabled(
+        { uid: profile.uid, displayName: profile.displayName || 'Superuser', email: profile.email },
+        targets.map((u) => u.uid),
+      )
+      showToast(`${res.unlockedCount} cuenta(s) desbloqueada(s) con éxito.`)
+      void loadUsersPanels()
+    } catch (err) {
+      console.error('[handleUnlockAllSystemDisabled] error:', err)
+      showToast('Error al desbloquear cuentas.', 'error')
+    } finally {
+      setUnlockAllBusy(false)
     }
   }
 
@@ -3631,7 +3702,25 @@ export function DashboardPage() {
             <section className="card">
               <h2>Cargar horario</h2>
 
-              {/* Cards de ciclo laboral / modo refuerzo eliminadas: el 6to día es manual y el reenganche se decide por ese flag. */}
+              {/* Alerta si el miembro está inhabilitado en este proyecto */}
+              {!canAudit(currentProfile.role) && currentProfile.projectDisabled && (
+                <div
+                  className="alert"
+                  style={{
+                    background: '#fef2f2',
+                    border: '1px solid #f87171',
+                    color: '#991b1b',
+                    padding: '10px 14px',
+                    borderRadius: 6,
+                    marginBottom: '1rem',
+                  }}
+                >
+                  <strong>🚫 Usuario inhabilitado en este proyecto:</strong>
+                  <p style={{ margin: '4px 0 0', fontSize: '0.85rem' }}>
+                    Has sido inhabilitado para cargar o modificar jornadas en este proyecto por un administrador.
+                  </p>
+                </div>
+              )}
 
               <form className="stack" onSubmit={submitEntry}>
                 <label>
@@ -3761,7 +3850,11 @@ export function DashboardPage() {
                   </label>
                 </div>
 
-                <button className="btn" type="submit" disabled={savingEntry}>
+                <button
+                  className="btn"
+                  type="submit"
+                  disabled={savingEntry || (!canAudit(currentProfile.role) && Boolean(currentProfile.projectDisabled))}
+                >
                   {savingEntry ? <><Spinner size={14} inline /> Guardando…</> : 'Guardar horario'}
                 </button>
               </form>
@@ -6269,18 +6362,76 @@ export function DashboardPage() {
           {userTab === 'APPROVED' && (
             <section className="card">
               <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '8px' }}>
-                <h2 style={{ margin: 0 }}>Usuarios aprobados</h2>
-                {canSeeProjectAdmin(currentProfile.role) && (
-                  <button
-                    className="btn-sm btn-outline"
-                    style={{ color: '#ef4444', borderColor: '#ef4444' }}
-                    onClick={() => { void handleDisableAllApprovedUsers() }}
-                    disabled={disableAllBusy}
-                    title="Inhabilita a todos los usuarios activos aprobados (excluye Superusuarios y tu propia cuenta)"
-                  >
-                    {disableAllBusy ? <><Spinner size={12} inline /> Inhabilitando…</> : '🚫 Inhabilitar todos los activos'}
-                  </button>
-                )}
+                <div>
+                  <h2 style={{ margin: 0 }}>Usuarios aprobados</h2>
+                  <p className="muted" style={{ margin: '2px 0 0', fontSize: '0.85rem' }}>
+                    {userProjectScope === 'CURRENT'
+                      ? `Proyecto activo: ${activeProjectName || 'Sin proyecto seleccionado'} (${scopedApprovedUsers.length} miembro${scopedApprovedUsers.length === 1 ? '' : 's'})`
+                      : `Todos los proyectos (${scopedApprovedUsers.length} miembro${scopedApprovedUsers.length === 1 ? '' : 's'})`}
+                  </p>
+                </div>
+                <div className="row" style={{ gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                  {profile?.role === 'SUPERUSER' && (
+                    <div style={{ display: 'inline-flex', borderRadius: 6, border: '1px solid var(--border-color)', overflow: 'hidden' }}>
+                      <button
+                        type="button"
+                        style={{
+                          background: userProjectScope === 'CURRENT' ? 'var(--primary)' : 'transparent',
+                          color: userProjectScope === 'CURRENT' ? '#fff' : 'inherit',
+                          border: 'none',
+                          padding: '4px 10px',
+                          fontSize: '0.8rem',
+                          cursor: 'pointer',
+                        }}
+                        onClick={() => setUserProjectScope('CURRENT')}
+                        title={`Filtrar solo los usuarios del proyecto activo (${activeProjectName || '—'})`}
+                      >
+                        Este proyecto
+                      </button>
+                      <button
+                        type="button"
+                        style={{
+                          background: userProjectScope === 'ALL' ? 'var(--primary)' : 'transparent',
+                          color: userProjectScope === 'ALL' ? '#fff' : 'inherit',
+                          border: 'none',
+                          padding: '4px 10px',
+                          fontSize: '0.8rem',
+                          cursor: 'pointer',
+                        }}
+                        onClick={() => setUserProjectScope('ALL')}
+                        title="Ver usuarios de todos los proyectos de la organización"
+                      >
+                        Todos ({approvedUsers.length})
+                      </button>
+                    </div>
+                  )}
+                  {canSeeProjectAdmin(currentProfile.role) && scopedApprovedUsers.some((u) => u.disabled) && (
+                    <button
+                      className="btn-sm btn-outline"
+                      style={{ color: '#10b981', borderColor: '#10b981' }}
+                      onClick={() => { void handleUnlockAllSystemDisabled() }}
+                      disabled={unlockAllBusy}
+                      title="Desbloquea las cuentas que tengan bloqueo global de sistema para que puedan iniciar sesión"
+                    >
+                      {unlockAllBusy ? <><Spinner size={12} inline /> Desbloqueando…</> : `🔓 Desbloquear cuentas (${scopedApprovedUsers.filter((u) => u.disabled).length})`}
+                    </button>
+                  )}
+                  {canSeeProjectAdmin(currentProfile.role) && (
+                    <button
+                      className="btn-sm btn-outline"
+                      style={{ color: '#ef4444', borderColor: '#ef4444' }}
+                      onClick={() => { void handleDisableAllApprovedUsers() }}
+                      disabled={disableAllBusy}
+                      title="Inhabilita a los usuarios activos del listado para cargar horas (excluye Superusuarios y tu propia cuenta)"
+                    >
+                      {disableAllBusy ? (
+                        <><Spinner size={12} inline /> Inhabilitando…</>
+                      ) : (
+                        userProjectScope === 'CURRENT' ? '🚫 Inhabilitar activos del proyecto' : '🚫 Inhabilitar todos los activos'
+                      )}
+                    </button>
+                  )}
+                </div>
               </div>
               {memberAreaConflicts.length > 0 && (
                 <div
@@ -6317,7 +6468,18 @@ export function DashboardPage() {
                 style={{ marginBottom: '0.75rem' }}
               />
               {filteredApprovedUsers.length === 0 ? (
-                <p className="muted">Sin resultados.</p>
+                userSearch.trim() ? (
+                  <p className="muted">Sin resultados para la búsqueda "{userSearch}".</p>
+                ) : userProjectScope === 'CURRENT' && scopedApprovedUsers.length === 0 ? (
+                  <div style={{ textAlign: 'center', padding: '2rem 1rem', background: 'var(--bg-accent, #f8fafc)', borderRadius: '8px', margin: '1rem 0', border: '1px dashed var(--border-color, #cbd5e1)' }}>
+                    <p style={{ fontSize: '1.05rem', fontWeight: 600, margin: '0 0 6px' }}>No hay usuarios aprobados en este proyecto aún</p>
+                    <p className="muted" style={{ margin: 0, fontSize: '0.88rem' }}>
+                      Cuando apruebes usuarios pendientes asignándolos a <strong>{activeProjectName || 'este proyecto'}</strong>, aparecerán aquí.
+                    </p>
+                  </div>
+                ) : (
+                  <p className="muted">Sin resultados.</p>
+                )
               ) : (
                 <div className="stack">
                   {filteredApprovedUsers.map((u) => (
@@ -6337,8 +6499,15 @@ export function DashboardPage() {
                           {u.isPlaceholder && (
                             <span className="chip" style={{ background: '#f97316', color: '#fff', fontSize: '0.72rem' }}>Sin primer acceso</span>
                           )}
+                          {u.projectDisabled && (
+                            <span className="chip" style={{ background: '#ef4444', color: '#fff', fontSize: '0.72rem' }} title="Inhabilitado para cargar horas en este proyecto">
+                              Inhabilitado en proyecto
+                            </span>
+                          )}
                           {u.disabled && (
-                            <span className="chip" style={{ background: '#ef4444', color: '#fff', fontSize: '0.72rem' }}>Inhabilitado</span>
+                            <span className="chip" style={{ background: '#7f1d1d', color: '#fff', fontSize: '0.72rem' }} title="Bloqueado a nivel sistema: no puede acceder a la aplicación">
+                              Bloqueo de sistema
+                            </span>
                           )}
                           {u.cycleMode === 'REINFORCEMENT' && (
                             <span className="chip" style={{ background: '#8b5cf6', color: '#fff', fontSize: '0.72rem' }}>Refuerzo</span>
@@ -6374,15 +6543,26 @@ export function DashboardPage() {
                         <button className="btn-sm btn-outline" onClick={() => openEditUser(u)}>Editar</button>
                         <button
                           className="btn-sm btn-outline"
-                          onClick={() => handleToggleUserDisabled(u)}
+                          onClick={() => void handleToggleUserProjectDisabled(u)}
                           disabled={u.uid === profile?.uid}
-                          title={u.uid === profile?.uid ? 'No podés inhabilitar tu propia cuenta' : ''}
+                          title={u.uid === profile?.uid ? 'No podés inhabilitar tu propia cuenta' : 'Habilita o inhabilita para cargar horas en este proyecto'}
                         >
-                          {u.disabled ? 'Rehabilitar' : 'Inhabilitar'}
+                          {u.projectDisabled ? 'Rehabilitar en proyecto' : 'Inhabilitar en proyecto'}
                         </button>
+                        {u.disabled && (
+                          <button
+                            className="btn-sm btn-outline"
+                            style={{ color: '#10b981', borderColor: '#10b981' }}
+                            onClick={() => void handleToggleUserGlobalDisabled(u)}
+                            disabled={u.uid === profile?.uid}
+                            title="Desbloquear acceso a la aplicación"
+                          >
+                            Desbloquear cuenta
+                          </button>
+                        )}
                         <button
                           className="btn-sm danger"
-                          onClick={() => handleDeleteApprovedUser(u)}
+                          onClick={() => void handleDeleteApprovedUser(u)}
                           disabled={u.uid === profile?.uid || u.role === 'SUPERUSER'}
                           title={
                             u.uid === profile?.uid

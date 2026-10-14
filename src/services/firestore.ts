@@ -838,10 +838,18 @@ export async function deleteUserProfileDeep(userId: string): Promise<{ deletedUi
   return { deletedUids: relatedUids }
 }
 
-/** Marca un usuario como inhabilitado / rehabilitado. */
+/** Marca un usuario como inhabilitado / rehabilitado a nivel de sistema (login). */
 export async function setUserDisabled(userId: string, disabled: boolean): Promise<void> {
   await updateDoc(doc(db, 'users', userId), {
     disabled,
+    updatedAt: serverTimestamp(),
+  })
+}
+
+/** Marca un usuario como inhabilitado / rehabilitado en su proyecto asignado (carga de horas). */
+export async function setUserProjectDisabled(userId: string, projectDisabled: boolean): Promise<void> {
+  await updateDoc(doc(db, 'users', userId), {
+    projectDisabled,
     updatedAt: serverTimestamp(),
   })
 }
@@ -3393,23 +3401,27 @@ export async function executeBulkRecalculateAllEntries(
 
 /**
  * Inhabilita masivamente a un listado de usuarios aprobados activos.
+ * Por defecto inhabilita a nivel de proyecto (projectDisabled: true), preservando
+ * el acceso global al sistema y a otros proyectos.
  * Exclusivo SUPERUSER. No toca jornadas ni configuración de proyectos.
  */
 export async function disableAllApprovedUsers(
   actor: { uid: string; displayName: string; email?: string | null },
   targetUids: string[],
+  options?: { projectOnly?: boolean; projectId?: string; projectName?: string },
 ): Promise<{ disabledCount: number }> {
   // Excluir al propio actor por seguridad absoluta
   const uidsToProcess = targetUids.filter((uid) => uid !== actor.uid)
   const BATCH_SIZE = 400
   let disabledCount = 0
+  const isProjectOnly = options?.projectOnly ?? true
 
   for (let i = 0; i < uidsToProcess.length; i += BATCH_SIZE) {
     const chunk = uidsToProcess.slice(i, i + BATCH_SIZE)
     const batch = writeBatch(db)
     for (const uid of chunk) {
       batch.update(doc(db, 'users', uid), {
-        disabled: true,
+        ...(isProjectOnly ? { projectDisabled: true } : { disabled: true }),
         updatedAt: serverTimestamp(),
       })
     }
@@ -3422,10 +3434,48 @@ export async function disableAllApprovedUsers(
     userId: actor.uid,
     userName: actor.displayName,
     email: actor.email ?? null,
-    details: `Inhabilitación masiva ejecutada: ${disabledCount} usuarios inhabilitados.`,
+    projectId: options?.projectId,
+    projectName: options?.projectName,
+    details: `Inhabilitación masiva ${isProjectOnly ? `en proyecto "${options?.projectName || options?.projectId || ''}"` : 'de sistema'} ejecutada: ${disabledCount} usuarios inhabilitados.`,
   })
 
   return { disabledCount }
+}
+
+/**
+ * Desbloquea masivamente el acceso de sistema (disabled: false) para los usuarios indicados.
+ * Útil para rehabilitar cuentas tras una inhabilitación global errónea.
+ * Exclusivo SUPERUSER.
+ */
+export async function unlockAllUsersSystemDisabled(
+  actor: { uid: string; displayName: string; email?: string | null },
+  targetUids: string[],
+): Promise<{ unlockedCount: number }> {
+  const BATCH_SIZE = 400
+  let unlockedCount = 0
+
+  for (let i = 0; i < targetUids.length; i += BATCH_SIZE) {
+    const chunk = targetUids.slice(i, i + BATCH_SIZE)
+    const batch = writeBatch(db)
+    for (const uid of chunk) {
+      batch.update(doc(db, 'users', uid), {
+        disabled: false,
+        updatedAt: serverTimestamp(),
+      })
+    }
+    await batch.commit()
+    unlockedCount += chunk.length
+  }
+
+  void writeSystemLog({
+    type: 'admin_bulk_disable_users',
+    userId: actor.uid,
+    userName: actor.displayName,
+    email: actor.email ?? null,
+    details: `Desbloqueo masivo de sistema ejecutado: ${unlockedCount} cuentas desbloqueadas.`,
+  })
+
+  return { unlockedCount }
 }
 
 /**

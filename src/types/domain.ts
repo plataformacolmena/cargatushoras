@@ -26,7 +26,8 @@ export interface UserProfile {
   mergedToUid?: string | null // UID real al que se migró este placeholder (null cuando aún no se reclamó)
   migratedFromUid?: string   // UID del placeholder del que proviene este perfil real
   auditReviewColor?: string  // color de revisión asignado por admin en reporte "sin informar"
-  disabled?: boolean         // true = inhabilitado por admin; no puede iniciar sesión
+  disabled?: boolean         // true = inhabilitado por admin a nivel sistema; no puede iniciar sesión
+  projectDisabled?: boolean  // true = inhabilitado en el proyecto asignado; no puede cargar horas
   createdAt?: unknown
   updatedAt?: unknown
 }
