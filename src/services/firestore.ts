@@ -63,7 +63,7 @@ import {
 } from 'firebase/firestore'
 import { getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage'
 import { db, storage } from '../firebase'
-import { calcEngancheExtras, calculateEntry, calculateSettlement, getDefaultProjectConfig } from '../lib/calc'
+import { calcEngancheExtras, calculateEntry, computeEntryCalculations, calculateSettlement, getDefaultProjectConfig } from '../lib/calc'
 import type {
   AppRole,
   AuditLock,
@@ -81,6 +81,7 @@ import type {
   Settlement,
   SystemLog,
   TimeEntry,
+  TimeEntryCalculation,
   TimeEntryInput,
   UserProfile,
   WorkCycle,
@@ -89,41 +90,12 @@ import type {
 const CALCULATION_VERSION = 'v1-client'
 
 /**
- * Id determin\u00edstico para `time_entries`: garantiza unicidad por
+ * Id determinístico para `time_entries`: garantiza unicidad por
  * (userId, projectId, workDate). El cliente preverifica con `getDoc` y las
- * reglas de Firestore tambi\u00e9n bloquean `create` si el doc existe.
- *
- * Nota: las entries antiguas (anteriores al deploy de unicidad) tienen ids
- * random; siguen funcionando pero no participan del bloqueo. La herramienta
- * de auditor\u00eda de duplicados las detecta y permite limpiarlas.
+ * reglas de Firestore también bloquean `create` si el doc existe.
  */
 function buildTimeEntryId(userId: string, projectId: string, workDate: string): string {
   return `${userId}_${projectId}_${workDate}`
-}
-
-/** Error tipado para "ya existe una jornada en esa fecha". */
-export class DuplicateTimeEntryError extends Error {
-  workDate: string
-  userId: string
-  constructor(workDate: string, userId: string) {
-    super(`Ya existe una jornada para ${userId} el ${workDate} en este proyecto.`)
-    this.name = 'DuplicateTimeEntryError'
-    this.workDate = workDate
-    this.userId = userId
-  }
-}
-
-// ─── Utilidad: elimina campos undefined (Firestore los rechaza) ──────────────
-function stripUndefined<T>(obj: T): T {
-  if (Array.isArray(obj)) return obj.map(stripUndefined) as unknown as T
-  if (obj !== null && typeof obj === 'object') {
-    return Object.fromEntries(
-      Object.entries(obj as object)
-        .filter(([, v]) => v !== undefined)
-        .map(([k, v]) => [k, stripUndefined(v)]),
-    ) as T
-  }
-  return obj
 }
 
 // ─── Debounce de recalculateUserEntries ───────────────────────────────────
@@ -166,6 +138,31 @@ export async function flushPendingRecalculations(): Promise<void> {
   await Promise.all(tasks)
 }
 
+/** Error tipado para "ya existe una jornada en esa fecha". */
+export class DuplicateTimeEntryError extends Error {
+  workDate: string
+  userId: string
+  constructor(workDate: string, userId: string) {
+    super(`Ya existe una jornada para ${userId} el ${workDate} en este proyecto.`)
+    this.name = 'DuplicateTimeEntryError'
+    this.workDate = workDate
+    this.userId = userId
+  }
+}
+
+// ─── Utilidad: elimina campos undefined (Firestore los rechaza) ──────────────
+function stripUndefined<T>(obj: T): T {
+  if (Array.isArray(obj)) return obj.map(stripUndefined) as unknown as T
+  if (obj !== null && typeof obj === 'object') {
+    return Object.fromEntries(
+      Object.entries(obj as object)
+        .filter(([, v]) => v !== undefined)
+        .map(([k, v]) => [k, stripUndefined(v)]),
+    ) as T
+  }
+  return obj
+}
+
 // ─── Cache en memoria para user_work_cycles ───────────────────────────────
 const WORK_CYCLES_TTL_MS = 5 * 60 * 1000
 interface WorkCyclesCacheEntry { data: WorkCycle[]; ts: number }
@@ -178,7 +175,6 @@ function invalidateWorkCyclesCache(projectId?: string): void {
     workCyclesCacheByProject.clear()
   }
 }
-
 
 // ---------- Validadores defensivos (defensa en profundidad) ----------
 // Las reglas de Firestore son la fuente de verdad de seguridad, pero
@@ -856,11 +852,6 @@ export async function listApprovedUsers(): Promise<UserProfile[]> {
   return users.sort((a, b) => (a.displayName ?? '').localeCompare(b.displayName ?? ''))
 }
 
-/**
- * Recalcula enganche/reenganche de todas las entradas no bloqueadas del usuario.
- * El reenganche se decide por el flag manual `isJornadaAdicional` de la jornada previa.
- * Se llama automáticamente tras guardar, editar o eliminar.
- */
 export async function recalculateUserEntries(projectId: string, userId: string): Promise<void> {
   // Limitar a 90 días: la lógica de streak solo necesita días consecutivos recientes.
   // Reduce lecturas drásticamente en usuarios con historial largo.
@@ -910,6 +901,8 @@ export async function recalculateUserEntries(projectId: string, userId: string):
       // Borrar campos derivados del ciclo (legado): ya no se usan.
       batch.update(doc(db, 'time_entries', entry.id), {
         calculation,
+        calculationSource: 'client',
+        calculationVersion: CALCULATION_VERSION,
         updatedAt: serverTimestamp(),
         cycleScope: deleteField(),
         cycleDayInWeek: deleteField(),
@@ -955,17 +948,30 @@ export async function updateTimeEntry(
     isJornadaAdicional: input.isJornadaAdicional,
   })
   const entryRef = doc(db, 'time_entries', entryId)
-  await updateDoc(entryRef, {
-    workDate: input.workDate,
-    shiftLabel: input.shiftLabel,
-    timeIn: input.timeIn,
-    timeOut: input.timeOut,
-    notes: input.notes,
-    penalties: input.penalties,
-    isJornadaAdicional: input.isJornadaAdicional,
-    calculation,
-    updatedAt: serverTimestamp(),
-  })
+  try {
+    await updateDoc(entryRef, {
+      workDate: input.workDate,
+      shiftLabel: input.shiftLabel,
+      timeIn: input.timeIn,
+      timeOut: input.timeOut,
+      notes: input.notes,
+      penalties: input.penalties,
+      isJornadaAdicional: input.isJornadaAdicional,
+      calculation,
+      calculationSource: 'client',
+      calculationVersion: CALCULATION_VERSION,
+      updatedAt: serverTimestamp(),
+    })
+  } catch (e) {
+    const code = (e as { code?: string }).code
+    // La regla `time_entries.update` exige que workDate no cambie. Si el cliente
+    // envió un workDate distinto al actual, el server responde permission-denied.
+    // Lo traducimos a un error tipado para que la UI muestre un mensaje específico.
+    if (code === 'permission-denied') {
+      throw new CannotChangeWorkDateError()
+    }
+    throw e
+  }
   if (actor) {
     void writeSystemLog({
       type: 'entry_edit',
@@ -979,6 +985,18 @@ export async function updateTimeEntry(
     })
   }
   scheduleRecalculateUserEntries(projectId, userId)
+}
+
+/**
+ * Error tipado para intentos de cambiar `workDate` en una entry existente.
+ * La regla Firestore bloquea esa transici\u00f3n (rompe el id determin\u00edstico
+ * y el bloqueo de duplicados). Para "cambiar fecha" hay que borrar y recrear.
+ */
+export class CannotChangeWorkDateError extends Error {
+  constructor() {
+    super('No se puede cambiar la fecha de una jornada existente. Eliminala y carg\u00e1 una nueva en la fecha correcta.')
+    this.name = 'CannotChangeWorkDateError'
+  }
 }
 
 export async function listProjectAreas(projectId: string): Promise<ProjectArea[]> {
@@ -1111,9 +1129,10 @@ export async function recalculateProjectEntries(
       const userNamePatch = currentUserName && currentUserName !== entry.userName
         ? { userName: currentUserName }
         : {}
-      // Borrar campos derivados del ciclo (legado): ya no se usan.
       batch.update(doc(db, 'time_entries', entry.id), {
         calculation,
+        calculationSource: 'client',
+        calculationVersion: CALCULATION_VERSION,
         ...userNamePatch,
         updatedAt: serverTimestamp(),
         cycleScope: deleteField(),
@@ -1211,6 +1230,15 @@ export async function previewSettlement(
     listProjectAreas(projectId),
   ])
 
+  // v2-raw: reconstruir c\u00e1lculos en cliente del admin desde datos crudos.
+  // Esto evita depender del campo `calculation` persistido (que ya no se
+  // escribe) y hace la liquidaci\u00f3n m\u00e1s robusta frente a cambios de config.
+  const userCycleModes = new Map<string, 'CYCLE' | 'REINFORCEMENT'>()
+  for (const user of projectUsers) {
+    userCycleModes.set(user.uid, user.cycleMode ?? 'CYCLE')
+  }
+  const calcMap = computeEntryCalculations(entries, config, userCycleModes)
+
   // Tarifa por hora:
   // 1) Si el rol tiene weeklyRate > 0 → Valor Jornada = weeklyRate / weeklyWorkDays
   // 2) Si no → Valor Jornada = dailyRate
@@ -1240,7 +1268,7 @@ export async function previewSettlement(
     dateFrom,
     dateTo,
     createdBy,
-  })
+  }, calcMap)
 }
 
 export async function saveSettlement(settlement: Settlement): Promise<Settlement> {
@@ -3143,4 +3171,219 @@ export async function migrateTimeEntryIds(): Promise<{
   }
 
   return { migrated, errors, skippedDueToConflict, skippedArchived, skippedInvalid }
+}
+
+// ── Recálculo masivo para toda la base de datos (Exclusivo SUPERUSER) ──────
+
+export interface BulkRecalcPreview {
+  totalScanned: number
+  missingCalculation: number
+  alreadyCalculated: number
+  archivedSkipped: number
+  lockedByAdminSkipped: number
+  toRecalculate: number
+  projectCount: number
+  userCount: number
+}
+
+export interface BulkRecalcOptions {
+  onlyMissing?: boolean
+  onProgress?: (progress: { processed: number; total: number; batchCount: number }) => void
+}
+
+export interface BulkRecalcResult {
+  updated: number
+  skipped: number
+  errors: number
+}
+
+/**
+ * Escanea toda la colección `time_entries` y genera un preview de cuántas
+ * jornadas carecen de cálculo guardado y cuántas se actualizarían.
+ */
+export async function previewBulkRecalculateAllEntries(
+  options: { onlyMissing?: boolean } = { onlyMissing: true },
+): Promise<BulkRecalcPreview> {
+  const snap = await getDocs(collection(db, 'time_entries'))
+  const totalScanned = snap.size
+  let missingCalculation = 0
+  let alreadyCalculated = 0
+  let archivedSkipped = 0
+  let lockedByAdminSkipped = 0
+  const projects = new Set<string>()
+  const users = new Set<string>()
+
+  for (const d of snap.docs) {
+    const data = d.data() as Partial<TimeEntry>
+    if (data.projectId) projects.add(data.projectId)
+    if (data.userId) users.add(data.userId)
+    if (data.archived) archivedSkipped++
+    if (data.lockedByAdmin) lockedByAdminSkipped++
+
+    const hasCalc =
+      data.calculation &&
+      typeof data.calculation === 'object' &&
+      typeof (data.calculation as TimeEntryCalculation).workedHours === 'number'
+    if (hasCalc) {
+      alreadyCalculated++
+    } else {
+      missingCalculation++
+    }
+  }
+
+  const toRecalculate = options.onlyMissing
+    ? missingCalculation
+    : Math.max(0, totalScanned - archivedSkipped)
+
+  return {
+    totalScanned,
+    missingCalculation,
+    alreadyCalculated,
+    archivedSkipped,
+    lockedByAdminSkipped,
+    toRecalculate,
+    projectCount: projects.size,
+    userCount: users.size,
+  }
+}
+
+/**
+ * Ejecuta el recálculo masivo y persistencia de `calculation` en toda la base de datos.
+ * Exclusivo para SUPERUSER.
+ * Agrupa las jornadas por (projectId, userId) para calcular con total precisión
+ * los descansos mínimos (12h), enganches, reenganches y racha de días consecutivos.
+ */
+export async function executeBulkRecalculateAllEntries(
+  actor: { uid: string; displayName: string; email?: string | null },
+  options: BulkRecalcOptions = { onlyMissing: true },
+): Promise<BulkRecalcResult> {
+  const [entriesSnap, usersSnap] = await Promise.all([
+    getDocs(collection(db, 'time_entries')),
+    getDocs(collection(db, 'users')),
+  ])
+
+  // Mapa de cycleMode por usuario
+  const userCycleModes = new Map<string, 'CYCLE' | 'REINFORCEMENT'>()
+  for (const d of usersSnap.docs) {
+    const u = d.data() as UserProfile
+    userCycleModes.set(u.uid, u.cycleMode ?? 'CYCLE')
+  }
+
+  // Cache de configs de proyecto para no re-leer el mismo proyecto múltiples veces
+  const projectConfigs = new Map<string, ProjectConfig>()
+  async function getConfig(projId: string): Promise<ProjectConfig> {
+    const cached = projectConfigs.get(projId)
+    if (cached) return cached
+    const cfg = await getProjectConfig(projId)
+    projectConfigs.set(projId, cfg)
+    return cfg
+  }
+
+  // Agrupar entries por `projectId::userId`
+  const grouped = new Map<string, Array<TimeEntry & { id: string }>>()
+  for (const d of entriesSnap.docs) {
+    const data = { id: d.id, ...d.data() } as TimeEntry & { id: string }
+    if (!data.projectId || !data.userId) continue
+    const key = `${data.projectId}::${data.userId}`
+    const list = grouped.get(key) ?? []
+    list.push(data)
+    grouped.set(key, list)
+  }
+
+  // Identificar qué entries deben actualizarse y pre-calcular
+  interface UpdateTarget {
+    id: string
+    calculation: TimeEntryCalculation
+  }
+  const toUpdate: UpdateTarget[] = []
+  let skipped = 0
+
+  for (const [key, userEntries] of grouped.entries()) {
+    const [projectId, userId] = key.split('::')
+    const config = await getConfig(projectId)
+
+    // Ordenar cronológicamente para que el streak y descansos de 12h sean consistentes
+    userEntries.sort((a, b) => {
+      const cmp = (a.workDate || '').localeCompare(b.workDate || '')
+      if (cmp !== 0) return cmp
+      return (a.timeIn || '').localeCompare(b.timeIn || '')
+    })
+
+    const entriesForExtras = userEntries.map((e) => ({
+      id: e.id,
+      userId: e.userId,
+      workDate: e.workDate,
+      timeIn: e.timeIn,
+      timeOut: e.timeOut,
+      isJornadaAdicional: e.isJornadaAdicional ?? false,
+    }))
+    const userCycleMap = new Map<string, 'CYCLE' | 'REINFORCEMENT'>([
+      [userId, userCycleModes.get(userId) ?? 'CYCLE'],
+    ])
+    const engancheMap = calcEngancheExtras(entriesForExtras, config, userCycleMap)
+
+    for (const entry of userEntries) {
+      if (entry.archived) {
+        skipped++
+        continue
+      }
+      const hasCalc =
+        entry.calculation &&
+        typeof entry.calculation === 'object' &&
+        typeof entry.calculation.workedHours === 'number'
+      if (options.onlyMissing && hasCalc) {
+        skipped++
+        continue
+      }
+
+      const extras = engancheMap.get(entry.id)
+      const calculation = calculateEntry(entry.timeIn, entry.timeOut, config, {
+        penalties: entry.penalties ?? 0,
+        isJornadaAdicional: entry.isJornadaAdicional ?? false,
+        engancheExtraHours: extras?.enganche ?? 0,
+        reengancheExtraHours: extras?.reenganche ?? 0,
+      })
+
+      toUpdate.push({ id: entry.id, calculation })
+    }
+  }
+
+  let updated = 0
+  let errors = 0
+  const total = toUpdate.length
+
+  // Ejecutar escrituras en batches de 400
+  const BATCH_SIZE = 400
+  let batchCount = 0
+  for (let i = 0; i < total; i += BATCH_SIZE) {
+    const chunk = toUpdate.slice(i, i + BATCH_SIZE)
+    const batch = writeBatch(db)
+    for (const item of chunk) {
+      batch.update(doc(db, 'time_entries', item.id), {
+        calculation: item.calculation,
+        calculationSource: 'client',
+        calculationVersion: CALCULATION_VERSION,
+        updatedAt: serverTimestamp(),
+      })
+    }
+    try {
+      await batch.commit()
+      updated += chunk.length
+      batchCount++
+      options.onProgress?.({ processed: updated, total, batchCount })
+    } catch (err) {
+      if (import.meta.env.DEV) console.error('[executeBulkRecalculateAllEntries] batch error:', err)
+      errors += chunk.length
+    }
+  }
+
+  void writeSystemLog({
+    type: 'admin_bulk_recalc',
+    userId: actor.uid,
+    userName: actor.displayName,
+    email: actor.email ?? null,
+    details: `Recálculo masivo ejecutado: ${updated} actualizadas, ${skipped} saltadas, ${errors} errores (onlyMissing=${options.onlyMissing ?? true})`,
+  })
+
+  return { updated, skipped, errors }
 }

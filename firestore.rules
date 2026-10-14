@@ -139,30 +139,30 @@ service cloud.firestore {
       ) && (
         (isApproved() &&
           request.resource.data.userId == request.auth.uid &&
-          request.resource.data.calculationSource == 'client' &&
-          request.resource.data.calculationVersion == 'v1-client' &&
           request.resource.data.lockedByAdmin == false) ||
-        (isAdminRole() &&
-          request.resource.data.calculationSource == 'client' &&
-          request.resource.data.calculationVersion == 'v1-client')
+        isAdminRole()
       );
 
       allow update: if (
         // Bloqueo total: las jornadas archivadas son inmutables (excepto para SUPERUSER).
         resource.data.get('archived', false) == false || isSuperUser()
+      ) && (
+        // workDate es parte del id determin\u00edstico de la entry. Cambiarlo
+        // dejar\u00eda el id stale y rompe el bloqueo de duplicados. Para
+        // "cambiar la fecha" hay que borrar y recrear la entry. Aplica a
+        // todos los roles, incluido SUPERUSER.
+        request.resource.data.workDate == resource.data.workDate
       ) && ((isAdminRole() && (
-        // Defensa en profundidad: si se cambia el color de revisión, debe estar en el set permitido.
+        // Defensa en profundidad: si se cambia el color de revisi\u00f3n, debe estar en el set permitido.
         !('reviewColor' in request.resource.data) ||
         request.resource.data.reviewColor in ['', 'green', 'yellow', 'red', 'orange', 'blue']
       )) || (
         isApproved() &&
         resource.data.userId == request.auth.uid &&
         resource.data.lockedByAdmin == false &&
-        resource.data.get('lockedByAudit', false) == false &&
-        request.resource.data.calculationSource == resource.data.calculationSource &&
-        request.resource.data.calculationVersion == resource.data.calculationVersion
+        resource.data.get('lockedByAudit', false) == false
       ) || (
-        // Migración de placeholder: reasignar entradas al UID real del usuario
+        // Migraci\u00f3n de placeholder: reasignar entradas al UID real del usuario
         isApproved() &&
         resource.data.lockedByAdmin == false &&
         request.resource.data.userId == request.auth.uid &&

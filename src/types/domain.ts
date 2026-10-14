@@ -324,7 +324,7 @@ export interface ChatThreadCreateInput {
 
 // ─── Registros del sistema ────────────────────────────────────────────────────
 
-export type SystemLogType = 'entry_create' | 'entry_edit' | 'entry_delete' | 'user_login'
+export type SystemLogType = 'entry_create' | 'entry_edit' | 'entry_delete' | 'user_login' | 'admin_bulk_recalc'
 
 export interface SystemLog {
   id: string

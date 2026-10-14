@@ -33,7 +33,6 @@ import {
   listProjectTemplates,
   listSettlements,
   previewSettlement,
-  recalculateProjectEntries,
   saveSettlement,
   saveProjectConfig,
   syncUserAreasToEntries,
@@ -62,9 +61,15 @@ import {
   deduplicateTimeEntries,
   type DuplicateAuditReport,
   DuplicateTimeEntryError,
+  recalculateProjectEntries,
+  recalculateUserEntries,
+  previewBulkRecalculateAllEntries,
+  executeBulkRecalculateAllEntries,
+  type BulkRecalcPreview,
   previewTimeEntryIdMigration,
   migrateTimeEntryIds,
   type IdMigrationPreview,
+  CannotChangeWorkDateError,
   setMaintenanceMode,
   listProjectUsers,
   subscribeToProjects,
@@ -79,7 +84,6 @@ import {
   updateProjectRole,
   updateTimeEntry,
   updateUserProfileAdmin,
-  recalculateUserEntries,
   createReminder,
   deleteReminder,
   listRemindersForUser,
@@ -93,6 +97,7 @@ import {
   resolveEmailRecoveryRequest,
   dismissEmailRecoveryRequest,
 } from '../services/firestore'
+import { computeEntryCalculations } from '../lib/calc'
 
 
 
@@ -112,6 +117,7 @@ import type {
   Settlement,
   SystemLog,
   TimeEntry,
+  TimeEntryCalculation,
   TimeEntryInput,
   UserProfile,
 } from '../types/domain'
@@ -197,7 +203,40 @@ function isLongEngancheEntry(
   return eng >= threshold || reeng >= threshold
 }
 
-function downloadEntriesCSV(entries: TimeEntry[], downloader: UserProfile, areas: ProjectArea[]) {
+// ─── Reconstrucción defensiva de cálculos ──────────────────────────────────
+// En el modelo estándar, `calculation` viene persistido en cada `time_entry`.
+// Si un registro antiguo aún no fue recalculado y carece de `calculation`,
+// `enrichWithCalc` lo reconstruye defensivamente en cliente usando `computeEntryCalculations`
+// para evitar que la UI falle mientras se ejecuta el recálculo masivo.
+
+const ZERO_CALC: TimeEntryCalculation = {
+  workedHours: 0, regularHours: 0, overtimeHours: 0, nightHours: 0,
+  nightOvertimeHours: 0, penaltyHours: 0, engancheExtraHours: 0,
+  reengancheExtraHours: 0, extraPayUnits: 0,
+}
+
+type EnrichedEntry = TimeEntry & { calculation: TimeEntryCalculation }
+
+function enrichWithCalc(
+  list: TimeEntry[],
+  config: ProjectConfig | null,
+  cycleModes: Map<string, 'CYCLE' | 'REINFORCEMENT'>,
+): EnrichedEntry[] {
+  if (!list.length) return []
+  const hasMissing = list.some(
+    (e) => !e.calculation || typeof e.calculation.workedHours !== 'number',
+  )
+  if (!hasMissing) {
+    return list as EnrichedEntry[]
+  }
+  if (!config) {
+    return list.map((e) => ({ ...e, calculation: e.calculation ?? ZERO_CALC }))
+  }
+  const map = computeEntryCalculations(list, config, cycleModes)
+  return list.map((e) => ({ ...e, calculation: e.calculation ?? map.get(e.id) ?? ZERO_CALC }))
+}
+
+function downloadEntriesCSV(entries: EnrichedEntry[], downloader: UserProfile, areas: ProjectArea[]) {
   const areaName = areas.find((a) => a.id === downloader.areaId)?.name ?? 'Todas las áreas'
   const downloadedAt = new Date().toLocaleString('es-UY', { timeZone: 'America/Montevideo' })
   const userName = downloader.displayName ?? downloader.email ?? downloader.uid
@@ -409,6 +448,15 @@ export function DashboardPage() {
   // Modal de archivar liquidación (paso 2: pegar link de Drive)
   const [archiveModal, setArchiveModal] = useState<{ settlement: Settlement; fileName: string; driveUrl: string; busy: boolean } | null>(null)
   const [rangeOpBusy, setRangeOpBusy] = useState(false)
+
+  // ── Modal de recálculo masivo en toda la BD (Exclusivo SUPERUSER) ──
+  const [bulkRecalcModalOpen, setBulkRecalcModalOpen] = useState(false)
+  const [bulkRecalcPreview, setBulkRecalcPreview] = useState<BulkRecalcPreview | null>(null)
+  const [bulkRecalcScanning, setBulkRecalcScanning] = useState(false)
+  const [bulkRecalcExecuting, setBulkRecalcExecuting] = useState(false)
+  const [bulkRecalcOnlyMissing, setBulkRecalcOnlyMissing] = useState(true)
+  const [bulkRecalcProgress, setBulkRecalcProgress] = useState<{ processed: number; total: number; batchCount: number } | null>(null)
+  const [bulkRecalcResult, setBulkRecalcResult] = useState<{ updated: number; skipped: number; errors: number } | null>(null)
 
   // Auditoría: usuarios sin informar
   const [noReportFilters, setNoReportFilters] = useState<{ dateFrom: string; dateTo: string; areaId: string }>({ dateFrom: '', dateTo: '', areaId: '' })
@@ -691,12 +739,25 @@ export function DashboardPage() {
   }, [activeProjectId, statsDateFrom, statsDateTo, statsSelectedAreas, statsLoading])
 
   // Datos agrupados por usuario
+  // ─── v2-raw: cálculo en cliente (cycleMode por uid) ────────────────
+  // Necesario para computar enganche/reenganche al renderizar.
+  const userCycleModesMap = useMemo(() => {
+    const m = new Map<string, 'CYCLE' | 'REINFORCEMENT'>()
+    for (const u of approvedUsers) m.set(u.uid, u.cycleMode ?? 'CYCLE')
+    if (profile && !m.has(profile.uid)) m.set(profile.uid, profile.cycleMode ?? 'CYCLE')
+    return m
+  }, [approvedUsers, profile])
+
+  const statsEntriesEnriched = useMemo(
+    () => enrichWithCalc(statsEntries, projectConfig, userCycleModesMap),
+    [statsEntries, projectConfig, userCycleModesMap],
+  )
   const statsByUser = useMemo(() => {
     const map = new Map<string, {
       userId: string; userName: string; areaName: string
       jornadas: number; worked: number; regular: number; overtime: number; night: number; extras: number
     }>()
-    for (const e of statsEntries) {
+    for (const e of statsEntriesEnriched) {
       const key = e.userId
       const existing = map.get(key)
       const areaName = e.areaId ? (areas.find((a) => a.id === e.areaId)?.name ?? 'Sin área') : 'Sin área'
@@ -724,13 +785,13 @@ export function DashboardPage() {
       }
     }
     return [...map.values()].sort((a, b) => b.worked - a.worked)
-  }, [statsEntries, areas])
+  }, [statsEntriesEnriched, areas])
 
   // Datos agrupados por área
   const statsByArea = useMemo(() => {
     const map = new Map<string, { areaId: string; areaName: string; jornadas: number; worked: number; extras: number }>()
-    const total = statsEntries.reduce((s, e) => s + e.calculation.workedHours, 0)
-    for (const e of statsEntries) {
+    const total = statsEntriesEnriched.reduce((s, e) => s + e.calculation.workedHours, 0)
+    for (const e of statsEntriesEnriched) {
       const key = e.areaId ?? '__none__'
       const areaName = e.areaId ? (areas.find((a) => a.id === e.areaId)?.name ?? 'Sin área') : 'Sin área'
       const extras = (e.calculation.overtimeHours ?? 0) + (e.calculation.engancheExtraHours ?? 0) + (e.calculation.reengancheExtraHours ?? 0)
@@ -746,12 +807,12 @@ export function DashboardPage() {
     return [...map.values()]
       .sort((a, b) => b.worked - a.worked)
       .map((r) => ({ ...r, pct: total > 0 ? Math.round((r.worked / total) * 1000) / 10 : 0 }))
-  }, [statsEntries, areas])
+  }, [statsEntriesEnriched, areas])
 
   // Datos agrupados por semana (YYYY-WW)
   const statsByDate = useMemo(() => {
     const map = new Map<string, { week: string; label: string; worked: number; extras: number }>()
-    for (const e of statsEntries) {
+    for (const e of statsEntriesEnriched) {
       const d = new Date(e.workDate + 'T12:00:00')
       const startOfYear = new Date(d.getFullYear(), 0, 1)
       const week = Math.ceil(((d.getTime() - startOfYear.getTime()) / 86400000 + startOfYear.getDay() + 1) / 7)
@@ -767,7 +828,7 @@ export function DashboardPage() {
       }
     }
     return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([, v]) => v)
-  }, [statsEntries])
+  }, [statsEntriesEnriched])
 
   function downloadStatsXlsx() {
     if (statsEntries.length === 0) return
@@ -980,11 +1041,23 @@ export function DashboardPage() {
     [memberAreaConflicts],
   )
 
+  // Entries enriquecidas con `calculation` reconstruido en cliente.
+  // Si projectConfig no est\u00e1 cargado, cae al `calculation` legacy
+  // persistido (entries pre v2-raw) o a un calc en cero.
+  const entriesEnriched = useMemo(
+    () => enrichWithCalc(entries, projectConfig, userCycleModesMap),
+    [entries, projectConfig, userCycleModesMap],
+  )
+  const auditEntriesEnriched = useMemo(
+    () => enrichWithCalc(auditEntries, projectConfig, userCycleModesMap),
+    [auditEntries, projectConfig, userCycleModesMap],
+  )
+
   // ─── Filtro de búsqueda de Horarios del proyecto ────────────────────────
   const filteredEntries = useMemo(() => {
     const q = entrySearch.trim().toLowerCase()
-    if (!q) return entries
-    return entries.filter((e) => {
+    if (!q) return entriesEnriched
+    return entriesEnriched.filter((e) => {
       const hay = [
         e.userName,
         e.workDate,
@@ -995,14 +1068,14 @@ export function DashboardPage() {
       ].join(' ').toLowerCase()
       return hay.includes(q)
     })
-  }, [entries, entrySearch])
+  }, [entriesEnriched, entrySearch])
 
   // ─── Paginación ─────────────────────────────────────────────────────────
   const entriesPagination = usePagedItems(filteredEntries, 25)
 
   const sortedAuditEntries = useMemo(() => {
     const { col, dir } = auditSort
-    return [...auditEntries].sort((a, b) => {
+    return [...auditEntriesEnriched].sort((a, b) => {
       let va: number | string = 0
       let vb: number | string = 0
       if (col === 'workDate') { va = a.workDate; vb = b.workDate }
@@ -1038,7 +1111,7 @@ export function DashboardPage() {
       const cmp = va < vb ? -1 : 1
       return dir === 'asc' ? cmp : -cmp
     })
-  }, [auditEntries, auditSort, areas, projectUsers, projectRoles])
+  }, [auditEntriesEnriched, auditSort, areas, projectUsers, projectRoles])
 
   const sortedPastSettlements = useMemo(() => {
     const { col, dir } = settlementsSort
@@ -1325,8 +1398,12 @@ export function DashboardPage() {
 
     // Hoja 2: Detalle (todas las jornadas del rango)
     const allEntries = await listAllTimeEntries(s.projectId, { dateFrom: s.dateFrom, dateTo: s.dateTo })
+    // v2-raw: reconstruir calc en cliente del admin desde datos crudos.
+    const archiveCalcMap = projectConfig
+      ? computeEntryCalculations(allEntries, projectConfig, userCycleModesMap)
+      : new Map<string, TimeEntryCalculation>()
     const detalleRows = allEntries.map((e) => {
-      const calc = e.calculation
+      const calc = archiveCalcMap.get(e.id) ?? e.calculation ?? ZERO_CALC
       const area = areas.find((a) => a.id === e.areaId)
       return {
         Fecha: e.workDate,
@@ -1681,7 +1758,11 @@ export function DashboardPage() {
       showToast('Jornada actualizada.')
       void loadEntries()
     } catch (err) {
-      showToast('Error al actualizar.', 'error')
+      if (err instanceof CannotChangeWorkDateError) {
+        showToast(err.message, 'error')
+      } else {
+        showToast('Error al actualizar.', 'error')
+      }
       console.error(err)
     } finally {
       setSavingEditEntry(false)
@@ -2068,7 +2149,7 @@ export function DashboardPage() {
 
   async function runRangeOp() {
     if (!rangeOpModal) return
-    const { op, dateFrom, dateTo } = rangeOpModal
+    const { dateFrom, dateTo } = rangeOpModal
     if (!dateFrom || !dateTo) {
       showToast('Indicá un rango de fechas.', 'error')
       return
@@ -2079,34 +2160,85 @@ export function DashboardPage() {
     }
     setRangeOpBusy(true)
     try {
-      if (op === 'RECALC') {
+      if (rangeOpModal.op === 'RECALC') {
         const count = await recalculateProjectEntries(activeProjectId, lockedRanges, { dateFrom, dateTo })
-        showToast(`${count} registro${count !== 1 ? 's' : ''} recalculado${count !== 1 ? 's' : ''}.`)
-        // Refrescar automáticamente el preview de liquidación si hay uno pendiente
-        if (currentSettlement && !isSettlementSaved) {
-          try {
-            const proj = projects.find((p) => p.id === activeProjectId)
-            const refreshed = await previewSettlement(
-              activeProjectId,
-              proj?.name ?? 'Proyecto',
-              currentSettlement.dateFrom,
-              currentSettlement.dateTo,
-              currentProfile.uid,
-            )
-            setCurrentSettlement(refreshed)
-            setEditableLines(refreshed.lines)
-          } catch (_e) { /* no bloquear si el refresh falla */ }
-        }
+        showToast(count > 0 ? `${count} registro${count !== 1 ? 's' : ''} recalculado${count !== 1 ? 's' : ''}.` : 'No hay registros para recalcular.')
+        await loadAuditEntries()
       } else {
         const count = await syncUserAreasToEntries(activeProjectId, lockedRanges, { dateFrom, dateTo })
         showToast(count > 0 ? `${count} registro${count !== 1 ? 's' : ''} actualizado${count !== 1 ? 's' : ''} con el área actual.` : 'No hay registros que actualizar.')
       }
       setRangeOpModal(null)
     } catch (err) {
-      showToast(op === 'RECALC' ? 'Error al recalcular.' : 'Error al sincronizar áreas.', 'error')
+      showToast(rangeOpModal.op === 'RECALC' ? 'Error al recalcular registros.' : 'Error al sincronizar áreas.', 'error')
       console.error(err)
     } finally {
       setRangeOpBusy(false)
+    }
+  }
+
+  async function handleBulkRecalcScan() {
+    setBulkRecalcScanning(true)
+    setBulkRecalcResult(null)
+    setBulkRecalcProgress(null)
+    try {
+      const preview = await previewBulkRecalculateAllEntries({ onlyMissing: bulkRecalcOnlyMissing })
+      setBulkRecalcPreview(preview)
+      showToast(`Escaneo completado: ${preview.toRecalculate} jornadas a procesar de ${preview.totalScanned}.`, 'info')
+    } catch (err) {
+      showToast('Error al analizar la base de datos.', 'error')
+      console.error('[handleBulkRecalcScan] error:', err)
+    } finally {
+      setBulkRecalcScanning(false)
+    }
+  }
+
+  async function handleBulkRecalcExecute() {
+    if (!bulkRecalcPreview) return
+    const toRecalc = bulkRecalcPreview.toRecalculate
+    if (toRecalc === 0) {
+      showToast('No hay registros pendientes de cálculo.', 'info')
+      return
+    }
+    if (!window.confirm(
+      `¿Ejecutar recálculo masivo en toda la base de datos?\n\n` +
+      `Jornadas a actualizar: ${toRecalc}\n` +
+      `Modo: ${bulkRecalcOnlyMissing ? 'Solo registros sin cálculos' : 'Todos los registros no archivados'}\n\n` +
+      `Esta acción persistirá los cálculos en Firestore lote por lote. ¿Continuar?`
+    )) {
+      return
+    }
+
+    setBulkRecalcExecuting(true)
+    setBulkRecalcProgress({ processed: 0, total: toRecalc, batchCount: 0 })
+    try {
+      const result = await executeBulkRecalculateAllEntries(
+        {
+          uid: currentProfile.uid,
+          displayName: currentProfile.displayName || 'Superuser',
+          email: currentProfile.email,
+        },
+        {
+          onlyMissing: bulkRecalcOnlyMissing,
+          onProgress: (prog) => {
+            setBulkRecalcProgress({
+              processed: prog.processed,
+              total: prog.total,
+              batchCount: prog.batchCount,
+            })
+          },
+        },
+      )
+      setBulkRecalcResult(result)
+      showToast(`Recálculo masivo finalizado: ${result.updated} jornadas actualizadas con éxito.`, 'success')
+      // Refrescar vistas locales
+      void loadAuditEntries()
+      void loadEntries()
+    } catch (err) {
+      showToast('Error al ejecutar el recálculo masivo.', 'error')
+      console.error('[handleBulkRecalcExecute] error:', err)
+    } finally {
+      setBulkRecalcExecuting(false)
     }
   }
 
@@ -2147,9 +2279,7 @@ export function DashboardPage() {
         projectId: editUserForm.projectId || undefined,
         cycleMode: newCycleMode,
       })
-      // Si cambió el modo de ciclo, recalcular las jornadas previas del usuario
-      // para que reflejen el nuevo cálculo de enganche/reenganche.
-      if (previousCycleMode !== newCycleMode && targetProjectId) {
+      if (targetProjectId && newCycleMode !== previousCycleMode) {
         try {
           await recalculateUserEntries(targetProjectId, editingUser.uid)
         } catch (recalcErr) {
@@ -3342,7 +3472,7 @@ export function DashboardPage() {
                   {entries.length > 0 && (
                     <button
                       className="btn btn-outline"
-                      onClick={() => downloadEntriesCSV(entries, currentProfile, areas)}
+                      onClick={() => downloadEntriesCSV(entriesEnriched, currentProfile, areas)}
                       title="Descargar registros como CSV"
                     >
                       Descargar CSV ({entries.length})
@@ -3761,6 +3891,21 @@ export function DashboardPage() {
                   >
                     Sincronizar áreas…
                   </button>
+                  {canSeeProjectAdmin(currentProfile.role) && (
+                    <button
+                      className="btn"
+                      style={{ background: '#7c3aed', color: '#fff', borderColor: '#7c3aed' }}
+                      onClick={() => {
+                        setBulkRecalcModalOpen(true)
+                        setBulkRecalcPreview(null)
+                        setBulkRecalcProgress(null)
+                        setBulkRecalcResult(null)
+                      }}
+                      title="Herramienta exclusiva de Superuser: escanea y calcula masivamente en toda la base de datos"
+                    >
+                      ⚡ Recálculo masivo BD (Superuser)
+                    </button>
+                  )}
                   <button
                     className="btn"
                     onClick={() => {
@@ -4330,10 +4475,10 @@ export function DashboardPage() {
                   <div className="row" style={{ gap: '1rem', flexWrap: 'wrap', marginBottom: '1.25rem' }}>
                     {[
                       { label: 'Jornadas', value: statsEntries.length },
-                      { label: 'Hs. trabajadas', value: statsEntries.reduce((s, e) => Math.round((s + e.calculation.workedHours) * 100) / 100, 0) },
-                      { label: 'Hs. regulares', value: statsEntries.reduce((s, e) => Math.round((s + e.calculation.regularHours) * 100) / 100, 0) },
-                      { label: 'Hs. extras', value: statsEntries.reduce((s, e) => Math.round((s + (e.calculation.overtimeHours ?? 0) + (e.calculation.engancheExtraHours ?? 0) + (e.calculation.reengancheExtraHours ?? 0)) * 100) / 100, 0) },
-                      { label: 'Hs. nocturnas', value: statsEntries.reduce((s, e) => Math.round((s + (e.calculation.nightHours ?? 0)) * 100) / 100, 0) },
+                      { label: 'Hs. trabajadas', value: statsEntriesEnriched.reduce((s, e) => Math.round((s + e.calculation.workedHours) * 100) / 100, 0) },
+                      { label: 'Hs. regulares', value: statsEntriesEnriched.reduce((s, e) => Math.round((s + e.calculation.regularHours) * 100) / 100, 0) },
+                      { label: 'Hs. extras', value: statsEntriesEnriched.reduce((s, e) => Math.round((s + (e.calculation.overtimeHours ?? 0) + (e.calculation.engancheExtraHours ?? 0) + (e.calculation.reengancheExtraHours ?? 0)) * 100) / 100, 0) },
+                      { label: 'Hs. nocturnas', value: statsEntriesEnriched.reduce((s, e) => Math.round((s + (e.calculation.nightHours ?? 0)) * 100) / 100, 0) },
                     ].map((kpi) => (
                       <div key={kpi.label} style={{ background: 'var(--surface, #f8fafc)', border: '1px solid var(--border, #e2e8f0)', borderRadius: '8px', padding: '0.6rem 1rem', minWidth: '110px', textAlign: 'center' }}>
                         <div style={{ fontSize: '1.4em', fontWeight: 700 }}>{kpi.value}</div>
@@ -6051,6 +6196,125 @@ export function DashboardPage() {
         </div>
       )}
 
+      {/* === MODAL: Recálculo masivo en toda la BD (Exclusivo SUPERUSER) === */}
+      {bulkRecalcModalOpen && (
+        <div className="modal-overlay" onClick={() => { if (!bulkRecalcExecuting) setBulkRecalcModalOpen(false) }}>
+          <div className="modal" style={{ maxWidth: '640px' }} onClick={(e) => e.stopPropagation()}>
+            <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0, color: '#7c3aed' }}>⚡ Recálculo masivo en toda la base de datos</h3>
+              <span className="chip" style={{ background: '#ede9fe', color: '#6d28d9', fontWeight: 600 }}>SUPERUSER</span>
+            </div>
+            <p className="muted" style={{ fontSize: '0.85rem', marginTop: '0.5rem' }}>
+              Esta herramienta recorre toda la colección <code>time_entries</code> en Firestore, calcula las horas (regulares, extras, nocturnas, penalidades y enganche/reenganche correlativo) usando la configuración vigente de cada proyecto y el ciclo de cada usuario, y persiste el resultado en la base de datos.
+            </p>
+
+            <div style={{ background: 'var(--surface, #f8fafc)', border: '1px solid var(--border, #e2e8f0)', borderRadius: '8px', padding: '0.85rem', margin: '0.75rem 0' }}>
+              <div style={{ fontWeight: 600, fontSize: '0.9rem', marginBottom: '0.5rem' }}>Alcance del recálculo:</div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', marginBottom: '6px' }}>
+                <input
+                  type="radio"
+                  name="bulkRecalcScope"
+                  checked={bulkRecalcOnlyMissing}
+                  onChange={() => {
+                    setBulkRecalcOnlyMissing(true)
+                    setBulkRecalcPreview(null)
+                  }}
+                  disabled={bulkRecalcExecuting || bulkRecalcScanning}
+                />
+                <span><strong>Solo registros sin cálculos guardados</strong> (Recomendado para migrar jornadas faltantes sin sobreescribir las ya calculadas)</span>
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                <input
+                  type="radio"
+                  name="bulkRecalcScope"
+                  checked={!bulkRecalcOnlyMissing}
+                  onChange={() => {
+                    setBulkRecalcOnlyMissing(false)
+                    setBulkRecalcPreview(null)
+                  }}
+                  disabled={bulkRecalcExecuting || bulkRecalcScanning}
+                />
+                <span><strong>Todos los registros activos de la base</strong> (Re-procesa todas las jornadas no archivadas con las configuraciones actuales)</span>
+              </label>
+            </div>
+
+            <div className="row" style={{ gap: '8px', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
+              <button
+                className="btn btn-outline"
+                onClick={() => { void handleBulkRecalcScan() }}
+                disabled={bulkRecalcScanning || bulkRecalcExecuting}
+              >
+                {bulkRecalcScanning ? <><Spinner size={14} inline /> Analizando base de datos…</> : '1. Analizar base de datos (Preview)'}
+              </button>
+
+              {bulkRecalcPreview && (
+                <button
+                  className="btn"
+                  style={{ background: '#7c3aed', color: '#fff', borderColor: '#7c3aed' }}
+                  onClick={() => { void handleBulkRecalcExecute() }}
+                  disabled={bulkRecalcExecuting || bulkRecalcScanning || bulkRecalcPreview.toRecalculate === 0}
+                >
+                  {bulkRecalcExecuting ? <><Spinner size={14} inline /> Ejecutando recálculo…</> : `2. Ejecutar recálculo (${bulkRecalcPreview.toRecalculate} jornadas)`}
+                </button>
+              )}
+            </div>
+
+            {bulkRecalcPreview && (
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+                <span className="chip">Total escaneadas: <strong>{bulkRecalcPreview.totalScanned}</strong></span>
+                <span className="chip" style={{ background: bulkRecalcPreview.missingCalculation > 0 ? '#fef3c7' : '#dcfce7', color: bulkRecalcPreview.missingCalculation > 0 ? '#92400e' : '#166534' }}>
+                  Sin cálculo guardado: <strong>{bulkRecalcPreview.missingCalculation}</strong>
+                </span>
+                <span className="chip" style={{ background: '#dcfce7', color: '#166534' }}>
+                  Ya calculadas: <strong>{bulkRecalcPreview.alreadyCalculated}</strong>
+                </span>
+                <span className="chip" style={{ background: '#e5e7eb', color: '#374151' }}>
+                  Archivadas (se omiten): <strong>{bulkRecalcPreview.archivedSkipped}</strong>
+                </span>
+                <span className="chip">Proyectos: <strong>{bulkRecalcPreview.projectCount}</strong></span>
+                <span className="chip" style={{ background: '#ede9fe', color: '#6d28d9', fontWeight: 600 }}>
+                  A actualizar: <strong>{bulkRecalcPreview.toRecalculate}</strong>
+                </span>
+              </div>
+            )}
+
+            {bulkRecalcProgress && (
+              <div style={{ margin: '0.75rem 0', padding: '0.75rem', background: '#f3f4f6', borderRadius: '6px' }}>
+                <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '4px' }}>
+                  Progreso: {bulkRecalcProgress.processed} / {bulkRecalcProgress.total} jornadas (Lote {bulkRecalcProgress.batchCount})
+                </div>
+                <div style={{ width: '100%', height: '8px', background: '#e5e7eb', borderRadius: '4px', overflow: 'hidden' }}>
+                  <div
+                    style={{
+                      width: `${Math.min(100, Math.round((bulkRecalcProgress.processed / (bulkRecalcProgress.total || 1)) * 100))}%`,
+                      height: '100%',
+                      background: '#7c3aed',
+                      transition: 'width 0.3s ease',
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {bulkRecalcResult && (
+              <div style={{ margin: '0.75rem 0', padding: '0.75rem', background: '#ecfdf5', border: '1px solid #a7f3d0', borderRadius: '6px', color: '#065f46', fontSize: '0.85rem' }}>
+                ✓ <strong>Finalizado:</strong> {bulkRecalcResult.updated} jornadas actualizadas con éxito en Firestore. ({bulkRecalcResult.skipped} omitidas, {bulkRecalcResult.errors} errores).
+              </div>
+            )}
+
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: '1rem' }}>
+              <button
+                className="btn btn-outline"
+                onClick={() => setBulkRecalcModalOpen(false)}
+                disabled={bulkRecalcExecuting}
+              >
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* === MODAL: Archivar liquidación — pegar link de Drive === */}
       {archiveModal && (
         <div className="modal-overlay" onClick={() => { if (!archiveModal.busy) setArchiveModal(null) }}>
@@ -6120,7 +6384,16 @@ export function DashboardPage() {
             <h3>Editar jornada</h3>
             <form className="stack" onSubmit={(e) => { void submitEditEntry(e) }}>
               <label>Fecha
-                <input type="date" value={editEntryForm.workDate} max={!canAudit(currentProfile.role) ? (getMaxWorkDate(projectConfig?.futureDatePolicy) ?? undefined) : undefined} onChange={(e) => setEditEntryForm((f) => ({ ...f, workDate: e.target.value }))} required />
+                <input
+                  type="date"
+                  value={editEntryForm.workDate}
+                  disabled
+                  readOnly
+                  title="La fecha no se puede cambiar. Para reasignarla, eliminá esta jornada y cargá una nueva."
+                />
+                <span className="muted" style={{ fontSize: '0.78rem' }}>
+                  La fecha no se puede modificar. Para cambiarla, eliminá esta jornada y cargá una nueva.
+                </span>
               </label>
               <label>Etiqueta
                 <input type="text" value={editEntryForm.shiftLabel} onChange={(e) => setEditEntryForm((f) => ({ ...f, shiftLabel: e.target.value }))} />
@@ -6336,8 +6609,23 @@ export function DashboardPage() {
               <p className="muted" style={{ fontSize: '0.8rem', margin: '0' }}>
                 Nota: el nombre se actualiza en el sistema pero se sincronizará nuevamente desde Google en el próximo inicio de sesión.
               </p>
+              <p className="muted" style={{ fontSize: '0.78rem', margin: '0' }}>
+                Si cambiaste el modo de ciclo y necesitás ver los nuevos cálculos en pantalla, usá <strong>Refrescar jornadas</strong>. No escribe nada en Firestore: vuelve a leer las jornadas y reconstruye los cálculos en el navegador.
+              </p>
               <div className="row">
                 <button className="btn" type="submit">Guardar cambios</button>
+                <button
+                  className="btn btn-outline"
+                  type="button"
+                  title="Vuelve a leer las jornadas y reconstruye los cálculos en cliente."
+                  onClick={() => {
+                    void loadEntries()
+                    void loadAuditEntries()
+                    showToast('Jornadas refrescadas.')
+                  }}
+                >
+                  Refrescar jornadas
+                </button>
                 <button className="btn btn-outline" type="button" onClick={() => setEditingUser(null)}>Cancelar</button>
               </div>
             </form>

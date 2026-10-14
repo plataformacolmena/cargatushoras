@@ -325,11 +325,53 @@ export function calcEngancheExtras(
   return result
 }
 
+/**
+ * Calcula en cliente las métricas de todas las entries a partir de datos crudos.
+ * Usado como fuente de verdad en useMemo del Dashboard y en previewSettlement,
+ * en lugar de leer el campo `calculation` persistido (que ya no se escribe).
+ * Para entries antiguas sin `calculation`, este resultado reemplaza el fallback.
+ */
+export function computeEntryCalculations(
+  entries: Array<Pick<TimeEntry, 'id' | 'userId' | 'workDate' | 'timeIn' | 'timeOut' | 'penalties' | 'isJornadaAdicional'>>,
+  config: ProjectConfig,
+  userCycleModes?: Map<string, 'CYCLE' | 'REINFORCEMENT'>,
+): Map<string, TimeEntryCalculation> {
+  const result = new Map<string, TimeEntryCalculation>()
+  if (!entries.length) return result
+  const engancheMap = calcEngancheExtras(
+    entries.map((e) => ({
+      id: e.id,
+      userId: e.userId,
+      workDate: e.workDate,
+      timeIn: e.timeIn,
+      timeOut: e.timeOut,
+      isJornadaAdicional: e.isJornadaAdicional ?? false,
+    })),
+    config,
+    userCycleModes,
+  )
+  for (const entry of entries) {
+    const extras = engancheMap.get(entry.id)
+    result.set(
+      entry.id,
+      calculateEntry(entry.timeIn, entry.timeOut, config, {
+        penalties: entry.penalties ?? 0,
+        isJornadaAdicional: entry.isJornadaAdicional ?? false,
+        engancheExtraHours: extras?.enganche ?? 0,
+        reengancheExtraHours: extras?.reenganche ?? 0,
+      }),
+    )
+  }
+  return result
+}
+
 export function calculateSettlement(
   entries: TimeEntry[],
   userRates: Map<string, { hourlyRate: number; roleId?: string; roleName?: string; areaId?: string; areaName?: string }>,
   config: ProjectConfig,
   meta: { projectId: string; projectName: string; dateFrom: string; dateTo: string; createdBy: string },
+  /** Mapa de cálculos pre-computados por entryId (resultado de computeEntryCalculations). Si se provee, se usa en lugar de e.calculation. */
+  calcMap?: Map<string, TimeEntryCalculation>,
 ): Settlement {
   const byUser = new Map<string, {
     userName: string
@@ -353,17 +395,18 @@ export function calculateSettlement(
       regularPaid: 0, overtimePaid: 0, nightPaid: 0, nightOvertimePaid: 0, penaltyPaid: 0,
     }
     const m = e.isJornadaAdicional ? adicMult : 1
-    const reg = e.calculation.regularHours ?? 0
-    const ot  = e.calculation.overtimeHours ?? 0
-    const nh  = e.calculation.nightHours ?? 0
-    const noh = e.calculation.nightOvertimeHours ?? 0
-    const pen = e.calculation.penaltyHours ?? 0
+    const c = calcMap?.get(e.id) ?? e.calculation
+    const reg = c?.regularHours ?? 0
+    const ot  = c?.overtimeHours ?? 0
+    const nh  = c?.nightHours ?? 0
+    const noh = c?.nightOvertimeHours ?? 0
+    const pen = c?.penaltyHours ?? 0
     existing.regular       += reg
     existing.overtime      += ot
     existing.night         += nh
     existing.nightOvertime += noh
-    existing.enganche      += e.calculation.engancheExtraHours  ?? 0
-    existing.reenganche    += e.calculation.reengancheExtraHours ?? 0
+    existing.enganche      += c?.engancheExtraHours  ?? 0
+    existing.reenganche    += c?.reengancheExtraHours ?? 0
     existing.penalty       += pen
     if (e.workDate) existing.daysWorked.add(e.workDate)
     // Acumulado para pago, aplicando multiplicador de jornada adicional cuando corresponda.
