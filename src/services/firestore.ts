@@ -1210,12 +1210,23 @@ export async function saveProjectTemplate(
   name: string,
   data: { areas: string[]; roles: ProjectRoleInput[]; config: Omit<ProjectConfig, 'projectId'> },
 ): Promise<string> {
+  const cleanConfig: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(data.config)) {
+    if (v !== undefined) cleanConfig[k] = v
+  }
+
   const ref = await addDoc(collection(db, 'project_templates'), {
     name,
-    ...data,
+    areas: data.areas,
+    roles: data.roles,
+    config: cleanConfig,
     createdAt: serverTimestamp(),
   })
   return ref.id
+}
+
+export async function deleteProjectTemplate(templateId: string): Promise<void> {
+  await deleteDoc(doc(db, 'project_templates', templateId))
 }
 
 export async function listProjectTemplates(): Promise<ProjectTemplate[]> {
@@ -1224,14 +1235,52 @@ export async function listProjectTemplates(): Promise<ProjectTemplate[]> {
   return snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<ProjectTemplate, 'id'>) }))
 }
 
-export async function applyProjectTemplate(projectId: string, template: ProjectTemplate): Promise<void> {
+export async function applyProjectTemplate(
+  projectId: string,
+  template: ProjectTemplate,
+): Promise<{ addedAreas: number; addedRoles: number; skippedAreas: number; skippedRoles: number }> {
+  const [existingAreas, existingRoles] = await Promise.all([
+    listProjectAreas(projectId),
+    listProjectRoles(projectId),
+  ])
+
+  const existingAreaNames = new Set(existingAreas.map((a) => a.name.trim().toLowerCase()))
+  const existingRoleNames = new Set(existingRoles.map((r) => r.name.trim().toLowerCase()))
+
+  const areaPromises: Promise<void>[] = []
+  let addedAreas = 0
+  let skippedAreas = 0
   for (const areaName of template.areas) {
-    await createProjectArea(projectId, areaName)
+    const trimmed = areaName.trim()
+    if (!trimmed) continue
+    if (!existingAreaNames.has(trimmed.toLowerCase())) {
+      areaPromises.push(createProjectArea(projectId, trimmed))
+      existingAreaNames.add(trimmed.toLowerCase())
+      addedAreas++
+    } else {
+      skippedAreas++
+    }
   }
+
+  const rolePromises: Promise<void>[] = []
+  let addedRoles = 0
+  let skippedRoles = 0
   for (const role of template.roles) {
-    await createProjectRole(projectId, role)
+    const trimmed = role.name.trim()
+    if (!trimmed) continue
+    if (!existingRoleNames.has(trimmed.toLowerCase())) {
+      rolePromises.push(createProjectRole(projectId, { ...role, name: trimmed }))
+      existingRoleNames.add(trimmed.toLowerCase())
+      addedRoles++
+    } else {
+      skippedRoles++
+    }
   }
+
+  await Promise.all([...areaPromises, ...rolePromises])
   await saveProjectConfig(projectId, template.config)
+
+  return { addedAreas, addedRoles, skippedAreas, skippedRoles }
 }
 
 export async function previewSettlement(

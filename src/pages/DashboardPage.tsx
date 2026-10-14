@@ -38,6 +38,7 @@ import {
   saveProjectConfig,
   syncUserAreasToEntries,
   saveProjectTemplate,
+  deleteProjectTemplate,
   saveTimeEntry,
   saveTimeEntryForUser,
   setEntryReviewColor,
@@ -448,6 +449,7 @@ export function DashboardPage() {
   const [templates, setTemplates] = useState<ProjectTemplate[]>([])
   const [newTemplateName, setNewTemplateName] = useState('')
   const [templateLoading, setTemplateLoading] = useState(false)
+  const [expandedTemplateId, setExpandedTemplateId] = useState<string | null>(null)
 
   // Rangos bloqueados por liquidaciones
   const [lockedRanges, setLockedRanges] = useState<Array<{ dateFrom: string; dateTo: string }>>([])
@@ -2170,36 +2172,41 @@ export function DashboardPage() {
   }
 
   async function handleSaveTemplate() {
-    if (!newTemplateName.trim() || !projectConfig) {
+    if (!newTemplateName.trim()) {
       showToast('Ingresá un nombre para el template.', 'error')
       return
     }
+    if (!activeProjectId) {
+      showToast('Seleccioná un proyecto activo primero para capturar su configuración.', 'error')
+      return
+    }
+    if (!projectConfig) {
+      showToast('Cargando configuración del proyecto activo, aguardá un instante...', 'info')
+      return
+    }
+    if (areas.length === 0 && projectRoles.length === 0) {
+      const confirmEmpty = window.confirm(
+        `El proyecto "${activeProjectName}" no tiene áreas ni roles configurados.\n\n¿Deseás guardar el template solo con los parámetros de cálculo de jornada?`
+      )
+      if (!confirmEmpty) return
+    }
     setTemplateLoading(true)
     try {
+      const { projectId: _, ...cleanConfig } = projectConfig
       await saveProjectTemplate(newTemplateName.trim(), {
         areas: areas.map((a) => a.name),
-        roles: projectRoles.map(({ name, dailyRate, weeklyRate, monthlyRate }) => ({ name, dailyRate, weeklyRate, monthlyRate })),
-        config: {
-          regularDailyHours: projectConfig.regularDailyHours,
-          overtimeMultiplier: projectConfig.overtimeMultiplier,
-          nightWindowStart: projectConfig.nightWindowStart,
-          nightWindowEnd: projectConfig.nightWindowEnd,
-          nightAdditionalMultiplier: projectConfig.nightAdditionalMultiplier,
-          weeklyWorkDays: projectConfig.weeklyWorkDays,
-          workWeekPattern: projectConfig.workWeekPattern,
-          workWeekStartDay: projectConfig.workWeekStartDay,
-          rodajeStart: projectConfig.rodajeStart,
-          rodajeEnd: projectConfig.rodajeEnd,
-          engancheHours: projectConfig.engancheHours,
-          reengancheHours: projectConfig.reengancheHours,
-          penaltyHours: projectConfig.penaltyHours,
-          jornadaAdicionalMultiplier: projectConfig.jornadaAdicionalMultiplier,
-        },
+        roles: projectRoles.map(({ name, dailyRate, weeklyRate, monthlyRate }) => ({
+          name,
+          dailyRate: Number(dailyRate) || 0,
+          weeklyRate: Number(weeklyRate) || 0,
+          monthlyRate: Number(monthlyRate) || 0,
+        })),
+        config: cleanConfig,
       })
       setNewTemplateName('')
       const loaded = await listProjectTemplates()
       setTemplates(loaded)
-      showToast('Template guardado.')
+      showToast(`Template "${newTemplateName.trim()}" guardado con éxito.`)
     } catch (err) {
       showToast('Error al guardar template.', 'error')
       console.error(err)
@@ -2209,10 +2216,22 @@ export function DashboardPage() {
   }
 
   async function handleApplyTemplate(template: ProjectTemplate) {
-    if (!window.confirm(`¿Aplicar template "${template.name}" al proyecto activo? Se crearán áreas, roles y se aplicará la configuración de cálculo.`)) return
+    if (!activeProjectId) {
+      showToast('Seleccioná un proyecto activo al cual aplicar el template.', 'error')
+      return
+    }
+    const confirmed = window.confirm(
+      `¿Aplicar el template "${template.name}" al proyecto activo "${activeProjectName}"?\n\n` +
+      `• Áreas del template: ${template.areas.length}\n` +
+      `• Roles del template: ${template.roles.length}\n` +
+      `• Parámetros de cálculo (jornada, horas extra, descansos).\n\n` +
+      `Las áreas o roles existentes en el proyecto que ya tengan el mismo nombre no se duplicarán.\n\n` +
+      `¿Continuar?`
+    )
+    if (!confirmed) return
     setTemplateLoading(true)
     try {
-      await applyProjectTemplate(activeProjectId, template)
+      const res = await applyProjectTemplate(activeProjectId, template)
       const [loadedAreas, loadedRoles, loadedConfig] = await Promise.all([
         listProjectAreas(activeProjectId),
         listProjectRoles(activeProjectId),
@@ -2221,9 +2240,27 @@ export function DashboardPage() {
       setAreas(loadedAreas)
       setProjectRoles(loadedRoles)
       setProjectConfig(loadedConfig)
-      showToast(`Template "${template.name}" aplicado exitosamente.`)
+      showToast(`Template "${template.name}" aplicado a "${activeProjectName}": +${res.addedAreas} áreas, +${res.addedRoles} roles.`)
     } catch (err) {
       showToast('Error al aplicar template.', 'error')
+      console.error(err)
+    } finally {
+      setTemplateLoading(false)
+    }
+  }
+
+  async function handleDeleteTemplate(template: ProjectTemplate) {
+    if (!template.id) return
+    if (!window.confirm(`¿Eliminar el template "${template.name}"? Esta acción no se puede deshacer.`)) return
+    setTemplateLoading(true)
+    try {
+      await deleteProjectTemplate(template.id)
+      const loaded = await listProjectTemplates()
+      setTemplates(loaded)
+      if (expandedTemplateId === template.id) setExpandedTemplateId(null)
+      showToast('Template eliminado.')
+    } catch (err) {
+      showToast('Error al eliminar template.', 'error')
       console.error(err)
     } finally {
       setTemplateLoading(false)
@@ -3381,27 +3418,143 @@ export function DashboardPage() {
           <hr />
 
           <h3>Templates de configuración</h3>
-          <p className="muted" style={{ marginTop: 0, fontSize: '0.85rem' }}>Guarda la configuración actual (áreas, roles y parámetros de cálculo) como template reutilizable.</p>
-          <div className="row" style={{ marginBottom: '0.75rem' }}>
-            <input type="text" placeholder="Nombre del template..." value={newTemplateName} onChange={(e) => setNewTemplateName(e.target.value)} />
-            <button className="btn" onClick={() => { void handleSaveTemplate() }} disabled={templateLoading}>
-              {templateLoading ? 'Guardando...' : 'Guardar como template'}
+          <p className="muted" style={{ marginTop: 0, fontSize: '0.85rem' }}>
+            Guardá las áreas, roles y parámetros de cálculo del proyecto activo como una plantilla reutilizable para aplicarla rápidamente a nuevos proyectos.
+          </p>
+
+          <div
+            style={{
+              background: 'var(--bg-accent, #f8fafc)',
+              border: '1px solid var(--border-color, #e2e8f0)',
+              borderRadius: 8,
+              padding: '10px 14px',
+              marginBottom: '1rem',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: '8px',
+              fontSize: '0.85rem',
+            }}
+          >
+            <div>
+              <strong>Proyecto origen activo:</strong> {activeProjectName}
+              <span className="muted" style={{ marginLeft: 8 }}>
+                ({areas.length} área{areas.length !== 1 ? 's' : ''} · {projectRoles.length} rol{projectRoles.length !== 1 ? 'es' : ''} · Jornada {projectConfig?.regularDailyHours ?? 8}h)
+              </span>
+            </div>
+            <span className="chip" style={{ fontSize: '0.75rem' }}>Captura automática</span>
+          </div>
+
+          <div className="row" style={{ marginBottom: '1.25rem', gap: '8px', flexWrap: 'wrap' }}>
+            <input
+              type="text"
+              placeholder="Nombre del template (ej: Ficción Largometraje, Publicidad Estándar)..."
+              value={newTemplateName}
+              onChange={(e) => setNewTemplateName(e.target.value)}
+              style={{ flex: '1 1 240px' }}
+            />
+            <button
+              className="btn"
+              onClick={() => { void handleSaveTemplate() }}
+              disabled={templateLoading || !newTemplateName.trim()}
+            >
+              {templateLoading ? <><Spinner size={12} inline /> Guardando…</> : 'Guardar configuración como template'}
             </button>
           </div>
-          {templates.length > 0 && (
-            <div className="stack">
-              <p style={{ fontWeight: 600, margin: '0 0 4px' }}>Templates disponibles:</p>
+
+          <p style={{ fontWeight: 600, margin: '0 0 8px' }}>
+            Templates disponibles ({templates.length}):
+          </p>
+          {templates.length === 0 ? (
+            <p className="muted">Aún no hay templates guardados. Crea uno ingresando un nombre arriba.</p>
+          ) : (
+            <div className="stack" style={{ gap: '10px' }}>
               {templates.map((t) => (
-                <div key={t.id} className="row entry-item" style={{ alignItems: 'flex-start' }}>
-                  <div style={{ flex: 1 }}>
-                    <strong>{t.name}</strong>
-                    <p className="muted" style={{ margin: '2px 0', fontSize: '0.82rem' }}>
-                      {t.areas.length} área{t.areas.length !== 1 ? 's' : ''} · {t.roles.length} rol{t.roles.length !== 1 ? 'es' : ''}
-                    </p>
+                <div key={t.id} className="entry-item" style={{ padding: '10px 14px', borderRadius: 8, border: '1px solid var(--border-color)' }}>
+                  <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                    <div>
+                      <strong style={{ fontSize: '0.98rem' }}>{t.name}</strong>
+                      <p className="muted" style={{ margin: '2px 0 0', fontSize: '0.82rem' }}>
+                        {t.areas.length} área{t.areas.length !== 1 ? 's' : ''} · {t.roles.length} rol{t.roles.length !== 1 ? 'es' : ''} · Jornada {t.config.regularDailyHours}h (Extra x{t.config.overtimeMultiplier})
+                      </p>
+                    </div>
+                    <div className="row" style={{ gap: '6px', flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        className="btn-sm btn-outline"
+                        onClick={() => setExpandedTemplateId((prev) => (prev === t.id ? null : (t.id ?? null)))}
+                      >
+                        {expandedTemplateId === t.id ? 'Ocultar detalle' : 'Ver detalle'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-sm"
+                        style={{ background: 'var(--primary)', color: '#fff' }}
+                        onClick={() => { void handleApplyTemplate(t) }}
+                        disabled={templateLoading}
+                        title={`Aplica áreas, roles y cálculo al proyecto activo (${activeProjectName}) sin duplicar los existentes`}
+                      >
+                        {templateLoading ? 'Aplicando…' : 'Aplicar al proyecto activo'}
+                      </button>
+                      {isSuperUser && t.id && (
+                        <button
+                          type="button"
+                          className="btn-sm btn-outline"
+                          style={{ color: '#ef4444', borderColor: '#ef4444' }}
+                          onClick={() => { void handleDeleteTemplate(t) }}
+                          disabled={templateLoading}
+                          title="Eliminar permanentemente este template"
+                        >
+                          Eliminar
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <button className="btn-sm btn-outline" onClick={() => { void handleApplyTemplate(t) }} disabled={templateLoading}>
-                    Aplicar
-                  </button>
+
+                  {expandedTemplateId === t.id && (
+                    <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px dashed var(--border-color)', fontSize: '0.82rem' }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px' }}>
+                        <div>
+                          <strong>Áreas declaradas ({t.areas.length}):</strong>
+                          {t.areas.length === 0 ? (
+                            <p className="muted" style={{ margin: '2px 0' }}>Sin áreas.</p>
+                          ) : (
+                            <div className="row" style={{ gap: '4px', flexWrap: 'wrap', marginTop: '4px' }}>
+                              {t.areas.map((a, i) => (
+                                <span key={i} className="chip" style={{ fontSize: '0.72rem' }}>{a}</span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                        <div>
+                          <strong>Roles y tarifas ({t.roles.length}):</strong>
+                          {t.roles.length === 0 ? (
+                            <p className="muted" style={{ margin: '2px 0' }}>Sin roles.</p>
+                          ) : (
+                            <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
+                              {t.roles.map((r, i) => (
+                                <div key={i} style={{ padding: '2px 0' }}>
+                                  • <strong>{r.name}</strong> {r.dailyRate > 0 ? `($${r.dailyRate}/día)` : r.weeklyRate > 0 ? `($${r.weeklyRate}/sem)` : ''}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                        <div>
+                          <strong>Parámetros de cálculo:</strong>
+                          <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+                            <li>Jornada regular: {t.config.regularDailyHours}h</li>
+                            <li>Horas extra: x{t.config.overtimeMultiplier}</li>
+                            <li>Ventana nocturna: {t.config.nightWindowStart} a {t.config.nightWindowEnd} (x{t.config.nightAdditionalMultiplier})</li>
+                            <li>Semana: {t.config.weeklyWorkDays} días (inicio {t.config.workWeekStartDay})</li>
+                            {t.config.engancheHours > 0 && <li>Enganche: {t.config.engancheHours}h</li>}
+                            {t.config.reengancheHours > 0 && <li>Reenganche: {t.config.reengancheHours}h</li>}
+                          </ul>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
